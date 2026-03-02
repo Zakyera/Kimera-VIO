@@ -991,6 +991,22 @@ void VioBackend::addBetweenFactor(const FrameId& from_id,
 }
 
 /* -------------------------------------------------------------------------- */
+// zy Step 1
+void VioBackend::addExternalPosePrior(const FrameId& frame_id,
+                                      const gtsam::Pose3& W_Pose_B,
+                                      const gtsam::SharedNoiseModel& noise_model) {
+  // Add a prior on the pose node x(frame_id).
+  new_imu_prior_and_other_factors_.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+      gtsam::Symbol(kPoseSymbolChar, frame_id),
+      W_Pose_B,
+      noise_model);
+
+  VLOG(1) << "Enqueued external pose prior on key: "
+          << gtsam::Symbol(kPoseSymbolChar, frame_id)
+          << " (frame_id=" << frame_id << ").";
+}
+
+/* -------------------------------------------------------------------------- */
 void VioBackend::addNoMotionFactor(const FrameId& from_id,
                                    const FrameId& to_id) {
   new_imu_prior_and_other_factors_
@@ -1039,6 +1055,53 @@ bool VioBackend::optimize(
     const size_t& max_extra_iterations,
     const gtsam::FactorIndices& extra_factor_slots_to_delete) {
   DCHECK(smoother_) << "Incremental smoother is a null pointer.";
+
+  // zy Step 2/3
+  // ---
+  // Inject a one-time external pose prior from within optimize() so it is
+  // guaranteed to execute for ALL backend subclasses (RegularVioBackend, etc).
+  // Placing this in spinOnce() is unreliable because derived backends can
+  // bypass VioBackend::spinOnce() completely.
+  static bool zy_external_prior_injected_once = false;
+  static constexpr FrameId zy_kExternalPriorFrameId = 2;
+  static gtsam::Pose3 zy_injected_W_Pose_B_prior;  // stored for Step 3 compare
+
+  // Progress logging: confirm optimize() is being reached and that cur_id
+  // advances as expected.
+  if (!zy_external_prior_injected_once && (cur_id % 5 == 0)) {
+    LOG(WARNING) << "[Step2-debug] optimize() reached. Waiting to inject prior at cur_id="
+                 << zy_kExternalPriorFrameId << ". Current cur_id=" << cur_id;
+  }
+
+  if (!zy_external_prior_injected_once && cur_id == zy_kExternalPriorFrameId) {
+    // Use the current estimate as a base (world -> body/IMU). At this point
+    // W_Pose_B_lkf_from_state_ corresponds to the previous update, but is a
+    // good deterministic source for a debug prior.
+    zy_injected_W_Pose_B_prior = W_Pose_B_lkf_from_state_;
+
+    // Add an obvious small perturbation so its effect is visible.
+    // (10 cm in world X).
+    zy_injected_W_Pose_B_prior =
+        gtsam::Pose3(zy_injected_W_Pose_B_prior.rotation(),
+                     zy_injected_W_Pose_B_prior.translation() +
+                         gtsam::Point3(0.10, 0.0, 0.0));
+
+    // Noise model: fairly tight translation, moderate rotation.
+    // 6D tangent-space sigmas: [rot_x rot_y rot_z trans_x trans_y trans_z]
+    const gtsam::Vector6 zy_sigmas =
+        (gtsam::Vector6() << 0.10, 0.10, 0.10, 0.05, 0.05, 0.05).finished();
+    const gtsam::SharedNoiseModel zy_noise =
+        gtsam::noiseModel::Diagonal::Sigmas(zy_sigmas);
+
+    addExternalPosePrior(cur_id, zy_injected_W_Pose_B_prior, zy_noise);
+    zy_external_prior_injected_once = true;
+
+    LOG(WARNING) << "[Step2] Injecting external pose prior INSIDE optimize() at cur_id="
+                 << cur_id << " on key " << gtsam::Symbol(kPoseSymbolChar, cur_id);
+    LOG(WARNING) << "[Step2] Prior target translation (W): "
+                 << zy_injected_W_Pose_B_prior.translation().transpose();
+  }
+  // ---
 
   // Only for statistics and debugging.
   // Store start time to calculate absolute total time taken.
@@ -1235,6 +1298,26 @@ bool VioBackend::optimize(
     if (is_smoother_ok) {
       updateStates(cur_id);
 
+      // zy Step 3
+      // ---
+      // After updateStates(), W_Pose_B_lkf_from_state_ has the optimized pose
+      // for cur_id. If we injected at cur_id==N, then the first chance we have
+      // to observe its effect is on the SAME optimize() call (since the prior
+      // was part of new_factors_tmp for this update).
+      if (zy_external_prior_injected_once && cur_id == zy_kExternalPriorFrameId) {
+        LOG(WARNING) << "[Step3] After optimize() with injected prior at cur_id="
+                     << cur_id;
+        LOG(WARNING) << "[Step3] Optimized translation (W): "
+                     << W_Pose_B_lkf_from_state_.translation().transpose();
+        LOG(WARNING) << "[Step3] Prior target translation (W): "
+                     << zy_injected_W_Pose_B_prior.translation().transpose();
+        LOG(WARNING) << "[Step3] Delta (optimized - prior_target): "
+                     << (W_Pose_B_lkf_from_state_.translation() -
+                         zy_injected_W_Pose_B_prior.translation())
+                            .transpose();
+      }
+      // ---
+
       // TODO: Add Update latest covariance --> move flag
       if (FLAGS_compute_state_covariance) {
         computeStateCovariance();
@@ -1248,7 +1331,6 @@ bool VioBackend::optimize(
   }
   return is_smoother_ok;
 }
-
 /// Private methods.
 /* -------------------------------------------------------------------------- */
 void VioBackend::addInitialPriorFactors(const FrameId& frame_id) {
@@ -1663,7 +1745,7 @@ void VioBackend::cleanCheiralityLmk(
   VLOG(10) << "Starting delete from new values...";
   bool is_deleted_from_values =
       deleteKeyFromValues(lmk_key, new_values, new_values_cheirality);
-  VLOG(10) << "Finished delete from timestamps.";
+  VLOG(10) << "Finished delete from new values."; // zy
 
   // Delete from new values.
   VLOG(10) << "Starting delete from timestamps...";
@@ -1840,8 +1922,6 @@ void VioBackend::setNoMotionFactorsParams(
   *no_motion_prior_noise = gtsam::noiseModel::Diagonal::Precisions(precisions);
 }
 
-/* --------------------------- PRINTERS ------------------------------------- */
-/// Printers.
 void VioBackend::print() const {
   backend_params_.print();
 
@@ -1938,7 +2018,7 @@ void VioBackend::printSmootherInfo(
     // If we are storing the graph to be deleted, then print extended info
     // besides the slot to be deleted.
     CHECK_GE(debug_info_.graphToBeDeleted.size(), delete_slots.size());
-    for (size_t i = 0u; i < delete_slots.size(); ++i) {
+    for (size_t i = 0u; i < delete_slots.size(); i++) {
       CHECK(debug_info_.graphToBeDeleted.at(i));
       if (print_point_plane_factors) {
         printSelectedFactors(debug_info_.graphToBeDeleted.at(i).get(),

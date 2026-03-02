@@ -132,6 +132,20 @@ class VioBackend {
     return state_covariance_lkf_;
   }
 
+  // zy Step 1
+    /**
+   * @brief Enqueue an external pose prior on the backend pose variable x(frame_id).
+   *
+   * This does NOT optimize immediately. It only pushes a PriorFactor<Pose3>
+   * into the same "new factors" buffer used by IMU/priors, so it will be
+   * considered at the next backend optimization update.
+   *
+   * Pose is W_Pose_B (world -> body/IMU), consistent with Kimera backend state.
+   */
+  void addExternalPosePrior(const FrameId& frame_id,
+                            const gtsam::Pose3& W_Pose_B,
+                            const gtsam::SharedNoiseModel& noise_model);
+
   // Update covariance matrix using getCurrentStateCovariance()
   // NOT TESTED
   void computeStateCovariance();

@@ -75,6 +75,23 @@ add_subdirectory(third_party)
 ### Compile the code
 add_library(${PROJECT_NAME} SHARED "")
 
+# zy
+# zy 
+# NOTE (CBS project): Kimera-VIO shared library must include core src/*.cpp.
+# This repo snapshot had add_library(... "") with no target_sources.
+# We include src/*.cpp and exclude optional Pangolin if not available.
+file(GLOB_RECURSE KIMERA_VIO_SRC
+  "${CMAKE_CURRENT_LIST_DIR}/src/*.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/src/*.cc"
+  "${CMAKE_CURRENT_LIST_DIR}/src/*.cxx"
+)
+# zy
+# Remove Pangolin-dependent source if Pangolin isn't installed
+list(FILTER KIMERA_VIO_SRC EXCLUDE REGEX ".*/visualizer/PangolinDisplay\\.(cpp|cc|cxx)$")
+# zy
+target_sources(${PROJECT_NAME} PRIVATE ${KIMERA_VIO_SRC})
+
+
 ### Add source code for data provider.
 add_subdirectory(include/kimera-vio/dataprovider)
 add_subdirectory(src/dataprovider)
@@ -167,8 +184,12 @@ target_compile_features(${PROJECT_NAME} PUBLIC
 # e.g. when testing
 add_library(kimera_vio::kimera_vio ALIAS kimera_vio)
 
-add_executable(stereoVIOEuroc ./examples/KimeraVIO.cpp)
-target_link_libraries(stereoVIOEuroc PUBLIC kimera_vio::kimera_vio)
+# zy
+option(KIMERA_BUILD_EXAMPLES "Build examples" OFF)
+if(KIMERA_BUILD_EXAMPLES)
+# add_executable(stereoVIOEuroc ./examples/KimeraVIO.cpp)
+# target_link_libraries(stereoVIOEuroc PUBLIC kimera_vio::kimera_vio)
+endif()
 
 ############################### TESTS ##########################################
 ### Add testing

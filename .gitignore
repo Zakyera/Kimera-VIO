@@ -1,33 +1,71 @@
-/build/
-/data-sets/
-/.settings/
-/matlab/result-*
-/scripts/**/*.txt
-/*/*.csv
-*.ipynb_checkpoints
-*.autosave
+##############################
+# CBS_FUSION super-repo ignore
+##############################
 
-% Ignore VS code settings
-*.vscode
+# ---- catkin / ROS workspaces ----
+**/build/
+**/devel/
+**/install/
+**/logs/
+**/.catkin_tools/
 
-% Ignore logged mesh ply
-*.ply
+# ---- GTSAM local build/install ----
+gtsam/build/
+gtsam/install/
 
-% Ignore Mac stuff
-*.DS_Store
-
-% Remove recovery files from matlab.
-*~
-% Ignore media files
-*.png
-*.mp4
-
-/scripts/*.yaml
-
-% Ignore large vocabulary files
-/vocabulary/*
-
-% Ignore python bytecode
+# ---- pixi / python / caches ----
+.pixi/
+__pycache__/
+**/__pycache__/
 *.pyc
+.cache/
+**/.cache/
+.ccache/
+**/.ccache/
 
-*compile_commands.json
+# ---- datasets / bags / large data ----
+datasets/
+**/datasets/
+*.bag
+*.db3
+*.mcap
+*.pcd
+*.ply
+*.bin
+*.npz
+*.npy
+*.csv
+*.h5
+*.hdf5
+
+# ---- binaries / build outputs ----
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# ---- IDE / editor ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ---- misc ----
+tmp/
+**/tmp/
+*.log
+
+# cloned dependency repos (tracked via forks + REPOS.lock, not committed here)
+kimera_ws/
+cbs_ws/
+gtsam/
+# --- Kimera vocabulary files (downloaded at build time; do not commit) ---
+vocabulary/ORBvoc.yml
+vocabulary/ORBvoc.zip
+vocabulary/ORBvoc/
