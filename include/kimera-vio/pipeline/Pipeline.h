@@ -90,6 +90,38 @@ class Pipeline {
     data_provider_module_->fillExternalOdometryQueue(odom_measurement);
   }
 
+  // zy Step 10a
+  inline void registerExternalPoseBeliefCallback(
+    const std::function<void(const VioBackend::ExternalPoseBelief&)>&
+        external_pose_belief_callback) {
+  CHECK(vio_backend_module_);
+  vio_backend_module_->registerExternalPoseBeliefCallback(
+      external_pose_belief_callback);
+  }
+
+  inline void enqueueExternalPosePrior(
+      const Timestamp& timestamp_kf_nsec,
+      const gtsam::Pose3& W_Pose_B,
+      const gtsam::SharedNoiseModel& noise_model,
+      const std::string& source = "unknown",
+      uint64_t source_seq = 0) {
+    CHECK(vio_backend_module_);
+    vio_backend_module_->enqueueExternalPosePrior(
+        timestamp_kf_nsec, W_Pose_B, noise_model, source, source_seq);
+  }
+
+  inline bool enqueueExternalPosePriorFromCovariance(
+      const Timestamp& timestamp_kf_nsec,
+      const gtsam::Pose3& W_Pose_B,
+      const gtsam::Matrix6& covariance,
+      const std::string& source = "unknown",
+      uint64_t source_seq = 0) {
+    CHECK(vio_backend_module_);
+    return vio_backend_module_->enqueueExternalPosePriorFromCovariance(
+        timestamp_kf_nsec, W_Pose_B, covariance, source, source_seq);
+  }
+
+
   inline LcdModule* getLcdModule() const { return lcd_module_.get(); }
 
  public:

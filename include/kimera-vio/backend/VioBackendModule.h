@@ -78,6 +78,27 @@ class VioBackendModule
   void registerMapUpdateCallback(
       const VioBackend::MapCallback& map_update_callback);
 
+    // zy Step 9a
+    // External CBS-style pose belief publication hook.
+  void registerExternalPoseBeliefCallback(
+      const std::function<void(const VioBackend::ExternalPoseBelief&)>&
+          external_pose_belief_callback);
+
+  // External CBS-style pose prior ingestion hooks.
+  void enqueueExternalPosePrior(const Timestamp& timestamp_kf_nsec,
+                                const gtsam::Pose3& W_Pose_B,
+                                const gtsam::SharedNoiseModel& noise_model,
+                                const std::string& source = "unknown",
+                                uint64_t source_seq = 0);
+
+  bool enqueueExternalPosePriorFromCovariance(
+      const Timestamp& timestamp_kf_nsec,
+      const gtsam::Pose3& W_Pose_B,
+      const gtsam::Matrix6& covariance,
+      const std::string& source = "unknown",
+      uint64_t source_seq = 0);
+
+
  protected:
   const VioBackend::UniquePtr vio_backend_;
 };

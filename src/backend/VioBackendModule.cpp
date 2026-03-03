@@ -49,4 +49,35 @@ void VioBackendModule::registerMapUpdateCallback(
   vio_backend_->registerMapUpdateCallback(map_update_callback);
 }
 
+// Step 9b
+void VioBackendModule::registerExternalPoseBeliefCallback(
+    const std::function<void(const VioBackend::ExternalPoseBelief&)>&
+        external_pose_belief_callback) {
+  CHECK(vio_backend_);
+  vio_backend_->registerExternalPoseBeliefCallback(external_pose_belief_callback);
+}
+
+void VioBackendModule::enqueueExternalPosePrior(
+    const Timestamp& timestamp_kf_nsec,
+    const gtsam::Pose3& W_Pose_B,
+    const gtsam::SharedNoiseModel& noise_model,
+    const std::string& source,
+    uint64_t source_seq) {
+  CHECK(vio_backend_);
+  vio_backend_->enqueueExternalPosePrior(
+      timestamp_kf_nsec, W_Pose_B, noise_model, source, source_seq);
+}
+
+bool VioBackendModule::enqueueExternalPosePriorFromCovariance(
+    const Timestamp& timestamp_kf_nsec,
+    const gtsam::Pose3& W_Pose_B,
+    const gtsam::Matrix6& covariance,
+    const std::string& source,
+    uint64_t source_seq) {
+  CHECK(vio_backend_);
+  return vio_backend_->enqueueExternalPosePriorFromCovariance(
+      timestamp_kf_nsec, W_Pose_B, covariance, source, source_seq);
+}
+
+
 }  // namespace VIO

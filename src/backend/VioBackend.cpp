@@ -31,12 +31,35 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+// zy Step 11
+#ifdef KIMERA_USE_CBS
+#pragma push_macro("CHECK")
+#pragma push_macro("CHECK_EQ")
+#pragma push_macro("CHECK_NE")
+#pragma push_macro("CHECK_LT")
+#pragma push_macro("CHECK_LE")
+#pragma push_macro("CHECK_GT")
+#pragma push_macro("CHECK_GE")
+#include <cbs/bpsam/bpsam.h>
+#pragma pop_macro("CHECK_GE")
+#pragma pop_macro("CHECK_GT")
+#pragma pop_macro("CHECK_LE")
+#pragma pop_macro("CHECK_LT")
+#pragma pop_macro("CHECK_NE")
+#pragma pop_macro("CHECK_EQ")
+#pragma pop_macro("CHECK")
+#endif
+
+
 
 #include <limits>  // for numeric_limits<>
 #include <map>
 #include <string>
 #include <utility>  // for make_pair
 #include <vector>
+#include <cmath> // zy step 5_c
+
+
 
 #include "kimera-vio/common/VioNavState.h"
 #include "kimera-vio/imu-frontend/ImuFrontend-definitions.h"
@@ -65,6 +88,15 @@ DEFINE_bool(compute_state_covariance,
 DEFINE_bool(no_incremental_pose,
             false,
             "Flag to disable incremental pose usage in backend");
+
+// zy Step 11a
+#ifdef KIMERA_USE_CBS
+DEFINE_bool(use_cbs_optimizer,
+            false,
+            "If true (and compiled with KIMERA_USE_CBS), run CBS BPSAM in "
+            "parallel and use CBS estimate as backend state output.");
+#endif
+
 
 namespace VIO {
 
@@ -119,6 +151,23 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   lmParams.setlambdaUpperBound(0.0);  // same as GN)
   smoother_ = std::make_unique<Smoother>(backend_params.nr_states_, lmParams);
 #endif
+
+// zy-------
+// zy Step 10f
+#ifdef KIMERA_USE_CBS
+  // Build CBS optimizer with Kimera's current ISAM2 parameterization.
+  gtsam::ISAM2Params cbs_isam_params;
+  BackendParams::setIsam2Params(backend_params, &cbs_isam_params);
+
+  cbs::BPSAM::Params cbs_params;
+  cbs_params.robot_id = static_cast<cbs::AgentId>(0);
+  cbs_params.sam_params_ = cbs_isam_params;
+  cbs_params.enable_gkcm = false;  // start simple; enable later if needed.
+
+  cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
+  LOG(INFO) << "CBS BPSAM scaffold initialized (inactive).";
+#endif
+// zy -------
 
   // Set parameters for all factors.
   setFactorsParams(backend_params,
@@ -196,7 +245,7 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
               kOutputLmkTypeMap ? &lmk_id_to_lmk_type_map : nullptr,
               kMinLmkObs);
     }
-
+    // zy Step 8_d, edited existing code 
     if (map_update_callback_) {
       map_update_callback_(lmk_ids_to_3d_points_in_time_horizon);
     } else {
@@ -204,6 +253,16 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
                     "Update callback for at least the "
                     "Frontend? Do so by using "
                     "registerMapUpdateCallback function.";
+    }
+
+    if (external_pose_belief_callback_) {
+      ExternalPoseBelief belief;
+      if (getLatestExternalPoseBelief(&belief)) {
+        external_pose_belief_callback_(belief);
+      } else {
+        VLOG(2) << "External pose belief callback registered, but no valid "
+                   "belief is available this cycle.";
+      }
     }
 
     // Create Backend Output Payload.
@@ -252,6 +311,16 @@ void VioBackend::registerMapUpdateCallback(
   map_update_callback_ = map_update_callback;
 }
 
+// zy Step 8_c
+// simple setter, same pattern as existing map/IMU callback registration.
+void VioBackend::registerExternalPoseBeliefCallback(
+    const std::function<void(const ExternalPoseBelief&)>&
+        external_pose_belief_callback) {
+  external_pose_belief_callback_ = external_pose_belief_callback;
+}
+
+
+
 /* -------------------------------------------------------------------------- */
 bool VioBackend::initStateAndSetPriors(
     const VioNavStateTimestamped& vio_nav_state_initial_seed) {
@@ -260,6 +329,21 @@ bool VioBackend::initStateAndSetPriors(
 
   // Update member variables.
   timestamp_lkf_ = vio_nav_state_initial_seed.timestamp_;
+
+  // zy Step 4_a
+  // On backend (re)initialization, reset external-prior staging state, 
+  // so old messages from previous runs don't leak into the new graph.
+  // if Kimera restarts while ROS continues, old queued beliefs can corrupt a new optimization session. This guarantees a clean slate.
+  {
+    std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
+    external_pose_priors_queue_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
+    timestamp_to_kf_id_map_.clear();
+    timestamp_to_kf_id_map_[timestamp_lkf_] = curr_kf_id_;
+  }
+
 
   // These two are identical in the beginning, but _from_state_ is used in
   // the optimizer and _from_increments_ is used as a smooth output
@@ -308,6 +392,17 @@ bool VioBackend::addVisualInertialStateAndOptimize(
   VLOG(1) << "VIO: adding keyframe " << curr_kf_id_
           << " at timestamp:" << UtilsNumerical::NsecToSec(timestamp_kf_nsec)
           << " (nsec).";
+  
+  // zy Step 3_c
+  // every keyframe gets a stable timestamp->key entry so beliefs can target exact past poses. 
+  {
+  std::lock_guard<std::mutex> lock(timestamp_to_kf_id_map_mutex_);
+  timestamp_to_kf_id_map_[timestamp_kf_nsec] = curr_kf_id_;
+
+  while (timestamp_to_kf_id_map_.size() > max_timestamp_to_kf_id_map_size_) {
+    timestamp_to_kf_id_map_.erase(timestamp_to_kf_id_map_.begin());
+  }
+  }
 
   // Add initial guess.
   addStateValues(curr_kf_id_,
@@ -722,6 +817,201 @@ void VioBackend::computeStateCovariance() {
           .fullMatrix());  // 6 + 3 + 6 = 15x15matrix
 }
 
+// zy Step 7_b
+// When CBS is driving estimates, outgoing belief should carry CBS covariance, not legacy smoother covariance.
+// Fallbacks keep behavior robust when CBS marginals are temporarily unavailable.
+bool VioBackend::getLatestExternalPoseBelief(
+    ExternalPoseBelief* belief) const {
+  CHECK_NOTNULL(belief);
+
+  if (backend_state_ == BackendState::Bootstrap) {
+    return false;
+  }
+
+  belief->timestamp_kf_nsec_ = timestamp_lkf_;
+  belief->frame_id_ = curr_kf_id_;
+  belief->W_Pose_B_ = W_Pose_B_lkf_from_state_;
+
+  bool covariance_set = false;
+  const gtsam::Symbol pose_symbol(kPoseSymbolChar, curr_kf_id_);
+
+#ifdef KIMERA_USE_CBS
+  // In CBS mode, export covariance from BPSAM marginals so shared beliefs reflect the CBS state.
+  if (FLAGS_use_cbs_optimizer) {
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    try {
+      if (cbs_optimizer_->valueExists(pose_symbol)) {
+        const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(pose_symbol);
+        if (cov.rows() >= 6 && cov.cols() >= 6 && cov.allFinite()) {
+          belief->covariance_ = cov.topLeftCorner(6, 6);
+          covariance_set = true;
+        } else {
+          VLOG(2) << "CBS covariance unavailable/invalid for pose key: "
+                  << pose_symbol;
+        }
+      } else {
+        VLOG(2) << "CBS value not found for pose key: " << pose_symbol;
+      }
+    } catch (const std::exception& e) {
+      VLOG(2) << "CBS marginal covariance query failed: " << e.what();
+    }
+  }
+#endif
+
+  // Fallback: use Kimera stored state covariance (if available), preserving legacy behavior.
+  if (!covariance_set) {
+    if (state_covariance_lkf_.rows() >= 6 && state_covariance_lkf_.cols() >= 6) {
+      belief->covariance_ = state_covariance_lkf_.topLeftCorner<6, 6>();
+      covariance_set = true;
+    }
+  }
+
+  // Last-resort fallback keeps outbound belief always valid even when marginals are not ready yet.
+  if (!covariance_set) {
+    belief->covariance_.setIdentity();
+    belief->covariance_.topLeftCorner<3, 3>() *= 1e-2;      // rot
+    belief->covariance_.bottomRightCorner<3, 3>() *= 1e-2;  // trans
+    VLOG(2) << "State covariance unavailable, using fallback identity covariance.";
+  }
+
+  if (!belief->covariance_.allFinite()) {
+    LOG(WARNING) << "Latest external pose belief covariance is non-finite.";
+    return false;
+  }
+
+  // Symmetrize + clamp tiny/negative variances to keep the transmitted Gaussian numerically stable.
+  belief->covariance_ =
+      0.5 * (belief->covariance_ + belief->covariance_.transpose());
+
+  constexpr double kMinVar = 1e-8;
+  for (int i = 0; i < 6; ++i) {
+    if (!std::isfinite(belief->covariance_(i, i)) ||
+        belief->covariance_(i, i) < kMinVar) {
+      belief->covariance_(i, i) = kMinVar;
+    }
+  }
+
+  return true;
+}
+
+// zy Step 14b
+// Intuition: query a timestamp-aligned pose belief (mean + covariance), using CBS marginals when enabled and safe fallback behavior otherwise.
+bool VioBackend::getExternalPoseBeliefAtTimestamp(
+    const Timestamp& query_timestamp_kf_nsec,
+    ExternalPoseBelief* belief,
+    const Timestamp& tolerance_ns) const {
+  CHECK_NOTNULL(belief);
+
+  if (backend_state_ == BackendState::Bootstrap) {
+    return false;
+  }
+
+  const Timestamp effective_tolerance_ns =
+      (tolerance_ns >= 0) ? tolerance_ns : external_prior_timestamp_tolerance_ns_;
+
+  auto absDiffNs = [](Timestamp a, Timestamp b) -> Timestamp {
+    return (a >= b) ? (a - b) : (b - a);
+  };
+
+  bool matched = false;
+  Timestamp matched_timestamp = -1;
+  FrameId matched_frame_id = -1;
+
+  {
+    std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
+    if (timestamp_to_kf_id_map_.empty()) {
+      return false;
+    }
+
+    auto it = timestamp_to_kf_id_map_.lower_bound(query_timestamp_kf_nsec);
+    std::map<Timestamp, FrameId>::const_iterator best_it =
+        timestamp_to_kf_id_map_.end();
+    Timestamp best_dt = std::numeric_limits<Timestamp>::max();
+
+    if (it != timestamp_to_kf_id_map_.end()) {
+      best_it = it;
+      best_dt = absDiffNs(it->first, query_timestamp_kf_nsec);
+    }
+    if (it != timestamp_to_kf_id_map_.begin()) {
+      auto prev_it = std::prev(it);
+      const Timestamp dt = absDiffNs(prev_it->first, query_timestamp_kf_nsec);
+      if (dt < best_dt) {
+        best_it = prev_it;
+        best_dt = dt;
+      }
+    }
+
+    if (best_it != timestamp_to_kf_id_map_.end() &&
+        best_dt <= effective_tolerance_ns) {
+      matched = true;
+      matched_timestamp = best_it->first;
+      matched_frame_id = best_it->second;
+    }
+  }
+
+  if (!matched) {
+    VLOG(2) << "No timestamp match for external belief query. query_ts="
+            << query_timestamp_kf_nsec << ", tol_ns=" << effective_tolerance_ns;
+    return false;
+  }
+
+  const gtsam::Symbol pose_symbol(kPoseSymbolChar, matched_frame_id);
+
+#ifdef KIMERA_USE_CBS
+  // Intuition: in CBS mode, query arbitrary historical pose beliefs directly from BPSAM marginals.
+  if (FLAGS_use_cbs_optimizer) {
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+
+    if (!cbs_optimizer_->valueExists(pose_symbol)) {
+      VLOG(2) << "CBS does not contain requested key: " << pose_symbol;
+      return false;
+    }
+
+    try {
+      belief->timestamp_kf_nsec_ = matched_timestamp;
+      belief->frame_id_ = matched_frame_id;
+      belief->W_Pose_B_ =
+          cbs_optimizer_->calculateEstimate<gtsam::Pose3>(pose_symbol);
+
+      const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(pose_symbol);
+      if (cov.rows() < 6 || cov.cols() < 6 || !cov.allFinite()) {
+        VLOG(2) << "Invalid CBS covariance for key: " << pose_symbol;
+        return false;
+      }
+
+      belief->covariance_ = cov.topLeftCorner(6, 6);
+      belief->covariance_ =
+          0.5 * (belief->covariance_ + belief->covariance_.transpose());
+
+      constexpr double kMinVar = 1e-8;
+      for (int i = 0; i < 6; ++i) {
+        if (!std::isfinite(belief->covariance_(i, i)) ||
+            belief->covariance_(i, i) < kMinVar) {
+          belief->covariance_(i, i) = kMinVar;
+        }
+      }
+
+      return true;
+    } catch (const std::exception& e) {
+      VLOG(2) << "CBS timestamp belief query failed: " << e.what();
+      return false;
+    }
+  }
+#endif
+
+  // Intuition: non-CBS backend only guarantees latest covariance; route latest request to existing API.
+  if (matched_frame_id == curr_kf_id_) {
+    return getLatestExternalPoseBelief(belief);
+  }
+
+  VLOG(2) << "Timestamp belief query for historical frame requires CBS mode. "
+          << "matched_frame_id=" << matched_frame_id
+          << ", curr_kf_id=" << curr_kf_id_;
+  return false;
+}
+
+
+
 /* -------------------------------------------------------------------------- */
 // TODO this function doesn't do just one thing... Should be refactored!
 // It returns the landmark ids of the stereo measurements
@@ -1005,8 +1295,91 @@ void VioBackend::addExternalPosePrior(const FrameId& frame_id,
           << gtsam::Symbol(kPoseSymbolChar, frame_id)
           << " (frame_id=" << frame_id << ").";
 }
+/* -------------------------------------------------------------------------- */
 
 /* -------------------------------------------------------------------------- */
+// zy Step 2_d and 6_c
+// this is only staging. No factor injection yet
+void VioBackend::enqueueExternalPosePrior(
+    const Timestamp& timestamp_kf_nsec,
+    const gtsam::Pose3& W_Pose_B,
+    const gtsam::SharedNoiseModel& noise_model,
+    const std::string& source,
+    uint64_t source_seq) {
+  CHECK(noise_model) << "enqueueExternalPosePrior received null noise model.";
+
+  std::lock_guard<std::mutex> lock(external_pose_priors_queue_mutex_);
+
+  ExternalPosePrior prior;
+  prior.timestamp_kf_nsec_ = timestamp_kf_nsec;
+  prior.W_Pose_B_ = W_Pose_B;
+  prior.noise_model_ = noise_model;
+    
+  prior.source_ = source;
+  prior.source_seq_ = source_seq;
+
+  external_pose_priors_queue_.push_back(std::move(prior));
+
+  if (external_pose_priors_queue_.size() > max_external_pose_priors_queue_size_) {
+    external_pose_priors_queue_.pop_front();
+    LOG_EVERY_N(WARNING, 100)
+        << "External pose prior queue overflow. Dropping oldest prior.";
+  }
+
+  VLOG(1) << "Queued external pose prior ts[nsec]=" << timestamp_kf_nsec
+          << ", source=" << source
+          << ", seq=" << source_seq
+          << ", queue size=" << external_pose_priors_queue_.size();
+}
+/* -------------------------------------------------------------------------- */
+
+/* -------------------------------------------------------------------------- */
+// zy Step 5_b and 6_c
+// bridge code can pass raw covariance matrix directly; backend owns conversion and validation.
+bool VioBackend::enqueueExternalPosePriorFromCovariance(
+    const Timestamp& timestamp_kf_nsec,
+    const gtsam::Pose3& W_Pose_B,
+    const gtsam::Matrix6& covariance,
+    const std::string& source,
+    uint64_t source_seq) {
+  if (!covariance.allFinite()) {
+    LOG(WARNING) << "enqueueExternalPosePriorFromCovariance: covariance has "
+                    "non-finite entries, dropping prior.";
+    return false;
+  }
+
+  // Symmetrize to avoid tiny asymmetries from serialization / numeric noise.
+  gtsam::Matrix6 cov = 0.5 * (covariance + covariance.transpose());
+
+  // Keep covariance numerically well-conditioned.
+  // Ordering is [rot, rot, rot, trans, trans, trans].
+  constexpr double kMinRotVar = 1e-8;    // rad^2
+  constexpr double kMinTransVar = 1e-8;  // m^2
+  for (int i = 0; i < 6; ++i) {
+    const double min_var = (i < 3) ? kMinRotVar : kMinTransVar;
+    if (!std::isfinite(cov(i, i)) || cov(i, i) < min_var) {
+      cov(i, i) = min_var;
+    }
+  }
+
+  gtsam::SharedNoiseModel noise_model;
+  try {
+    noise_model = gtsam::noiseModel::Gaussian::Covariance(cov);
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "enqueueExternalPosePriorFromCovariance: failed to build "
+                    "Gaussian noise from covariance: "
+                 << e.what();
+    return false;
+  }
+
+enqueueExternalPosePrior(
+  timestamp_kf_nsec, W_Pose_B, noise_model, source, source_seq);  
+return true;}
+
+/* -------------------------------------------------------------------------- */
+
+
+
 void VioBackend::addNoMotionFactor(const FrameId& from_id,
                                    const FrameId& to_id) {
   new_imu_prior_and_other_factors_
@@ -1056,52 +1429,217 @@ bool VioBackend::optimize(
     const gtsam::FactorIndices& extra_factor_slots_to_delete) {
   DCHECK(smoother_) << "Incremental smoother is a null pointer.";
 
-  // zy Step 2/3
-  // ---
-  // Inject a one-time external pose prior from within optimize() so it is
-  // guaranteed to execute for ALL backend subclasses (RegularVioBackend, etc).
-  // Placing this in spinOnce() is unreliable because derived backends can
-  // bypass VioBackend::spinOnce() completely.
-  static bool zy_external_prior_injected_once = false;
-  static constexpr FrameId zy_kExternalPriorFrameId = 2;
-  static gtsam::Pose3 zy_injected_W_Pose_B_prior;  // stored for Step 3 compare
+  // Step 4B & 6_5:
+  // Robustly consume external priors with:
+  // 1) age gating (drop very old),
+  // 2) future gating (defer too-future),
+  // 3) nearest timestamp match,
+  // 4) per-update injection cap.
+  constexpr Timestamp kMaxPriorAgeNs = 2 * 1000 * 1000 * 1000LL;      // 2s
+  constexpr Timestamp kMaxFutureLeadNs = 50 * 1000 * 1000LL;           // 50ms
+  constexpr size_t kMaxExternalPriorsPerOptimize = 200;
 
-  // Progress logging: confirm optimize() is being reached and that cur_id
-  // advances as expected.
-  if (!zy_external_prior_injected_once && (cur_id % 5 == 0)) {
-    LOG(WARNING) << "[Step2-debug] optimize() reached. Waiting to inject prior at cur_id="
-                 << zy_kExternalPriorFrameId << ". Current cur_id=" << cur_id;
+  size_t num_external_priors_injected = 0;
+  size_t num_external_priors_deferred = 0;
+  size_t num_external_priors_dropped_old = 0;
+  size_t num_external_priors_dropped_inactive = 0;
+  size_t num_external_priors_deferred_budget = 0;
+
+  // zy Step 12a
+  // In CBS mode, we stage external pose messages as Gaussian beliefs and inject them in one batch.
+  #ifdef KIMERA_USE_CBS
+  std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
+      cbs_incoming_beliefs;
+  size_t num_external_beliefs_staged = 0;
+  size_t num_external_beliefs_rejected = 0;
+  size_t num_external_beliefs_dropped_bad_noise = 0;
+  #endif
+
+
+  auto absDiffNs = [](Timestamp a, Timestamp b) -> Timestamp {
+    return (a >= b) ? (a - b) : (b - a);
+  };
+
+  {
+    std::deque<ExternalPosePrior> remaining_queue;
+    std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
+
+    for (const auto& prior : external_pose_priors_queue_) {
+      // Drop priors that are too old w.r.t current backend timestamp.
+      if (prior.timestamp_kf_nsec_ + kMaxPriorAgeNs < timestamp_kf_nsec) {
+        ++num_external_priors_dropped_old;
+        continue;
+      }
+
+      // Keep priors that are too far in the future; they may match later frames.
+      if (prior.timestamp_kf_nsec_ > timestamp_kf_nsec + kMaxFutureLeadNs) {
+        remaining_queue.push_back(prior);
+        ++num_external_priors_deferred;
+        continue;
+      }
+
+      bool matched = false;
+      FrameId matched_frame_id = -1;
+
+      {
+        std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
+        if (!timestamp_to_kf_id_map_.empty()) {
+          auto it = timestamp_to_kf_id_map_.lower_bound(prior.timestamp_kf_nsec_);
+
+          std::map<Timestamp, FrameId>::const_iterator best_it =
+              timestamp_to_kf_id_map_.end();
+          Timestamp best_dt = std::numeric_limits<Timestamp>::max();
+
+          if (it != timestamp_to_kf_id_map_.end()) {
+            const Timestamp dt = absDiffNs(it->first, prior.timestamp_kf_nsec_);
+            best_it = it;
+            best_dt = dt;
+          }
+          if (it != timestamp_to_kf_id_map_.begin()) {
+            auto prev_it = std::prev(it);
+            const Timestamp dt = absDiffNs(prev_it->first, prior.timestamp_kf_nsec_);
+            if (dt < best_dt) {
+              best_it = prev_it;
+              best_dt = dt;
+            }
+          }
+
+          if (best_it != timestamp_to_kf_id_map_.end() &&
+              best_dt <= external_prior_timestamp_tolerance_ns_) {
+            matched = true;
+            matched_frame_id = best_it->second;
+          }
+        }
+      }
+
+      if (!matched) {
+        remaining_queue.push_back(prior);
+        ++num_external_priors_deferred;
+        continue;
+      }
+
+      // Avoid overloading a single optimize() step.
+      if (num_external_priors_injected >= kMaxExternalPriorsPerOptimize) {
+        remaining_queue.push_back(prior);
+        ++num_external_priors_deferred_budget;
+        continue;
+      }
+
+      const gtsam::Symbol pose_symbol(kPoseSymbolChar, matched_frame_id);
+      // zy Step 12b, edited the original one
+      if (state_.exists(pose_symbol) || new_values_.exists(pose_symbol)) {
+#ifdef KIMERA_USE_CBS
+        if (FLAGS_use_cbs_optimizer) {
+          // In CBS mode, route matched external measurements through BPSAM belief ingestion (not direct priors).
+          CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+
+          gtsam::Matrix66 cov = gtsam::Matrix66::Zero();
+          bool have_cov = false;
+
+          // Convert supported Kimera noise models into covariance because gbp::Gaussian is moment-parameterized.
+          if (auto gaussian_model =
+                  boost::dynamic_pointer_cast<gtsam::noiseModel::Gaussian>(
+                      prior.noise_model_)) {
+            cov = gaussian_model->covariance();
+            have_cov = true;
+          } else if (auto robust_model =
+                         boost::dynamic_pointer_cast<gtsam::noiseModel::Robust>(
+                             prior.noise_model_)) {
+            auto wrapped =
+                boost::dynamic_pointer_cast<gtsam::noiseModel::Gaussian>(
+                    robust_model->noise());
+            if (wrapped) {
+              cov = wrapped->covariance();
+              have_cov = true;
+            }
+          }
+
+          if (!have_cov || !cov.allFinite()) {
+            ++num_external_beliefs_dropped_bad_noise;
+            VLOG(2) << "Dropping external belief with unsupported/non-finite noise. "
+                    << "source=" << prior.source_
+                    << ", seq=" << prior.source_seq_
+                    << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
+            continue;
+          }
+
+          const gtsam::Vector6 mu =
+              gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_B_);
+
+          // Map source tags into CBS agent ids so BPSAM tracks per-sender belief streams.
+          cbs::AgentId sender_id = static_cast<cbs::AgentId>(1);  // default remote
+          if (prior.source_ == "kimera" || prior.source_ == "self") {
+            sender_id = static_cast<cbs::AgentId>(0);
+          } else if (prior.source_ == "liorf" || prior.source_ == "liosam") {
+            sender_id = static_cast<cbs::AgentId>(1);
+          }
+
+          // Stage belief by matched pose key; addBeliefs() will contractively merge before the update step.
+          gbp::Gaussian belief(pose_symbol, mu, cov, 1);
+          cbs_incoming_beliefs[pose_symbol].emplace_back(sender_id, belief);
+          ++num_external_beliefs_staged;
+          ++num_external_priors_injected;
+
+          VLOG(2) << "Staged external CBS belief: source=" << prior.source_
+                  << ", seq=" << prior.source_seq_
+                  << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+                  << ", matched_frame_id=" << matched_frame_id;
+        } else {
+          // Legacy fallback: keep direct prior injection when CBS runtime switch is disabled.
+          addExternalPosePrior(
+              matched_frame_id, prior.W_Pose_B_, prior.noise_model_);
+          ++num_external_priors_injected;
+          VLOG(2) << "Injected external prior: source=" << prior.source_
+                  << ", seq=" << prior.source_seq_
+                  << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+                  << ", matched_frame_id=" << matched_frame_id;
+        }
+#else
+        addExternalPosePrior(
+            matched_frame_id, prior.W_Pose_B_, prior.noise_model_);
+        ++num_external_priors_injected;
+        VLOG(2) << "Injected external prior: source=" << prior.source_
+                << ", seq=" << prior.source_seq_
+                << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+                << ", matched_frame_id=" << matched_frame_id;
+#endif
+      } else {
+
+        ++num_external_priors_dropped_inactive;
+        VLOG(2) << "Matched external prior but pose key inactive. source="
+                << prior.source_ << ", seq=" << prior.source_seq_
+                << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+                << ", frame_id=" << matched_frame_id;
+      } // zy when something behaves oddly, you can trace exact upstream message through Kimera.
+    }
+
+    external_pose_priors_queue_.swap(remaining_queue);
   }
 
-  if (!zy_external_prior_injected_once && cur_id == zy_kExternalPriorFrameId) {
-    // Use the current estimate as a base (world -> body/IMU). At this point
-    // W_Pose_B_lkf_from_state_ corresponds to the previous update, but is a
-    // good deterministic source for a debug prior.
-    zy_injected_W_Pose_B_prior = W_Pose_B_lkf_from_state_;
-
-    // Add an obvious small perturbation so its effect is visible.
-    // (10 cm in world X).
-    zy_injected_W_Pose_B_prior =
-        gtsam::Pose3(zy_injected_W_Pose_B_prior.rotation(),
-                     zy_injected_W_Pose_B_prior.translation() +
-                         gtsam::Point3(0.10, 0.0, 0.0));
-
-    // Noise model: fairly tight translation, moderate rotation.
-    // 6D tangent-space sigmas: [rot_x rot_y rot_z trans_x trans_y trans_z]
-    const gtsam::Vector6 zy_sigmas =
-        (gtsam::Vector6() << 0.10, 0.10, 0.10, 0.05, 0.05, 0.05).finished();
-    const gtsam::SharedNoiseModel zy_noise =
-        gtsam::noiseModel::Diagonal::Sigmas(zy_sigmas);
-
-    addExternalPosePrior(cur_id, zy_injected_W_Pose_B_prior, zy_noise);
-    zy_external_prior_injected_once = true;
-
-    LOG(WARNING) << "[Step2] Injecting external pose prior INSIDE optimize() at cur_id="
-                 << cur_id << " on key " << gtsam::Symbol(kPoseSymbolChar, cur_id);
-    LOG(WARNING) << "[Step2] Prior target translation (W): "
-                 << zy_injected_W_Pose_B_prior.translation().transpose();
+  // zy Step 12c
+  #ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer && !cbs_incoming_beliefs.empty()) {
+    // Flush staged beliefs once per optimize cycle so CBS receives a coherent batch for this iteration.
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    num_external_beliefs_rejected = cbs_optimizer_->addBeliefs(cbs_incoming_beliefs);
+    VLOG(2) << "CBS addBeliefs: staged=" << num_external_beliefs_staged
+            << ", rejected=" << num_external_beliefs_rejected
+            << ", bad_noise=" << num_external_beliefs_dropped_bad_noise;
   }
-  // ---
+  #endif
+
+  if (num_external_priors_injected > 0 || num_external_priors_dropped_old > 0 ||
+      num_external_priors_dropped_inactive > 0 ||
+      num_external_priors_deferred_budget > 0) {
+    VLOG(1) << "External prior stats: injected=" << num_external_priors_injected
+            << ", deferred=" << num_external_priors_deferred
+            << ", dropped_old=" << num_external_priors_dropped_old
+            << ", dropped_inactive=" << num_external_priors_dropped_inactive
+            << ", deferred_budget=" << num_external_priors_deferred_budget
+            << ", queue_size_now=" << external_pose_priors_queue_.size();
+  }
+
+
 
   // Only for statistics and debugging.
   // Store start time to calculate absolute total time taken.
@@ -1298,26 +1836,6 @@ bool VioBackend::optimize(
     if (is_smoother_ok) {
       updateStates(cur_id);
 
-      // zy Step 3
-      // ---
-      // After updateStates(), W_Pose_B_lkf_from_state_ has the optimized pose
-      // for cur_id. If we injected at cur_id==N, then the first chance we have
-      // to observe its effect is on the SAME optimize() call (since the prior
-      // was part of new_factors_tmp for this update).
-      if (zy_external_prior_injected_once && cur_id == zy_kExternalPriorFrameId) {
-        LOG(WARNING) << "[Step3] After optimize() with injected prior at cur_id="
-                     << cur_id;
-        LOG(WARNING) << "[Step3] Optimized translation (W): "
-                     << W_Pose_B_lkf_from_state_.translation().transpose();
-        LOG(WARNING) << "[Step3] Prior target translation (W): "
-                     << zy_injected_W_Pose_B_prior.translation().transpose();
-        LOG(WARNING) << "[Step3] Delta (optimized - prior_target): "
-                     << (W_Pose_B_lkf_from_state_.translation() -
-                         zy_injected_W_Pose_B_prior.translation())
-                            .transpose();
-      }
-      // ---
-
       // TODO: Add Update latest covariance --> move flag
       if (FLAGS_compute_state_covariance) {
         computeStateCovariance();
@@ -1417,15 +1935,21 @@ void VioBackend::addConstantVelocityFactor(const FrameId& from_id,
 
 /* -------------------------------- UPDATE ---------------------------------- */
 void VioBackend::updateStates(const FrameId& cur_id) {
-  VLOG(10) << "Starting to calculate estimate.";
+  // zy Step 11c, edited the original
+  // ---
+    VLOG(10) << "Starting to calculate estimate.";
+#ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    state_ = cbs_optimizer_->calculateEstimate();
+  } else {
+    state_ = smoother_->calculateEstimate();
+  }
+#else
   state_ = smoother_->calculateEstimate();
+#endif
   VLOG(10) << "Finished to calculate estimate.";
 
-  DCHECK(state_.find(gtsam::Symbol(kPoseSymbolChar, cur_id)) != state_.end());
-  DCHECK(state_.find(gtsam::Symbol(kVelocitySymbolChar, cur_id)) !=
-         state_.end());
-  DCHECK(state_.find(gtsam::Symbol(kImuBiasSymbolChar, cur_id)) !=
-         state_.end());
 
   gtsam::Pose3 W_Pose_B_kf =
       state_.at<gtsam::Pose3>(gtsam::Symbol(kPoseSymbolChar, cur_id));
@@ -1713,6 +2237,30 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       counter_of_exceptions_ = 0;
     }
   }
+
+  // zy Step 11b
+  #ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+
+    cbs::BPSAM::UpdateParams cbs_update_params;
+    cbs_update_params.removeFactorIndices.insert(
+        cbs_update_params.removeFactorIndices.end(),
+        delete_slots.begin(),
+        delete_slots.end());
+
+    try {
+      cbs_optimizer_->update(new_factors, new_values, cbs_update_params);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "CBS BPSAM update failed: " << e.what();
+      return false;
+    } catch (...) {
+      LOG(ERROR) << "CBS BPSAM update failed with unknown exception.";
+      return false;
+    }
+  }
+  #endif
+
 
   return true;
 }

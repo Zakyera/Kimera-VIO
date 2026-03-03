@@ -48,6 +48,12 @@
 #include <iostream>
 #include <memory>
 #include <unordered_map>
+// zy Step 2_a
+#include <deque>
+#include <mutex>
+// zy Step 3_a
+#include <map>
+
 
 #include "kimera-vio/backend/VioBackend-definitions.h"
 #include "kimera-vio/backend/VioBackendParams.h"
@@ -61,6 +67,11 @@
 #include "kimera-vio/utils/ThreadsafeQueue.h"
 #include "kimera-vio/utils/UtilsGTSAM.h"
 #include "kimera-vio/utils/UtilsOpenCV.h"
+
+// zy Step 11
+namespace cbs {
+class BPSAM;
+}
 
 namespace VIO {
 
@@ -117,7 +128,23 @@ class VioBackend {
    * optimizing.
    */
   void registerMapUpdateCallback(const MapCallback& map_update_callback);
+  
+  // zy Step 7_a
+  struct ExternalPoseBelief {
+  Timestamp timestamp_kf_nsec_ = -1;
+  FrameId frame_id_ = -1;
+  gtsam::Pose3 W_Pose_B_ = gtsam::Pose3();
+  gtsam::Matrix6 covariance_ = gtsam::Matrix6::Identity();
+  };
 
+  // zy Step 8_a
+  // Register callback invoked when a new external-shareable pose belief is ready.
+  void registerExternalPoseBeliefCallback(
+      const std::function<void(const ExternalPoseBelief&)>&
+          external_pose_belief_callback);
+
+
+  
   // Get valid 3D points - TODO: this copies the graph.
   void get3DPoints(std::vector<gtsam::Point3>* points_3d) const;
 
@@ -145,6 +172,36 @@ class VioBackend {
   void addExternalPosePrior(const FrameId& frame_id,
                             const gtsam::Pose3& W_Pose_B,
                             const gtsam::SharedNoiseModel& noise_model);
+  
+  // zy Step 6_a
+  // caller can tag priors (source="liorf", source_seq=1234) without breaking existing call sites.
+  void enqueueExternalPosePrior(const Timestamp& timestamp_kf_nsec,
+                                const gtsam::Pose3& W_Pose_B,
+                                const gtsam::SharedNoiseModel& noise_model,
+                                const std::string& source = "unknown",
+                                uint64_t source_seq = 0);
+  // zy Step 6_a
+  bool enqueueExternalPosePriorFromCovariance(
+      const Timestamp& timestamp_kf_nsec,
+      const gtsam::Pose3& W_Pose_B,
+      const gtsam::Matrix6& covariance,
+      const std::string& source = "unknown",
+      uint64_t source_seq = 0);
+
+
+  /**
+   * @brief Get the latest backend pose belief for external sharing (CBS/bridge).
+   * @return true if a valid belief was produced, false otherwise.
+   */
+  bool getLatestExternalPoseBelief(ExternalPoseBelief* belief) const;
+
+  // zy Step 14a
+  // Intuition: support timestamp-driven CBS exchange by querying belief for the nearest matched keyframe.
+  bool getExternalPoseBeliefAtTimestamp(const Timestamp& query_timestamp_kf_nsec,
+                                        ExternalPoseBelief* belief,
+                                        const Timestamp& tolerance_ns = -1) const;
+
+
 
   // Update covariance matrix using getCurrentStateCovariance()
   // NOT TESTED
@@ -507,6 +564,13 @@ class VioBackend {
   // ISAM2 smoother
   std::unique_ptr<Smoother> smoother_;
 
+  // zy Step 10d
+  #ifdef KIMERA_USE_CBS
+  std::shared_ptr<cbs::BPSAM> cbs_optimizer_;
+  #endif
+
+
+
   // Values
   //!< new states to be added
   gtsam::Values new_values_;
@@ -520,6 +584,29 @@ class VioBackend {
   SmartFactorMap old_smart_factors_;
   // if SlotIndex is -1, means that the factor has not been inserted yet in
   // the graph
+
+  // zy Step 2_c
+  // stores timestamped priors until optimize() consumes them; queue cap prevents unbounded growth.
+  struct ExternalPosePrior {
+  Timestamp timestamp_kf_nsec_ = -1;
+  gtsam::Pose3 W_Pose_B_ = gtsam::Pose3();
+  gtsam::SharedNoiseModel noise_model_;
+  std::string source_ = "unknown";
+  uint64_t source_seq_ = 0;
+  };
+
+  mutable std::mutex external_pose_priors_queue_mutex_;
+  std::deque<ExternalPosePrior> external_pose_priors_queue_;
+  size_t max_external_pose_priors_queue_size_ = 5000;
+
+  // zy Step 3_b
+  // this map lets us match incoming belief timestamps to Kimera frame IDs, including old poses.
+  mutable std::mutex timestamp_to_kf_id_map_mutex_;
+  std::map<Timestamp, FrameId> timestamp_to_kf_id_map_;
+  size_t max_timestamp_to_kf_id_map_size_ = 20000;
+  Timestamp external_prior_timestamp_tolerance_ns_ = 2000000;  // 2 ms
+
+
 
   // Data:
   // TODO grows unbounded currently, but it should be limited to time horizon.
@@ -537,6 +624,11 @@ class VioBackend {
 
   //! Map update callback for the frontend PnP tracker.
   MapCallback map_update_callback_;
+
+  // zy Step 8_b
+  // stores the bridge callback function in backend state.
+  std::function<void(const ExternalPoseBelief&)> external_pose_belief_callback_;
+
 
   // Debug info.
   DebugVioInfo debug_info_;

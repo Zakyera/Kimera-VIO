@@ -34,6 +34,26 @@ find_package(KimeraRPGO REQUIRED)
 # Pangolin is optional
 find_package(Pangolin QUIET)
 
+# Step 10a
+option(KIMERA_USE_CBS "Build Kimera-VIO with CBS/BPSAM integration hooks" OFF)
+if(KIMERA_USE_CBS)
+  set(_CBS_SRC_HINT "${CMAKE_CURRENT_SOURCE_DIR}/../../../cbs_ws/src")
+
+  if(NOT cbs_DIR AND EXISTS "${_CBS_SRC_HINT}/cbs/build/cbsConfig.cmake")
+    set(cbs_DIR "${_CBS_SRC_HINT}/cbs/build" CACHE PATH
+        "Directory containing cbsConfig.cmake")
+  endif()
+
+  if(NOT aria_common_DIR AND
+     EXISTS "${_CBS_SRC_HINT}/aria_common/build/aria_commonConfig.cmake")
+    set(aria_common_DIR "${_CBS_SRC_HINT}/aria_common/build" CACHE PATH
+        "Directory containing aria_commonConfig.cmake")
+  endif()
+
+  find_package(cbs REQUIRED CONFIG)
+endif()
+
+
 include(VerifyGtsamConfig)
 option(KIMERA_VERIFY_GTSAM_CONFIG "Check that GTSAM was compiled with the right options" ON)
 if (KIMERA_VERIFY_GTSAM_CONFIG)
@@ -148,6 +168,15 @@ target_link_libraries(${PROJECT_NAME}
     gtsam_unstable
     opengv
 )
+# zy Step 10b
+if(KIMERA_USE_CBS)
+  target_link_libraries(${PROJECT_NAME}
+    PUBLIC
+      cbs
+  )
+  target_compile_definitions(${PROJECT_NAME} PUBLIC KIMERA_USE_CBS=1)
+endif()
+
 target_include_directories(${PROJECT_NAME}
   PUBLIC
     ${DBoW2_INCLUDE_DIRS}
