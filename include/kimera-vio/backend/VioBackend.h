@@ -73,6 +73,10 @@ namespace cbs {
 class BPSAM;
 }
 
+#ifdef KIMERA_USE_CBS
+DECLARE_bool(use_cbs_optimizer);
+#endif
+
 namespace VIO {
 
 // Forward-declarations
@@ -264,9 +268,8 @@ class VioBackend {
         VioNavStateTimestamped(input.timestamp_, initial_state_estimate));
   }
 
-  inline void saveGraph(const std::string& filepath) const {
-    smoother_->getFactors().saveGraph(filepath);
-  }
+  // Intuition: implementation lives in .cpp so CBS type is complete when used.
+  void saveGraph(const std::string& filepath) const;
 
  protected:
   enum class BackendState {
@@ -567,6 +570,10 @@ class VioBackend {
   // zy Step 10d
   #ifdef KIMERA_USE_CBS
   std::shared_ptr<cbs::BPSAM> cbs_optimizer_;
+  // zy step 18a cache last CBS iSAM2-style update indices so smart-factor slot bookkeeping can follow CBS slots.
+  gtsam::ISAM2Result cbs_last_update_result_;
+  bool cbs_has_last_update_result_ = false;
+
   #endif
 
 

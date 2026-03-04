@@ -68,6 +68,7 @@ void VioBackendModule::enqueueExternalPosePrior(
       timestamp_kf_nsec, W_Pose_B, noise_model, source, source_seq);
 }
 
+// zy
 bool VioBackendModule::enqueueExternalPosePriorFromCovariance(
     const Timestamp& timestamp_kf_nsec,
     const gtsam::Pose3& W_Pose_B,
@@ -79,5 +80,15 @@ bool VioBackendModule::enqueueExternalPosePriorFromCovariance(
       timestamp_kf_nsec, W_Pose_B, covariance, source, source_seq);
 }
 
+// zy keep Pipeline decoupled from backend internals while enabling synchronized timestamp-based belief retrieval.
+bool VioBackendModule::getExternalPoseBeliefAtTimestamp(
+    const Timestamp& query_timestamp_kf_nsec,
+    VioBackend::ExternalPoseBelief* belief,
+    const Timestamp& tolerance_ns) const {
+  CHECK(vio_backend_);
+  return vio_backend_->getExternalPoseBeliefAtTimestamp(
+      query_timestamp_kf_nsec, belief, tolerance_ns);
+}
 
 }  // namespace VIO
+

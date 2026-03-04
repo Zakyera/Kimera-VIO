@@ -121,6 +121,16 @@ class Pipeline {
         timestamp_kf_nsec, W_Pose_B, covariance, source, source_seq);
   }
 
+  // zy Step 15c
+  // Intuition: expose timestamp-based belief query at pipeline boundary for synchronized multi-estimator fusion.
+  inline bool getExternalPoseBeliefAtTimestamp(
+      const Timestamp& query_timestamp_kf_nsec,
+      VioBackend::ExternalPoseBelief* belief,
+      const Timestamp& tolerance_ns = -1) const {
+    CHECK(vio_backend_module_);
+    return vio_backend_module_->getExternalPoseBeliefAtTimestamp(
+        query_timestamp_kf_nsec, belief, tolerance_ns);
+  }
 
   inline LcdModule* getLcdModule() const { return lcd_module_.get(); }
 

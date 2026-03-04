@@ -98,6 +98,13 @@ class VioBackendModule
       const std::string& source = "unknown",
       uint64_t source_seq = 0);
 
+  // zy Step 15a
+  // forward timestamp-based belief queries through the module API used by Pipeline.
+  bool getExternalPoseBeliefAtTimestamp(
+      const Timestamp& query_timestamp_kf_nsec,
+      VioBackend::ExternalPoseBelief* belief,
+      const Timestamp& tolerance_ns = -1) const;
+
 
  protected:
   const VioBackend::UniquePtr vio_backend_;

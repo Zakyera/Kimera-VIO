@@ -89,13 +89,16 @@ DEFINE_bool(no_incremental_pose,
             false,
             "Flag to disable incremental pose usage in backend");
 
-// zy Step 11a
+// zy Step 11a & 26
 #ifdef KIMERA_USE_CBS
+// Intuition: full-replacement mode should default to CBS so we don't accidentally run legacy optimizer.
 DEFINE_bool(use_cbs_optimizer,
-            false,
-            "If true (and compiled with KIMERA_USE_CBS), run CBS BPSAM in "
-            "parallel and use CBS estimate as backend state output.");
+            true,
+            "If true (and compiled with KIMERA_USE_CBS), use CBS BPSAM as the "
+            "backend optimization heart. Set false to fall back to legacy "
+            "fixed-lag smoother.");
 #endif
+
 
 
 namespace VIO {
@@ -160,12 +163,19 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   BackendParams::setIsam2Params(backend_params, &cbs_isam_params);
 
   cbs::BPSAM::Params cbs_params;
-  cbs_params.robot_id = static_cast<cbs::AgentId>(0);
+  // zy Step 33: use CBS-native printable agent IDs so robot/pose labeled keys behave consistently across modules.
+  constexpr cbs::AgentId kKimeraAgentId = static_cast<cbs::AgentId>('a');
+  cbs_params.robot_id = kKimeraAgentId;
+
   cbs_params.sam_params_ = cbs_isam_params;
   cbs_params.enable_gkcm = false;  // start simple; enable later if needed.
 
   cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
-  LOG(INFO) << "CBS BPSAM scaffold initialized (inactive).";
+  // LOG(INFO) << "CBS BPSAM scaffold initialized (inactive)."; (zy cancelled it)
+  // zy Step 27: startup log must state runtime mode so we can verify CBS-heart activation from logs.
+  LOG(INFO) << "CBS BPSAM initialized. use_cbs_optimizer="
+          << (FLAGS_use_cbs_optimizer ? "true" : "false");
+
 #endif
 // zy -------
 
@@ -224,6 +234,21 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
       getImuBiasPrevKf().print();
     }
 
+    // zy Step 23
+    // Intuition: always read/output factors from the optimizer that is currently active (CBS or legacy smoother).
+    const gtsam::NonlinearFactorGraph* output_factor_graph = nullptr;
+#ifdef KIMERA_USE_CBS
+    if (FLAGS_use_cbs_optimizer) {
+      CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+      output_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
+    } else
+#endif
+    {
+      CHECK(smoother_);
+      output_factor_graph = &smoother_->getFactors();
+    }
+    CHECK_NOTNULL(output_factor_graph);
+
     // TODO(Toni): remove all of this.... It should be done in 3DVisualizer
     // or in the Mesher depending on who needs what...
     // Generate extra optional backend ouputs.
@@ -240,10 +265,16 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
       // Also, if lmk type requested, fill lmk id to lmk type object.
       // WARNING this also cleans the lmks inside the old_smart_factors map!
       lmk_ids_to_3d_points_in_time_horizon =
+          // getMapLmkIdsTo3dPointsInTimeHorizon(
+          //     smoother_->getFactors(),
+          //     kOutputLmkTypeMap ? &lmk_id_to_lmk_type_map : nullptr,
+          //     kMinLmkObs); (zy cancelled it)
+          // zy Step 23b: map extraction must use the same active factor graph used by the optimizer.
           getMapLmkIdsTo3dPointsInTimeHorizon(
-              smoother_->getFactors(),
+              *output_factor_graph,
               kOutputLmkTypeMap ? &lmk_id_to_lmk_type_map : nullptr,
               kMinLmkObs);
+
     }
     // zy Step 8_d, edited existing code 
     if (map_update_callback_) {
@@ -275,7 +306,9 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
             imu_bias_lkf_),
         // TODO(Toni): Make all below optional!!
         state_,
-        smoother_->getFactors(),
+        // smoother_->getFactors(), (zy cancelled it)
+        // zy Step 23c: downstream modules should receive the active graph (CBS in CBS mode).
+        *output_factor_graph,
         getCurrentStateCovariance(),
         curr_kf_id_,
         landmark_count_,
@@ -309,6 +342,20 @@ void VioBackend::registerImuBiasUpdateCallback(
 void VioBackend::registerMapUpdateCallback(
     const MapCallback& map_update_callback) {
   map_update_callback_ = map_update_callback;
+}
+
+void VioBackend::saveGraph(const std::string& filepath) const {
+#ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    // Intuition: when CBS is active, graph export must come from BPSAM (true optimization heart), not legacy smoother.
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    cbs_optimizer_->getFactorsUnsafe().saveGraph(filepath);
+    return;
+  }
+#endif
+  // Intuition: keep original behavior for non-CBS mode.
+  CHECK(smoother_);
+  smoother_->getFactors().saveGraph(filepath);
 }
 
 // zy Step 8_c
@@ -798,9 +845,62 @@ PointsWithIdMap VioBackend::getMapLmkIdsTo3dPointsInTimeHorizon(
   return points_with_id;
 }
 
+// zy Step 17, "i replaced the whole original function"
 /* -------------------------------------------------------------------------- */
 // NOT TESTED (--> There is a UnitTest function in UtilsOpenCV)
 void VioBackend::computeStateCovariance() {
+#ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    // Intuition: in CBS-heart mode, covariance must come from BPSAM marginals, not from the legacy fixed-lag smoother.
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    
+    // Intuition: BPSAM exposes per-key marginals; we build a conservative block-diagonal [x(6), v(3), b(6)] covariance.
+    state_covariance_lkf_ = gtsam::Matrix::Identity(15, 15) * 1e-6;
+
+    const gtsam::Symbol pose_key(kPoseSymbolChar, curr_kf_id_);
+    const gtsam::Symbol vel_key(kVelocitySymbolChar, curr_kf_id_);
+    const gtsam::Symbol bias_key(kImuBiasSymbolChar, curr_kf_id_);
+
+    if (cbs_optimizer_->valueExists(pose_key)) {
+      const gtsam::Matrix pose_cov = cbs_optimizer_->marginalCovariance(pose_key);
+      if (pose_cov.rows() >= 6 && pose_cov.cols() >= 6 && pose_cov.allFinite()) {
+        state_covariance_lkf_.block(0, 0, 6, 6) = pose_cov.topLeftCorner(6, 6);
+      } else {
+        VLOG(2) << "Invalid CBS pose covariance for key: " << pose_key;
+      }
+    } else {
+      VLOG(2) << "CBS pose key not found for covariance: " << pose_key;
+    }
+
+    if (cbs_optimizer_->valueExists(vel_key)) {
+      const gtsam::Matrix vel_cov = cbs_optimizer_->marginalCovariance(vel_key);
+      if (vel_cov.rows() >= 3 && vel_cov.cols() >= 3 && vel_cov.allFinite()) {
+        state_covariance_lkf_.block(6, 6, 3, 3) = vel_cov.topLeftCorner(3, 3);
+      } else {
+        VLOG(2) << "Invalid CBS velocity covariance for key: " << vel_key;
+      }
+    } else {
+      VLOG(2) << "CBS velocity key not found for covariance: " << vel_key;
+    }
+
+    if (cbs_optimizer_->valueExists(bias_key)) {
+      const gtsam::Matrix bias_cov = cbs_optimizer_->marginalCovariance(bias_key);
+      if (bias_cov.rows() >= 6 && bias_cov.cols() >= 6 && bias_cov.allFinite()) {
+        state_covariance_lkf_.block(9, 9, 6, 6) = bias_cov.topLeftCorner(6, 6);
+      } else {
+        VLOG(2) << "Invalid CBS bias covariance for key: " << bias_key;
+      }
+    } else {
+      VLOG(2) << "CBS bias key not found for covariance: " << bias_key;
+    }
+
+    // Intuition: enforce numeric symmetry before publishing/consuming covariance downstream.
+    state_covariance_lkf_ =
+        0.5 * (state_covariance_lkf_ + state_covariance_lkf_.transpose());
+    return;
+  }
+#endif
+
   gtsam::Marginals marginals(smoother_->getFactors(),
                              state_,
                              gtsam::Marginals::Factorization::CHOLESKY);
@@ -816,6 +916,7 @@ void VioBackend::computeStateCovariance() {
       marginals.jointMarginalCovariance(keys)
           .fullMatrix());  // 6 + 3 + 6 = 15x15matrix
 }
+
 
 // zy Step 7_b
 // When CBS is driving estimates, outgoing belief should carry CBS covariance, not legacy smoother covariance.
@@ -999,8 +1100,8 @@ bool VioBackend::getExternalPoseBeliefAtTimestamp(
   }
 #endif
 
-  // Intuition: non-CBS backend only guarantees latest covariance; route latest request to existing API.
-  if (matched_frame_id == curr_kf_id_) {
+  // zy 19b keep key-type comparison explicit and warning-free across platforms.
+  if (matched_frame_id == static_cast<FrameId>(curr_kf_id_)) {
     return getLatestExternalPoseBelief(belief);
   }
 
@@ -1453,6 +1554,13 @@ bool VioBackend::optimize(
   size_t num_external_beliefs_staged = 0;
   size_t num_external_beliefs_rejected = 0;
   size_t num_external_beliefs_dropped_bad_noise = 0;
+  // Step 31a: avoid silently mixing beliefs from unknown senders into a wrong CBS agent stream.
+  size_t num_external_beliefs_dropped_unknown_source = 0;
+  // Intuition: avoid self-feedback loops where Kimera re-fuses its own published belief.
+  size_t num_external_beliefs_dropped_self_source = 0;
+  // zy Step 33b
+  constexpr cbs::AgentId kKimeraAgentId = static_cast<cbs::AgentId>('a');
+  constexpr cbs::AgentId kLiorfAgentId = static_cast<cbs::AgentId>('b');
   #endif
 
 
@@ -1527,7 +1635,21 @@ bool VioBackend::optimize(
 
       const gtsam::Symbol pose_symbol(kPoseSymbolChar, matched_frame_id);
       // zy Step 12b, edited the original one
-      if (state_.exists(pose_symbol) || new_values_.exists(pose_symbol)) {
+      // zy Step 28a: key-availability must be checked against the optimizer that is actually active (CBS or legacy).
+      bool pose_key_is_active = false;
+#ifdef KIMERA_USE_CBS
+      if (FLAGS_use_cbs_optimizer) {
+        CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+        pose_key_is_active =
+            cbs_optimizer_->valueExists(pose_symbol) || new_values_.exists(pose_symbol);
+      } else
+#endif
+      {
+        pose_key_is_active =
+            state_.exists(pose_symbol) || new_values_.exists(pose_symbol);
+      }
+
+      if (pose_key_is_active) {
 #ifdef KIMERA_USE_CBS
         if (FLAGS_use_cbs_optimizer) {
           // In CBS mode, route matched external measurements through BPSAM belief ingestion (not direct priors).
@@ -1566,13 +1688,48 @@ bool VioBackend::optimize(
           const gtsam::Vector6 mu =
               gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_B_);
 
-          // Map source tags into CBS agent ids so BPSAM tracks per-sender belief streams.
-          cbs::AgentId sender_id = static_cast<cbs::AgentId>(1);  // default remote
+          // // Map source tags into CBS agent ids so BPSAM tracks per-sender belief streams.
+          // cbs::AgentId sender_id = static_cast<cbs::AgentId>(1);  // default remote
+          // if (prior.source_ == "kimera" || prior.source_ == "self") {
+          //   sender_id = static_cast<cbs::AgentId>(0);
+          // } else if (prior.source_ == "liorf" || prior.source_ == "liosam") {
+          //   sender_id = static_cast<cbs::AgentId>(1);
+          // } (zy cancelled it)
+
+          // zy Step 33c: map sender tags to stable CBS multi-agent IDs used by labeled robot anchors.
+          cbs::AgentId sender_id = kKimeraAgentId;
+          bool known_source = true;
           if (prior.source_ == "kimera" || prior.source_ == "self") {
-            sender_id = static_cast<cbs::AgentId>(0);
+            sender_id = kKimeraAgentId;
           } else if (prior.source_ == "liorf" || prior.source_ == "liosam") {
-            sender_id = static_cast<cbs::AgentId>(1);
+            sender_id = kLiorfAgentId;
+          } else {
+            known_source = false;
           }
+
+
+          if (!known_source) {
+            ++num_external_beliefs_dropped_unknown_source;
+            VLOG(2) << "Dropping external belief with unknown source tag. "
+                    << "source=" << prior.source_
+                    << ", seq=" << prior.source_seq_
+                    << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
+            continue;
+          }
+
+          // zy Step 35b
+          if (sender_id == kKimeraAgentId) {
+            ++num_external_beliefs_dropped_self_source;
+            VLOG(2) << "Dropping self-source belief to prevent feedback loop. "
+                    << "source=" << prior.source_
+                    << ", seq=" << prior.source_seq_
+                    << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
+            continue;
+          }
+
+
+
+
 
           // Stage belief by matched pose key; addBeliefs() will contractively merge before the update step.
           gbp::Gaussian belief(pose_symbol, mu, cov, 1);
@@ -1624,7 +1781,10 @@ bool VioBackend::optimize(
     num_external_beliefs_rejected = cbs_optimizer_->addBeliefs(cbs_incoming_beliefs);
     VLOG(2) << "CBS addBeliefs: staged=" << num_external_beliefs_staged
             << ", rejected=" << num_external_beliefs_rejected
-            << ", bad_noise=" << num_external_beliefs_dropped_bad_noise;
+            << ", bad_noise=" << num_external_beliefs_dropped_bad_noise
+            << ", unknown_source=" << num_external_beliefs_dropped_unknown_source
+            << ", self_source=" << num_external_beliefs_dropped_self_source;
+
   }
   #endif
 
@@ -1660,6 +1820,20 @@ bool VioBackend::optimize(
   // vio).
   gtsam::FactorIndices delete_slots = extra_factor_slots_to_delete;
 
+  // zy Step 22a: pick the currently active optimizer graph (CBS or legacy) so debug/bookkeeping reads the correct factor graph.
+  const gtsam::NonlinearFactorGraph* active_factor_graph = nullptr;
+#ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    active_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
+  } else
+#endif
+  {
+    active_factor_graph = &smoother_->getFactors();
+  }
+  CHECK_NOTNULL(active_factor_graph);
+
+
   // TODO we know the actual end size... but I am not sure how to use factor
   // graph API for appending factors without copying or re-allocation...
   std::vector<LandmarkId> lmk_ids_of_new_smart_factors_tmp;
@@ -1667,13 +1841,104 @@ bool VioBackend::optimize(
   gtsam::NonlinearFactorGraph new_factors_tmp;
   new_factors_tmp.reserve(new_smart_factors_size +
                           new_imu_prior_and_other_factors_.size());
-  for (const auto& new_smart_factor : new_smart_factors_) {
-    // Push back the smart factor to the list of new factors to add to the
-    // graph. // Smart factor, so same address right?
-    LandmarkId lmk_id = new_smart_factor.first;  // don't use &
+// zy cancelled it  for (const auto& new_smart_factor : new_smart_factors_) {
+//     // Push back the smart factor to the list of new factors to add to the
+//     // graph. // Smart factor, so same address right?
+//     LandmarkId lmk_id = new_smart_factor.first;  // don't use &
 
-    // Find smart factor and slot in old_smart_factors_ corresponding to
-    // the lmk with id of the new smart factor.
+//     // Find smart factor and slot in old_smart_factors_ corresponding to
+//     // the lmk with id of the new smart factor.
+//     const auto& old_smart_factor_it = old_smart_factors_.find(lmk_id);
+//     CHECK(old_smart_factor_it != old_smart_factors_.end())
+//         << "Lmk with id: " << lmk_id
+//         << " could not be found in old_smart_factors_.";
+
+//     // Slot slot = old_smart_factor_it->second.second; (zy cancelled it)
+//     // zy 19a
+//     Slot slot = old_smart_factor_it->second.second;
+//     if (slot != -1) {
+//       DCHECK_GE(slot, 0);
+
+//       bool slot_is_active = false;
+// #ifdef KIMERA_USE_CBS
+//       if (FLAGS_use_cbs_optimizer) {
+//         // Intuition: when CBS is active, slot validity must be checked against the CBS factor graph.
+//         CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+//         slot_is_active = cbs_optimizer_->getFactorsUnsafe().exists(slot);
+//       } else
+// #endif
+//       {
+//         // Intuition: preserve original fixed-lag slot check when CBS mode is disabled.
+//         slot_is_active = smoother_->getFactors().exists(slot);
+//       }
+
+//       if (slot_is_active) {
+//         // Intuition: replace stale smart factor with its refreshed version for this landmark.
+//         delete_slots.push_back(slot);
+//         new_factors_tmp.push_back(new_smart_factor.second);
+//         lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
+//       } else {
+//         // Intuition: if the previous slot no longer exists, drop stale bookkeeping to keep horizon state consistent.
+//         old_smart_factors_.erase(old_smart_factor_it);
+//         CHECK(deleteLmkFromFeatureTracks(lmk_id));
+//       }
+//     } else {
+//       // Intuition: slot -1 means this smart factor has never been inserted yet, so add it now.
+//       new_factors_tmp.push_back(new_smart_factor.second);
+//       lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
+//     }
+
+
+//       bool slot_is_active = false;
+// #ifdef KIMERA_USE_CBS
+//       if (FLAGS_use_cbs_optimizer) {
+//         // Intuition: in CBS mode, validate smart-factor slots against CBS factor graph, not the legacy smoother graph.
+//         CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+//         slot_is_active = cbs_optimizer_->getFactorsUnsafe().exists(slot);
+//       } else
+// #endif
+//       {
+//         // Intuition: preserve original fixed-lag behavior when CBS mode is disabled.
+//         slot_is_active = smoother_->getFactors().exists(slot);
+//       }
+
+//       if (slot_is_active) {
+//       // Smart factor Slot is different than -1, therefore the factor should be
+//       // already in the factor graph.
+//       DCHECK_GE(slot, 0);
+//       if (smoother_->getFactors().exists(slot)) {
+//         // Confirmed, the factor is in the graph.
+//         // We must delete the old smart factor from the graph.
+//         // TODO what happens if delete_slots has repeated elements?
+//         delete_slots.push_back(slot);
+//         // And we must add the new smart factor to the graph.
+//         new_factors_tmp.push_back(new_smart_factor.second);
+//         // Store lmk id of the smart factor to add to the graph.
+//         lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
+//       } else {
+//         // This should not happen, unless feature tracks are so long
+//         // (longer than factor graph's time horizon), than the factor has been
+//         // removed from the optimization.
+//         // Erase this factor and feature track, as it has gone past the horizon.
+//         // TODO(marcus): check with toni if this needs a warning
+//         old_smart_factors_.erase(old_smart_factor_it);
+//         CHECK(deleteLmkFromFeatureTracks(lmk_id));
+//         // TODO(Toni): we should as well remove it from new_smart_factors_!!
+//       }
+//     } else {
+//       // We just add the new smart factor to the graph, as it has never been
+//       // there before.
+//       new_factors_tmp.push_back(new_smart_factor.second);
+//       // Store lmk id of the smart factor to add to the graph.
+//       lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
+//     }
+//   }
+  // zy step 20
+  for (const auto& new_smart_factor : new_smart_factors_) {
+    // Push back the smart factor to the list of new factors to add to the graph.
+    LandmarkId lmk_id = new_smart_factor.first;
+
+    // Find smart factor and slot in old_smart_factors_ corresponding to this landmark.
     const auto& old_smart_factor_it = old_smart_factors_.find(lmk_id);
     CHECK(old_smart_factor_it != old_smart_factors_.end())
         << "Lmk with id: " << lmk_id
@@ -1681,33 +1946,34 @@ bool VioBackend::optimize(
 
     Slot slot = old_smart_factor_it->second.second;
     if (slot != -1) {
-      // Smart factor Slot is different than -1, therefore the factor should be
-      // already in the factor graph.
       DCHECK_GE(slot, 0);
-      if (smoother_->getFactors().exists(slot)) {
-        // Confirmed, the factor is in the graph.
-        // We must delete the old smart factor from the graph.
-        // TODO what happens if delete_slots has repeated elements?
+
+      bool slot_is_active = false;
+#ifdef KIMERA_USE_CBS
+      if (FLAGS_use_cbs_optimizer) {
+        // Intuition: in CBS mode, validate smart-factor slots against CBS graph ownership.
+        CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+        slot_is_active = cbs_optimizer_->getFactorsUnsafe().exists(slot);
+      } else
+#endif
+      {
+        // Intuition: in legacy mode, keep slot validation against the fixed-lag smoother graph.
+        slot_is_active = smoother_->getFactors().exists(slot);
+      }
+
+      if (slot_is_active) {
+        // Intuition: replace previous smart factor for this landmark with the refreshed factor.
         delete_slots.push_back(slot);
-        // And we must add the new smart factor to the graph.
         new_factors_tmp.push_back(new_smart_factor.second);
-        // Store lmk id of the smart factor to add to the graph.
         lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
       } else {
-        // This should not happen, unless feature tracks are so long
-        // (longer than factor graph's time horizon), than the factor has been
-        // removed from the optimization.
-        // Erase this factor and feature track, as it has gone past the horizon.
-        // TODO(marcus): check with toni if this needs a warning
+        // Intuition: if old slot vanished, drop stale bookkeeping so horizon state stays consistent.
         old_smart_factors_.erase(old_smart_factor_it);
         CHECK(deleteLmkFromFeatureTracks(lmk_id));
-        // TODO(Toni): we should as well remove it from new_smart_factors_!!
       }
     } else {
-      // We just add the new smart factor to the graph, as it has never been
-      // there before.
+      // Intuition: slot -1 means first insertion of this smart factor into the graph.
       new_factors_tmp.push_back(new_smart_factor.second);
-      // Store lmk id of the smart factor to add to the graph.
       lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
     }
   }
@@ -1736,25 +2002,66 @@ bool VioBackend::optimize(
     }
   }
 
+  // if (VLOG_IS_ON(10)) {
+  //   printSmootherInfo(new_factors_tmp,
+  //                     delete_slots,
+  //                     "Smoother status before update:",
+  //                     VLOG_IS_ON(10));
+  // } (zy cancelled it)
+
+  // zy Step 22b
   if (VLOG_IS_ON(10)) {
+#ifdef KIMERA_USE_CBS
+    if (FLAGS_use_cbs_optimizer) {
+      // Intuition: avoid dumping stale fixed-lag internals when CBS is the active optimization heart.
+      VLOG(10) << "CBS mode: skipping legacy printSmootherInfo() dump.";
+    } else {
+      printSmootherInfo(new_factors_tmp,
+                        delete_slots,
+                        "Smoother status before update:",
+                        VLOG_IS_ON(10));
+    }
+#else
     printSmootherInfo(new_factors_tmp,
                       delete_slots,
                       "Smoother status before update:",
                       VLOG_IS_ON(10));
+#endif
   }
 
-  // Recreate the graph before marginalization.
+
+  // // Recreate the graph before marginalization.
+  // if (VLOG_IS_ON(10) && FLAGS_debug_graph_before_opt) {
+  //   debug_info_.graphBeforeOpt = smoother_->getFactors();
+  //   debug_info_.graphToBeDeleted = gtsam::NonlinearFactorGraph();
+  //   debug_info_.graphToBeDeleted.resize(delete_slots.size());
+  //   for (size_t i = 0u; i < delete_slots.size(); i++) {
+  //     // If the factor is to be deleted, store it as graph to be deleted.
+  //     CHECK(smoother_->getFactors().exists(delete_slots.at(i)));
+  //     debug_info_.graphToBeDeleted.at(i) =
+  //         smoother_->getFactors().at(delete_slots.at(i));
+  //   }
+  // } (zy cancelled it)
+
+  // zy Step 22c 
   if (VLOG_IS_ON(10) && FLAGS_debug_graph_before_opt) {
-    debug_info_.graphBeforeOpt = smoother_->getFactors();
+    // Intuition: snapshot/delete-debug must track the active optimizer graph to keep slot references valid.
+    debug_info_.graphBeforeOpt = *active_factor_graph;
     debug_info_.graphToBeDeleted = gtsam::NonlinearFactorGraph();
     debug_info_.graphToBeDeleted.resize(delete_slots.size());
     for (size_t i = 0u; i < delete_slots.size(); i++) {
-      // If the factor is to be deleted, store it as graph to be deleted.
-      CHECK(smoother_->getFactors().exists(delete_slots.at(i)));
-      debug_info_.graphToBeDeleted.at(i) =
-          smoother_->getFactors().at(delete_slots.at(i));
+      if (active_factor_graph->exists(delete_slots.at(i))) {
+        debug_info_.graphToBeDeleted.at(i) =
+            active_factor_graph->at(delete_slots.at(i));
+      } else {
+        VLOG(2) << "Delete slot " << delete_slots.at(i)
+                << " not found in active factor graph.";
+      }
     }
   }
+
+
+
 
   // Use current timestamp for each new value. This timestamp will be used
   // to determine if the variable should be marginalized.
@@ -1819,12 +2126,27 @@ bool VioBackend::optimize(
 
     ////////////////////////////////////////////////////////////////////////////
 
-    // Do some more optimization iterations.
-    for (size_t n_iter = 1; n_iter < max_extra_iterations && is_smoother_ok;
-         ++n_iter) {
-      VLOG(10) << "Doing extra iteration nr: " << n_iter;
-      is_smoother_ok = updateSmoother(&result);
+    // // Do some more optimization iterations.
+    // for (size_t n_iter = 1; n_iter < max_extra_iterations && is_smoother_ok;
+    //      ++n_iter) {
+    //   VLOG(10) << "Doing extra iteration nr: " << n_iter;
+    //   is_smoother_ok = updateSmoother(&result);
+    // } (zy cancelled it)
+
+    // ZY Step 21: CBS already performs its own incremental update; repeating empty legacy-style iterations adds no value.
+#ifdef KIMERA_USE_CBS
+    const bool run_extra_iterations = !FLAGS_use_cbs_optimizer;
+#else
+    const bool run_extra_iterations = true;
+#endif
+    if (run_extra_iterations) {
+      for (size_t n_iter = 1; n_iter < max_extra_iterations && is_smoother_ok;
+           ++n_iter) {
+        VLOG(10) << "Doing extra iteration nr: " << n_iter;
+        is_smoother_ok = updateSmoother(&result);
+      }
     }
+
 
     if (VLOG_IS_ON(5) || log_output_) {
       debug_info_.extraIterationsTime_ =
@@ -1835,6 +2157,44 @@ bool VioBackend::optimize(
     // Update states we need for next iteration, if smoother is ok.
     if (is_smoother_ok) {
       updateStates(cur_id);
+      // ---- zy
+      // zy Step 29: track active optimization size per cycle to verify CBS full-replacement behavior and detect growth regressions.
+      size_t num_pose_keys = 0;
+      size_t num_vel_keys = 0;
+      size_t num_bias_keys = 0;
+      for (const auto& key_value : state_) {
+        const gtsam::Symbol sym(key_value.key);
+        if (sym.chr() == kPoseSymbolChar) {
+          ++num_pose_keys;
+        } else if (sym.chr() == kVelocitySymbolChar) {
+          ++num_vel_keys;
+        } else if (sym.chr() == kImuBiasSymbolChar) {
+          ++num_bias_keys;
+        }
+      }
+
+      // Intuition: emit one consistent optimizer status line regardless of CBS/legacy mode.
+      size_t num_factors_active = 0;
+      const char* optimizer_mode = "LEGACY";
+#ifdef KIMERA_USE_CBS
+      if (FLAGS_use_cbs_optimizer) {
+        CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+        optimizer_mode = "CBS";
+        num_factors_active = cbs_optimizer_->getFactorsUnsafe().size();
+      } else
+#endif
+      {
+        CHECK(smoother_);
+        num_factors_active = smoother_->getFactors().size();
+      }
+
+      VLOG(1) << "Optimize status [" << optimizer_mode
+              << "]: factors=" << num_factors_active
+              << ", x=" << num_pose_keys
+              << ", v=" << num_vel_keys
+              << ", b=" << num_bias_keys
+              << ", cur_kf=" << cur_id;
+// ----- zy
 
       // TODO: Add Update latest covariance --> move flag
       if (FLAGS_compute_state_covariance) {
@@ -1958,15 +2318,32 @@ void VioBackend::updateStates(const FrameId& cur_id) {
 
   // If we have an available pose at cur_id - 1 we use it, otw identity
   // gives us W_Pose_B_lkf as our current pose estimate.
-  if (cur_id > 0) {
-    DCHECK(state_.find(gtsam::Symbol(kPoseSymbolChar, cur_id - 1)) !=
-           state_.end());
-    W_Pose_B_lkf =
-        state_.at<gtsam::Pose3>(gtsam::Symbol(kPoseSymbolChar, cur_id - 1));
+  // if (cur_id > 0) {
+  //   DCHECK(state_.find(gtsam::Symbol(kPoseSymbolChar, cur_id - 1)) !=
+  //          state_.end());
+  //   W_Pose_B_lkf =
+  //       state_.at<gtsam::Pose3>(gtsam::Symbol(kPoseSymbolChar, cur_id - 1));
 
-    // Compute relative pose as odometry to append to pose estimate trajectory
-    B_lkf_Pose_kf = W_Pose_B_lkf.between(W_Pose_B_kf);
+  //   // Compute relative pose as odometry to append to pose estimate trajectory
+  //   B_lkf_Pose_kf = W_Pose_B_lkf.between(W_Pose_B_kf);
+  // } (zy cancelled it)
+
+  // zy Step 32a: Make updateStates() robust if x(k-1) is temporarily missing (can happen in edge CBS graph maintenance cases).
+  // This prevents crashes and keeps the backend running.
+  if (cur_id > 0) {
+    const gtsam::Symbol prev_pose_key(kPoseSymbolChar, cur_id - 1);
+    if (state_.exists(prev_pose_key)) {
+      W_Pose_B_lkf = state_.at<gtsam::Pose3>(prev_pose_key);
+
+      // Compute relative pose as odometry to append to pose estimate trajectory.
+      B_lkf_Pose_kf = W_Pose_B_lkf.between(W_Pose_B_kf);
+    } else {
+      // Intuition: if x(k-1) is temporarily unavailable, keep backend alive with identity increment instead of hard-failing.
+      VLOG(2) << "Previous pose key missing in state: " << prev_pose_key
+              << ". Using identity increment for frame " << cur_id;
+    }
   }
+
 
   // Update latest state estimate
   W_Pose_B_lkf_from_state_ = W_Pose_B_kf;
@@ -1992,6 +2369,49 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                                 const std::map<Key, double>& timestamps,
                                 const gtsam::FactorIndices& delete_slots) {
   CHECK_NOTNULL(result);
+  // zy Step 16a
+  #ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    // Intuition: in CBS mode, BPSAM is the single optimization heart, so we skip the legacy smoother update path.
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+
+    cbs::BPSAM::UpdateParams cbs_update_params;
+    cbs_update_params.removeFactorIndices.insert(
+        cbs_update_params.removeFactorIndices.end(),
+        delete_slots.begin(),
+        delete_slots.end());
+
+      try {
+      // Intuition: run CBS/BPSAM update and keep its native ISAM2 result for CBS-specific bookkeeping.
+      const gtsam::ISAM2Result cbs_result =
+          cbs_optimizer_->update(new_factors, new_values, cbs_update_params);
+
+      // Intuition: keep FixedLagSmoother API contract by populating a compatible summary result in CBS mode.
+      result->iterations = 1;
+      result->intermediateSteps = 0;
+      result->nonlinearVariables = cbs_result.variablesRelinearized;
+      result->linearVariables = cbs_result.variablesReeliminated;
+      result->error = cbs_result.errorAfter ? *cbs_result.errorAfter : 0.0;
+
+      // Intuition: refresh smart-factor slot cache only when this update inserted factors.
+      if (!new_factors.empty()) {
+        cbs_last_update_result_ = cbs_result;
+        cbs_has_last_update_result_ = true;
+      }
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "CBS BPSAM update failed: " << e.what();
+      return false;
+    } catch (...) {
+      LOG(ERROR) << "CBS BPSAM update failed with unknown exception.";
+      return false;
+    }
+
+
+
+    return true;
+  }
+#endif
+
   // Store smoother as backup.
   CHECK(smoother_);
   // This is not doing a full deep copy: it is keeping same shared_ptrs for
@@ -2238,31 +2658,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     }
   }
 
-  // zy Step 11b
-  #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
-    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
-
-    cbs::BPSAM::UpdateParams cbs_update_params;
-    cbs_update_params.removeFactorIndices.insert(
-        cbs_update_params.removeFactorIndices.end(),
-        delete_slots.begin(),
-        delete_slots.end());
-
-    try {
-      cbs_optimizer_->update(new_factors, new_values, cbs_update_params);
-    } catch (const std::exception& e) {
-      LOG(ERROR) << "CBS BPSAM update failed: " << e.what();
-      return false;
-    } catch (...) {
-      LOG(ERROR) << "CBS BPSAM update failed with unknown exception.";
-      return false;
-    }
-  }
-  #endif
-
-
-  return true;
+    return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2343,53 +2739,170 @@ void VioBackend::deleteLmkFromExtraStructures(const LandmarkId& lmk_id) {
 // this idx points to the updated slots in the graph after optimization.
 // for next iteration to know which slots have to be deleted
 // before adding the new smart factors.
+// void VioBackend::updateNewSmartFactorsSlots(
+//     const std::vector<LandmarkId>& lmk_ids_of_new_smart_factors,
+//     SmartFactorMap* old_smart_factors) {
+//   CHECK_NOTNULL(old_smart_factors);
+
+//   // Get result.
+//   // const gtsam::ISAM2Result& result = smoother_->getISAM2Result(); (zy cancelled it)
+
+//   // zy Step 18d choose update indices + factor graph from the active optimizer so slot remapping stays correct in CBS and legacy modes.
+//   const gtsam::ISAM2Result* isam2_result = nullptr;
+//   const gtsam::NonlinearFactorGraph* factor_graph = nullptr;
+
+// #ifdef KIMERA_USE_CBS
+//   if (FLAGS_use_cbs_optimizer) {
+//     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+//     if (!cbs_has_last_update_result_) {
+//       VLOG(2) << "CBS smart-factor slot update skipped: no cached CBS update result yet.";
+//       return;
+//     }
+//     isam2_result = &cbs_last_update_result_;
+//     factor_graph = &cbs_optimizer_->getFactorsUnsafe();
+//   } else
+// #endif
+//   {
+//     isam2_result = &smoother_->getISAM2Result();
+//     factor_graph = &smoother_->getFactors();
+//   }
+
+//   CHECK_NOTNULL(isam2_result);
+//   CHECK_NOTNULL(factor_graph);
+
+
+//   // Simple version of find smart factors.
+//   for (size_t i = 0u; i < lmk_ids_of_new_smart_factors.size(); ++i) {
+//     // DCHECK(i < result.newFactorsIndices.size()) (zy cancelled it)
+//     // zy Step 18e: bound-check against the active optimizer's update result (CBS or legacy).
+//     DCHECK(i < isam2_result->newFactorsIndices.size())
+
+
+//         << "There are more new smart factors than new factors added to the "
+//            "graph.";
+//     // Get new slot in the graph for the newly added smart factor.
+//     // const size_t& slot = result.newFactorsIndices.at(i); (zy cancelled it)
+//     const size_t& slot = isam2_result->newFactorsIndices.at(i); // zy Step 18e
+
+//     // TODO this will not work if there are non-smart factors!!!
+//     // Update slot using isam2 indices.
+//     // ORDER of inclusion of factors in the ISAM2::update() function
+//     // matters, as these indices have a 1-to-1 correspondence with the
+//     // factors.
+
+//     // BOOKKEEPING, for next iteration to know which slots have to be
+//     // deleted before adding the new smart factors. Find the entry in
+//     // old_smart_factors_.
+//     const auto& it =
+//         old_smart_factors->find(lmk_ids_of_new_smart_factors.at(i));
+
+//     DCHECK(it != old_smart_factors->end())
+//         << "Trying to access unavailable factor.";
+//     // CHECK that the factor in the graph at slot position is a smart
+//     // factor.
+//     // const auto sptr = dynamic_cast<const SmartStereoFactor*>(
+//         // smoother_->getFactors().at(slot).get()); (zy cancelled it)
+//     DCHECK(factor_graph->exists(slot));
+//     const auto sptr = dynamic_cast<const SmartStereoFactor*>(
+//         factor_graph->at(slot).get()); // zy Step 18e
+
+//     DCHECK(sptr);
+//     // CHECK that shared ptrs point to the same smart factor.
+//     // make sure no one is cloning SmartSteroFactors.
+//     DCHECK_EQ(it->second.first.get(), sptr)
+//         << "Non-matching addresses for same factors for lmk with id: "
+//         << lmk_ids_of_new_smart_factors.at(i) << " in old_smart_factors_ "
+//         << "VS factor in graph at slot: " << slot
+//         << ". Slot previous to update was: " << it->second.second;
+
+//     // Update slot number in old_smart_factors_.
+//     it->second.second = slot;
+//   }
+// } (zy cancelled it)
+
+// zy Step 24: In legacy Kimera, newFactorsIndices order matches the factors we inserted.
+// In CBS mode, BPSAM may inject belief factors internally, so those indices can shift.
+// If we keep index-based remap in CBS mode, smart-factor slot bookkeeping can silently break.
 void VioBackend::updateNewSmartFactorsSlots(
     const std::vector<LandmarkId>& lmk_ids_of_new_smart_factors,
     SmartFactorMap* old_smart_factors) {
   CHECK_NOTNULL(old_smart_factors);
 
-  // Get result.
-  const gtsam::ISAM2Result& result = smoother_->getISAM2Result();
+#ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    // Intuition: CBS may inject extra factors internally, so index-based remap is unsafe; remap by pointer identity instead.
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    if (!cbs_has_last_update_result_) {
+      VLOG(2) << "CBS smart-factor slot update skipped: no cached CBS update result yet.";
+      return;
+    }
 
-  // Simple version of find smart factors.
+    const gtsam::NonlinearFactorGraph& factor_graph =
+        cbs_optimizer_->getFactorsUnsafe();
+
+    for (const LandmarkId& lmk_id : lmk_ids_of_new_smart_factors) {
+      const auto it = old_smart_factors->find(lmk_id);
+      DCHECK(it != old_smart_factors->end())
+          << "Trying to access unavailable factor.";
+
+      const SmartStereoFactor* target_factor = it->second.first.get();
+      DCHECK(target_factor);
+
+      Slot found_slot = -1;
+      for (size_t slot = 0u; slot < factor_graph.size(); ++slot) {
+        if (!factor_graph.exists(slot)) {
+          continue;
+        }
+        if (factor_graph.at(slot).get() == target_factor) {
+          found_slot = static_cast<Slot>(slot);
+          break;
+        }
+      }
+
+      if (found_slot < 0) {
+        LOG(WARNING) << "CBS smart-factor slot remap failed for lmk id: "
+                     << lmk_id;
+        continue;
+      }
+
+      it->second.second = found_slot;
+    }
+    return;
+  }
+#endif
+
+  // Intuition: keep original fast index-based remap for legacy smoother path.
+  const gtsam::ISAM2Result& result = smoother_->getISAM2Result();
+  const gtsam::NonlinearFactorGraph& factor_graph = smoother_->getFactors();
+
   for (size_t i = 0u; i < lmk_ids_of_new_smart_factors.size(); ++i) {
     DCHECK(i < result.newFactorsIndices.size())
         << "There are more new smart factors than new factors added to the "
            "graph.";
-    // Get new slot in the graph for the newly added smart factor.
+
     const size_t& slot = result.newFactorsIndices.at(i);
 
-    // TODO this will not work if there are non-smart factors!!!
-    // Update slot using isam2 indices.
-    // ORDER of inclusion of factors in the ISAM2::update() function
-    // matters, as these indices have a 1-to-1 correspondence with the
-    // factors.
-
-    // BOOKKEEPING, for next iteration to know which slots have to be
-    // deleted before adding the new smart factors. Find the entry in
-    // old_smart_factors_.
     const auto& it =
         old_smart_factors->find(lmk_ids_of_new_smart_factors.at(i));
 
     DCHECK(it != old_smart_factors->end())
         << "Trying to access unavailable factor.";
-    // CHECK that the factor in the graph at slot position is a smart
-    // factor.
+
+    DCHECK(factor_graph.exists(slot));
     const auto sptr = dynamic_cast<const SmartStereoFactor*>(
-        smoother_->getFactors().at(slot).get());
+        factor_graph.at(slot).get());
     DCHECK(sptr);
-    // CHECK that shared ptrs point to the same smart factor.
-    // make sure no one is cloning SmartSteroFactors.
+
     DCHECK_EQ(it->second.first.get(), sptr)
         << "Non-matching addresses for same factors for lmk with id: "
         << lmk_ids_of_new_smart_factors.at(i) << " in old_smart_factors_ "
         << "VS factor in graph at slot: " << slot
         << ". Slot previous to update was: " << it->second.second;
 
-    // Update slot number in old_smart_factors_.
     it->second.second = slot;
   }
 }
+
 
 void VioBackend::setFactorsParams(
     const BackendParams& vio_params,
@@ -2509,23 +3022,53 @@ void VioBackend::printSmootherInfo(
     const bool& showDetails) const {
   LOG(INFO) << " =============== START:" << message << " =============== ";
 
+  // const std::string* which_graph = nullptr;
+  // const gtsam::NonlinearFactorGraph* graph = nullptr;
+  // // Pick the graph that makes more sense:
+  // // This is code is mostly run post update, when it throws exception,
+  // // shouldn't we print the graph before optimization instead?
+  // // Yes if available, but if not, then just ask the smoother.
+  // static const std::string graph_before_opt = "(graph before optimization)";
+  // static const std::string smoother_get_factors = "(smoother getFactors)";
+  // if (debug_info_.graphBeforeOpt.size() != 0) {
+  //   which_graph = &graph_before_opt;
+  //   graph = &(debug_info_.graphBeforeOpt);
+  // } else {
+  //   which_graph = &smoother_get_factors;
+  //   graph = &(smoother_->getFactors());
+  // }
+  // CHECK_NOTNULL(which_graph);
+  // CHECK_NOTNULL(graph); (zy cancelled it)
+
+  // zy Step 25a
   const std::string* which_graph = nullptr;
   const gtsam::NonlinearFactorGraph* graph = nullptr;
   // Pick the graph that makes more sense:
-  // This is code is mostly run post update, when it throws exception,
-  // shouldn't we print the graph before optimization instead?
-  // Yes if available, but if not, then just ask the smoother.
+  // This code is mostly run post update, when it throws exception.
   static const std::string graph_before_opt = "(graph before optimization)";
   static const std::string smoother_get_factors = "(smoother getFactors)";
+  static const std::string cbs_get_factors = "(cbs getFactorsUnsafe)";
+
   if (debug_info_.graphBeforeOpt.size() != 0) {
     which_graph = &graph_before_opt;
     graph = &(debug_info_.graphBeforeOpt);
   } else {
-    which_graph = &smoother_get_factors;
-    graph = &(smoother_->getFactors());
+#ifdef KIMERA_USE_CBS
+    if (FLAGS_use_cbs_optimizer) {
+      // Intuition: when CBS is active, debug dumps must reflect CBS graph, not stale smoother graph.
+      CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+      which_graph = &cbs_get_factors;
+      graph = &(cbs_optimizer_->getFactorsUnsafe());
+    } else
+#endif
+    {
+      which_graph = &smoother_get_factors;
+      graph = &(smoother_->getFactors());
+    }
   }
   CHECK_NOTNULL(which_graph);
   CHECK_NOTNULL(graph);
+
 
   static constexpr bool print_smart_factors = true;  // There a lot of these!
   static constexpr bool print_point_plane_factors = true;
@@ -2690,7 +3233,22 @@ void VioBackend::printSelectedGraph(
 void VioBackend::computeSmartFactorStatistics() {
   // Compute number of valid/degenerate
   debug_info_.resetSmartFactorsStatistics();
-  gtsam::NonlinearFactorGraph graph = smoother_->getFactors();
+  // gtsam::NonlinearFactorGraph graph = smoother_->getFactors(); (zy cancelled it)
+  // zy Step 25b: smart-factor stats must be computed from the currently active optimizer graph.
+  const gtsam::NonlinearFactorGraph* active_factor_graph = nullptr;
+#ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    active_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
+  } else
+#endif
+  {
+    CHECK(smoother_);
+    active_factor_graph = &smoother_->getFactors();
+  }
+  CHECK_NOTNULL(active_factor_graph);
+  const gtsam::NonlinearFactorGraph& graph = *active_factor_graph;
+
   for (const auto& g : graph) {
     if (g) {
       const auto gsf = dynamic_cast<const SmartStereoFactor*>(g.get());
@@ -2750,7 +3308,22 @@ void VioBackend::computeSmartFactorStatistics() {
 }
 
 void VioBackend::computeSparsityStatistics() {
-  gtsam::NonlinearFactorGraph graph = smoother_->getFactors();
+  // gtsam::NonlinearFactorGraph graph = smoother_->getFactors();
+  // zy Step 25c: sparsity/hessian diagnostics must use the same graph that produced the current estimate.
+  const gtsam::NonlinearFactorGraph* active_factor_graph = nullptr;
+#ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer) {
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    active_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
+  } else
+#endif
+  {
+    CHECK(smoother_);
+    active_factor_graph = &smoother_->getFactors();
+  }
+  CHECK_NOTNULL(active_factor_graph);
+  const gtsam::NonlinearFactorGraph& graph = *active_factor_graph;
+
   gtsam::GaussianFactorGraph::shared_ptr gfg = graph.linearize(state_);
   gtsam::Matrix Hessian = gfg->hessian().first;
   debug_info_.nrElementsInMatrix_ = Hessian.rows() * Hessian.cols();
@@ -2806,8 +3379,24 @@ void VioBackend::postDebug(
            "The sum of the parts is not equal to the total.";
 
     // Print error.
+    // gtsam::NonlinearFactorGraph graph = gtsam::NonlinearFactorGraph(
+    //     smoother_->getFactors());  // clone, expensive but safer! (zy cancelled it)
+    // zy Step 25c: error-before/after debug must compare against the active optimizer graph (CBS or legacy).
+    const gtsam::NonlinearFactorGraph* active_factor_graph = nullptr;
+#ifdef KIMERA_USE_CBS
+    if (FLAGS_use_cbs_optimizer) {
+      CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+      active_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
+    } else
+#endif
+    {
+      CHECK(smoother_);
+      active_factor_graph = &smoother_->getFactors();
+    }
+    CHECK_NOTNULL(active_factor_graph);
     gtsam::NonlinearFactorGraph graph = gtsam::NonlinearFactorGraph(
-        smoother_->getFactors());  // clone, expensive but safer!
+        *active_factor_graph);  // clone, expensive but safer!
+
     VLOG(10) << "Optimization Errors:\n"
              << " - Error before :" << graph.error(debug_info_.stateBeforeOpt)
              << '\n'
