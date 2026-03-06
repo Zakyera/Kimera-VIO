@@ -73,10 +73,6 @@ namespace cbs {
 class BPSAM;
 }
 
-#ifdef KIMERA_USE_CBS
-DECLARE_bool(use_cbs_optimizer);
-#endif
-
 namespace VIO {
 
 // Forward-declarations
@@ -268,7 +264,12 @@ class VioBackend {
         VioNavStateTimestamped(input.timestamp_, initial_state_estimate));
   }
 
-  // Intuition: implementation lives in .cpp so CBS type is complete when used.
+  // inline void saveGraph(const std::string& filepath) const {
+  //   smoother_->getFactors().saveGraph(filepath);
+  // } (zy cancelled it)
+
+  // zy Step 26a
+  // Keeps header lightweight; implementation lives in VioBackend.cpp where CBS/gflags symbols are available.
   void saveGraph(const std::string& filepath) const;
 
  protected:

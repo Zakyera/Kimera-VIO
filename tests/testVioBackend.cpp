@@ -298,6 +298,20 @@ TEST_F(BackendFixture, robotMovingWithConstantVelocity) {
         BackendInput(timestamp_k, all_measurements[k], pim, imu_accgyr));
     CHECK(backend_output);
 
+    // zy Step 36 about check examples
+    // Intuition: inject one mock LIORF belief and one self belief to verify
+    // accept + self-drop logic in CBS ingestion path.
+    // if (k == 5) {
+    //   VioBackend::ExternalPoseBelief b;
+    //   ASSERT_TRUE(vio_backend->getLatestExternalPoseBelief(&b));
+    //   const gtsam::Matrix6 cov = 1e-2 * gtsam::Matrix6::Identity();
+    //   EXPECT_TRUE(vio_backend->enqueueExternalPosePriorFromCovariance(
+    //       b.timestamp_kf_nsec_, b.W_Pose_B_, cov, "liorf_mock", 1));
+    //   EXPECT_TRUE(vio_backend->enqueueExternalPosePriorFromCovariance(
+    //       b.timestamp_kf_nsec_, b.W_Pose_B_, cov, "kimera", 2));
+    // }
+
+
     // At this point the update imu bias callback should be triggered which
     // will update the imu_frontend imu bias.
     imu_frontend.resetIntegrationWithCachedBias();
