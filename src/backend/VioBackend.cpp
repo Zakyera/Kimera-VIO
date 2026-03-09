@@ -88,6 +88,35 @@ DEFINE_bool(compute_state_covariance,
 DEFINE_bool(no_incremental_pose,
             false,
             "Flag to disable incremental pose usage in backend");
+// zy Step 36
+// Relax external-prior timestamp matching to a practical default for cross-stack exchange
+// (Kimera/LIORF timestamps are close but not typically within 2ms under real runtime load).
+DEFINE_int64(external_prior_timestamp_tolerance_ns,
+             200000000,  // 200ms
+             "Maximum absolute timestamp delta (ns) used to match incoming "
+             "external pose priors to Kimera keyframes.");
+// zy Step 37
+// LIORF and Kimera can have multi-second processing lag differences during bag replay.
+// Make age/future gates configurable so valid cross-estimator priors are not discarded.
+DEFINE_int64(external_prior_max_age_ns,
+             20000000000LL,  // 20s
+             "Maximum age (ns) of an incoming external prior relative to the "
+             "current Kimera optimize timestamp before dropping as too old.");
+DEFINE_int64(external_prior_max_future_lead_ns,
+             200000000,  // 200ms
+             "Maximum future lead (ns) allowed for incoming external priors; "
+             "larger lead is deferred for later optimize cycles.");
+DEFINE_int32(external_prior_max_queue_size,
+             1000,
+             "Maximum number of staged external pose priors kept in memory.");
+DEFINE_int64(external_prior_queue_time_horizon_ns,
+             60000000000LL,  // 60s
+             "Keep at most this trailing time window (ns) of staged external "
+             "pose priors, measured against newest received prior timestamp.");
+DEFINE_int32(external_prior_max_per_optimize,
+             400,
+             "Maximum number of external priors processed in one optimize() "
+             "cycle before deferring the remainder.");
 
 // zy Step 11a & 26
 #ifdef KIMERA_USE_CBS
@@ -186,6 +215,39 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
                    &no_motion_prior_noise_,
                    &zero_velocity_prior_noise_,
                    &constant_velocity_prior_noise_);
+
+  // zy Step 36_b
+  // Allow runtime tuning via gflag and guard against invalid values.
+  if (FLAGS_external_prior_timestamp_tolerance_ns > 0) {
+    external_prior_timestamp_tolerance_ns_ =
+        static_cast<Timestamp>(FLAGS_external_prior_timestamp_tolerance_ns);
+  } else {
+    LOG(WARNING) << "Invalid --external_prior_timestamp_tolerance_ns="
+                 << FLAGS_external_prior_timestamp_tolerance_ns
+                 << ", falling back to 200000000 ns.";
+    external_prior_timestamp_tolerance_ns_ = 200000000;
+  }
+  LOG(INFO) << "External prior timestamp tolerance [ns]: "
+            << external_prior_timestamp_tolerance_ns_;
+  LOG(INFO) << "External prior max age [ns]: "
+            << FLAGS_external_prior_max_age_ns;
+  LOG(INFO) << "External prior max future lead [ns]: "
+            << FLAGS_external_prior_max_future_lead_ns;
+  if (FLAGS_external_prior_max_queue_size > 0) {
+    max_external_pose_priors_queue_size_ =
+        static_cast<size_t>(FLAGS_external_prior_max_queue_size);
+  } else {
+    LOG(WARNING) << "Invalid --external_prior_max_queue_size="
+                 << FLAGS_external_prior_max_queue_size
+                 << ", falling back to 1000.";
+    max_external_pose_priors_queue_size_ = 1000;
+  }
+  LOG(INFO) << "External prior max queue size [count]: "
+            << max_external_pose_priors_queue_size_;
+  LOG(INFO) << "External prior queue time horizon [ns]: "
+            << FLAGS_external_prior_queue_time_horizon_ns;
+  LOG(INFO) << "External prior max per optimize [count]: "
+            << FLAGS_external_prior_max_per_optimize;
 
   // Reset debug info.
   resetDebugInfo(&debug_info_);
@@ -1421,6 +1483,26 @@ void VioBackend::enqueueExternalPosePrior(
 
   external_pose_priors_queue_.push_back(std::move(prior));
 
+  // Keep only a trailing timestamp window so queue growth is bounded even if
+  // backend lags behind incoming external messages.
+  if (FLAGS_external_prior_queue_time_horizon_ns > 0) {
+    const Timestamp horizon_ns =
+        static_cast<Timestamp>(FLAGS_external_prior_queue_time_horizon_ns);
+    const Timestamp newest_ts = external_pose_priors_queue_.back().timestamp_kf_nsec_;
+    size_t dropped_horizon = 0;
+    while (!external_pose_priors_queue_.empty() &&
+           external_pose_priors_queue_.front().timestamp_kf_nsec_ + horizon_ns <
+               newest_ts) {
+      external_pose_priors_queue_.pop_front();
+      ++dropped_horizon;
+    }
+    if (dropped_horizon > 0) {
+      LOG_EVERY_N(WARNING, 100)
+          << "External pose prior queue horizon trim dropped "
+          << dropped_horizon << " stale priors.";
+    }
+  }
+
   if (external_pose_priors_queue_.size() > max_external_pose_priors_queue_size_) {
     external_pose_priors_queue_.pop_front();
     LOG_EVERY_N(WARNING, 100)
@@ -1536,9 +1618,18 @@ bool VioBackend::optimize(
   // 2) future gating (defer too-future),
   // 3) nearest timestamp match,
   // 4) per-update injection cap.
-  constexpr Timestamp kMaxPriorAgeNs = 2 * 1000 * 1000 * 1000LL;      // 2s
-  constexpr Timestamp kMaxFutureLeadNs = 50 * 1000 * 1000LL;           // 50ms
-  constexpr size_t kMaxExternalPriorsPerOptimize = 200;
+  const Timestamp kMaxPriorAgeNs =
+      FLAGS_external_prior_max_age_ns > 0
+          ? static_cast<Timestamp>(FLAGS_external_prior_max_age_ns)
+          : static_cast<Timestamp>(20 * 1000 * 1000 * 1000LL);
+  const Timestamp kMaxFutureLeadNs =
+      FLAGS_external_prior_max_future_lead_ns >= 0
+          ? static_cast<Timestamp>(FLAGS_external_prior_max_future_lead_ns)
+          : static_cast<Timestamp>(200 * 1000 * 1000LL);
+  const size_t kMaxExternalPriorsPerOptimize =
+      FLAGS_external_prior_max_per_optimize > 0
+          ? static_cast<size_t>(FLAGS_external_prior_max_per_optimize)
+          : static_cast<size_t>(400);
 
   size_t num_external_priors_injected = 0;
   size_t num_external_priors_deferred = 0;

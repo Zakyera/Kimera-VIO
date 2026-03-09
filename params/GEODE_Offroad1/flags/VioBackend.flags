@@ -2,3 +2,9 @@
 --debug_graph_before_opt=false
 --process_cheirality=true
 --max_number_of_cheirality_exceptions=5
+--external_prior_timestamp_tolerance_ns=2000000000
+--external_prior_max_age_ns=180000000000
+--external_prior_max_future_lead_ns=2000000000
+--external_prior_max_queue_size=600
+--external_prior_queue_time_horizon_ns=45000000000
+--external_prior_max_per_optimize=600

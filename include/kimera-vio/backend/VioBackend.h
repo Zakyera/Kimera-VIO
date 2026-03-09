@@ -605,14 +605,14 @@ class VioBackend {
 
   mutable std::mutex external_pose_priors_queue_mutex_;
   std::deque<ExternalPosePrior> external_pose_priors_queue_;
-  size_t max_external_pose_priors_queue_size_ = 5000;
+  size_t max_external_pose_priors_queue_size_ = 1000;
 
   // zy Step 3_b
   // this map lets us match incoming belief timestamps to Kimera frame IDs, including old poses.
   mutable std::mutex timestamp_to_kf_id_map_mutex_;
   std::map<Timestamp, FrameId> timestamp_to_kf_id_map_;
   size_t max_timestamp_to_kf_id_map_size_ = 20000;
-  Timestamp external_prior_timestamp_tolerance_ns_ = 2000000;  // 2 ms
+  Timestamp external_prior_timestamp_tolerance_ns_ = 200000000;  // 200 ms
 
 
 
