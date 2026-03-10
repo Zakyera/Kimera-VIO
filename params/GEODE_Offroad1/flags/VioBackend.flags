@@ -9,3 +9,7 @@
 --external_prior_max_queue_size=600
 --external_prior_queue_time_horizon_ns=45000000000
 --external_prior_max_per_optimize=600
+--cbs_enable_gkcm=false
+--cbs_pose_rounds_per_epoch=1
+--cbs_pose_convergence_abs_residual=1e-3
+--cbs_pose_convergence_rel_residual=1e-3

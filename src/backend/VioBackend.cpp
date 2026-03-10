@@ -127,6 +127,11 @@ DEFINE_bool(use_cbs_optimizer,
             "If true (and compiled with KIMERA_USE_CBS), use CBS BPSAM as the "
             "backend optimization heart. Set false to fall back to legacy "
             "fixed-lag smoother.");
+//zy Step 40a
+// Runtime toggle for CBS GkCM/PCM consistency filtering on incoming belief factors.
+DEFINE_bool(cbs_enable_gkcm,
+            false,
+            "If true, enable CBS GkCM filtering of incoming belief factors.");
 // Align CBS belief contraction defaults with the CBS offline examples.
 DEFINE_double(cbs_belief_contract_alpha,
               0.5,
@@ -137,6 +142,19 @@ DEFINE_double(cbs_belief_d_reset,
 DEFINE_double(cbs_belief_gamma,
               0.1,
               "CBS contraction gamma (used when alpha is adaptive).");
+//zy Step 40b
+// Number of CBS inner update rounds per backend epoch (first round uses new factors, later rounds are belief-only).
+DEFINE_int32(cbs_pose_rounds_per_epoch,
+             3,
+             "Maximum number of CBS pose-stage update rounds executed per backend optimize epoch.");
+//zy Step 40c
+// CBS pose-stage convergence criteria on residual change between consecutive inner rounds.
+DEFINE_double(cbs_pose_convergence_abs_residual,
+              1e-3,
+              "Absolute residual-change threshold for early stopping of CBS pose rounds.");
+DEFINE_double(cbs_pose_convergence_rel_residual,
+              1e-3,
+              "Relative residual-change threshold for early stopping of CBS pose rounds.");
 #endif
 
 
@@ -208,7 +226,9 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   cbs_params.robot_id = kKimeraAgentId;
 
   cbs_params.sam_params_ = cbs_isam_params;
-  cbs_params.enable_gkcm = false;  // start simple; enable later if needed.
+  //zy Step 40d
+  // Keep GkCM optional at runtime so we can compare plain contraction vs. CBS+PCM filtering.
+  cbs_params.enable_gkcm = FLAGS_cbs_enable_gkcm;
   cbs_params.gbp_update_params.type = gbp::GaussianMergeType::Contract;
   cbs_params.gbp_update_params.metric_type = gbp::MetricType::Hellinger;
   cbs_params.gbp_update_params.contract_alpha =
@@ -227,6 +247,12 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << ", alpha=" << FLAGS_cbs_belief_contract_alpha
             << ", d_reset=" << FLAGS_cbs_belief_d_reset
             << ", gamma=" << FLAGS_cbs_belief_gamma;
+  //zy Step 40e
+  // Surface CBS pose-round controls at startup for reproducible experiments.
+  LOG(INFO) << "CBS config: gkcm=" << (FLAGS_cbs_enable_gkcm ? "true" : "false")
+            << ", pose_rounds_per_epoch=" << FLAGS_cbs_pose_rounds_per_epoch
+            << ", conv_abs=" << FLAGS_cbs_pose_convergence_abs_residual
+            << ", conv_rel=" << FLAGS_cbs_pose_convergence_rel_residual;
 
 #endif
 // zy -------
@@ -2611,7 +2637,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                                 const gtsam::FactorIndices& delete_slots) {
   CHECK_NOTNULL(result);
   // zy Step 16a
-  #ifdef KIMERA_USE_CBS
+#ifdef KIMERA_USE_CBS
   if (FLAGS_use_cbs_optimizer) {
     // Intuition: in CBS mode, BPSAM is the single optimization heart, so we skip the legacy smoother update path.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
@@ -2623,12 +2649,53 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
         delete_slots.end());
 
       try {
-      // Intuition: run CBS/BPSAM update and keep its native ISAM2 result for CBS-specific bookkeeping.
-      const gtsam::ISAM2Result cbs_result =
+      //zy Step 40f
+      // Run CBS pose-sharing inner rounds per epoch:
+      // round 0 uses incoming factors/values, later rounds run belief-only updates.
+      const int max_pose_rounds = std::max(1, FLAGS_cbs_pose_rounds_per_epoch);
+      const double abs_eps =
+          std::max(0.0, FLAGS_cbs_pose_convergence_abs_residual);
+      const double rel_eps =
+          std::max(0.0, FLAGS_cbs_pose_convergence_rel_residual);
+      auto compute_cbs_residual = [&]() -> std::optional<double> {
+        try {
+          const auto estimate = cbs_optimizer_->calculateEstimate();
+          return cbs_optimizer_->getFactorsUnsafe().error(estimate);
+        } catch (...) {
+          return std::nullopt;
+        }
+      };
+
+      gtsam::ISAM2Result cbs_result =
           cbs_optimizer_->update(new_factors, new_values, cbs_update_params);
+      int rounds_executed = 1;
+      std::optional<double> prev_residual = compute_cbs_residual();
+
+      for (int round = 1; round < max_pose_rounds; ++round) {
+        cbs_result = cbs_optimizer_->update(
+            gtsam::NonlinearFactorGraph(), gtsam::Values(), cbs_update_params);
+        ++rounds_executed;
+
+        const std::optional<double> curr_residual = compute_cbs_residual();
+        if (curr_residual && prev_residual) {
+          const double abs_change = std::fabs(*curr_residual - *prev_residual);
+          const double rel_change =
+              abs_change / std::max(std::fabs(*prev_residual), 1e-12);
+          if (abs_change <= abs_eps || rel_change <= rel_eps) {
+            VLOG(2) << "CBS pose rounds converged early at round "
+                    << rounds_executed << "/" << max_pose_rounds
+                    << " (abs=" << abs_change << ", rel=" << rel_change << ")";
+            break;
+          }
+        }
+
+        if (curr_residual) {
+          prev_residual = curr_residual;
+        }
+      }
 
       // Intuition: keep FixedLagSmoother API contract by populating a compatible summary result in CBS mode.
-      result->iterations = 1;
+      result->iterations = rounds_executed;
       result->intermediateSteps = 0;
       result->nonlinearVariables = cbs_result.variablesRelinearized;
       result->linearVariables = cbs_result.variablesReeliminated;
