@@ -120,12 +120,23 @@ DEFINE_int32(external_prior_max_per_optimize,
 
 // zy Step 11a & 26
 #ifdef KIMERA_USE_CBS
-// Intuition: full-replacement mode should default to CBS so we don't accidentally run legacy optimizer.
+// zy
+// Default to legacy fixed-lag backend unless explicitly enabling CBS at runtime.
 DEFINE_bool(use_cbs_optimizer,
-            true,
+            false,
             "If true (and compiled with KIMERA_USE_CBS), use CBS BPSAM as the "
             "backend optimization heart. Set false to fall back to legacy "
             "fixed-lag smoother.");
+// Align CBS belief contraction defaults with the CBS offline examples.
+DEFINE_double(cbs_belief_contract_alpha,
+              0.5,
+              "CBS belief contraction alpha (Hellinger target ratio).");
+DEFINE_double(cbs_belief_d_reset,
+              0.6,
+              "CBS belief reset threshold in Hellinger distance.");
+DEFINE_double(cbs_belief_gamma,
+              0.1,
+              "CBS contraction gamma (used when alpha is adaptive).");
 #endif
 
 
@@ -198,12 +209,24 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
 
   cbs_params.sam_params_ = cbs_isam_params;
   cbs_params.enable_gkcm = false;  // start simple; enable later if needed.
+  cbs_params.gbp_update_params.type = gbp::GaussianMergeType::Contract;
+  cbs_params.gbp_update_params.metric_type = gbp::MetricType::Hellinger;
+  cbs_params.gbp_update_params.contract_alpha =
+      static_cast<float>(FLAGS_cbs_belief_contract_alpha);
+  cbs_params.gbp_update_params.d_reset =
+      static_cast<float>(FLAGS_cbs_belief_d_reset);
+  cbs_params.gbp_update_params.gamma =
+      static_cast<float>(FLAGS_cbs_belief_gamma);
 
   cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
   // LOG(INFO) << "CBS BPSAM scaffold initialized (inactive)."; (zy cancelled it)
   // zy Step 27: startup log must state runtime mode so we can verify CBS-heart activation from logs.
   LOG(INFO) << "CBS BPSAM initialized. use_cbs_optimizer="
           << (FLAGS_use_cbs_optimizer ? "true" : "false");
+  LOG(INFO) << "CBS belief contraction params: type=Contract, metric=Hellinger"
+            << ", alpha=" << FLAGS_cbs_belief_contract_alpha
+            << ", d_reset=" << FLAGS_cbs_belief_d_reset
+            << ", gamma=" << FLAGS_cbs_belief_gamma;
 
 #endif
 // zy -------
@@ -248,6 +271,22 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << FLAGS_external_prior_queue_time_horizon_ns;
   LOG(INFO) << "External prior max per optimize [count]: "
             << FLAGS_external_prior_max_per_optimize;
+
+  // zy
+  // In fixed-lag mode, keep timestamp->key lookup bounded to the active lag
+  // window so very old external beliefs can be identified and dropped.
+  if (!FLAGS_use_cbs_optimizer) {
+    const size_t lag_states =
+        backend_params_.nr_states_ > 0
+            ? static_cast<size_t>(backend_params_.nr_states_)
+            : static_cast<size_t>(25);
+    max_timestamp_to_kf_id_map_size_ = std::max<size_t>(lag_states + 10, 50);
+    LOG(INFO) << "Fixed-lag mode: timestamp->key map max entries set to "
+              << max_timestamp_to_kf_id_map_size_;
+  } else {
+    LOG(INFO) << "CBS mode: timestamp->key map max entries set to "
+              << max_timestamp_to_kf_id_map_size_;
+  }
 
   // Reset debug info.
   resetDebugInfo(&debug_info_);
@@ -1002,7 +1041,14 @@ bool VioBackend::getLatestExternalPoseBelief(
   // In CBS mode, export covariance from BPSAM marginals so shared beliefs reflect the CBS state.
   if (FLAGS_use_cbs_optimizer) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    bool local_marginals_active = false;
     try {
+      // Match CBS pose-sharing stage: export pose covariance from LOCAL
+      // marginalization (exclude belief factors from covariance computation).
+      cbs_optimizer_->setMarginalizationGraph(
+          cbs::BPSAM::MarginalizationType::LOCAL);
+      local_marginals_active = true;
+
       if (cbs_optimizer_->valueExists(pose_symbol)) {
         const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(pose_symbol);
         if (cov.rows() >= 6 && cov.cols() >= 6 && cov.allFinite()) {
@@ -1017,6 +1063,18 @@ bool VioBackend::getLatestExternalPoseBelief(
       }
     } catch (const std::exception& e) {
       VLOG(2) << "CBS marginal covariance query failed: " << e.what();
+    }
+
+    if (local_marginals_active) {
+      try {
+        cbs_optimizer_->setMarginalizationGraph(
+            cbs::BPSAM::MarginalizationType::FULL);
+      } catch (const std::exception& e) {
+        VLOG(2) << "Failed to restore CBS FULL marginalization graph: "
+                << e.what();
+      } catch (...) {
+        VLOG(2) << "Failed to restore CBS FULL marginalization graph.";
+      }
     }
   }
 #endif
@@ -1131,6 +1189,11 @@ bool VioBackend::getExternalPoseBeliefAtTimestamp(
     }
 
     try {
+      bool local_marginals_active = false;
+      cbs_optimizer_->setMarginalizationGraph(
+          cbs::BPSAM::MarginalizationType::LOCAL);
+      local_marginals_active = true;
+
       belief->timestamp_kf_nsec_ = matched_timestamp;
       belief->frame_id_ = matched_frame_id;
       belief->W_Pose_B_ =
@@ -1150,12 +1213,21 @@ bool VioBackend::getExternalPoseBeliefAtTimestamp(
       for (int i = 0; i < 6; ++i) {
         if (!std::isfinite(belief->covariance_(i, i)) ||
             belief->covariance_(i, i) < kMinVar) {
-          belief->covariance_(i, i) = kMinVar;
+            belief->covariance_(i, i) = kMinVar;
         }
       }
 
+      if (local_marginals_active) {
+        cbs_optimizer_->setMarginalizationGraph(
+            cbs::BPSAM::MarginalizationType::FULL);
+      }
       return true;
     } catch (const std::exception& e) {
+      try {
+        cbs_optimizer_->setMarginalizationGraph(
+            cbs::BPSAM::MarginalizationType::FULL);
+      } catch (...) {
+      }
       VLOG(2) << "CBS timestamp belief query failed: " << e.what();
       return false;
     }
@@ -1634,6 +1706,7 @@ bool VioBackend::optimize(
   size_t num_external_priors_injected = 0;
   size_t num_external_priors_deferred = 0;
   size_t num_external_priors_dropped_old = 0;
+  size_t num_external_priors_dropped_marginalized = 0;
   size_t num_external_priors_dropped_inactive = 0;
   size_t num_external_priors_deferred_budget = 0;
 
@@ -1659,11 +1732,66 @@ bool VioBackend::optimize(
     return (a >= b) ? (a - b) : (b - a);
   };
 
+  // zy
+  // In fixed-lag mode, prune timestamp->key map entries whose pose keys are no
+  // longer active in the optimizer and capture the oldest still-active
+  // timestamp. Incoming beliefs older than that are guaranteed to target
+  // marginalized states and should be dropped early.
+  Timestamp oldest_active_pose_timestamp = -1;
+  Timestamp newest_active_pose_timestamp = -1;
+  size_t num_timestamp_map_pruned = 0;
+  {
+    std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
+    for (auto it = timestamp_to_kf_id_map_.begin();
+         it != timestamp_to_kf_id_map_.end();) {
+      const gtsam::Symbol pose_symbol(kPoseSymbolChar, it->second);
+      bool pose_key_is_active = false;
+#ifdef KIMERA_USE_CBS
+      if (FLAGS_use_cbs_optimizer) {
+        CHECK(cbs_optimizer_)
+            << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+        pose_key_is_active = cbs_optimizer_->valueExists(pose_symbol) ||
+                             new_values_.exists(pose_symbol);
+      } else
+#endif
+      {
+        pose_key_is_active =
+            state_.exists(pose_symbol) || new_values_.exists(pose_symbol);
+      }
+
+      if (pose_key_is_active) {
+        ++it;
+      } else {
+        it = timestamp_to_kf_id_map_.erase(it);
+        ++num_timestamp_map_pruned;
+      }
+    }
+
+    if (!timestamp_to_kf_id_map_.empty()) {
+      oldest_active_pose_timestamp = timestamp_to_kf_id_map_.begin()->first;
+      newest_active_pose_timestamp = timestamp_to_kf_id_map_.rbegin()->first;
+    }
+  }
+  if (num_timestamp_map_pruned > 0) {
+    VLOG(2) << "Pruned " << num_timestamp_map_pruned
+            << " marginalized timestamp->key entries. oldest_active_ts[nsec]="
+            << oldest_active_pose_timestamp;
+  }
+
   {
     std::deque<ExternalPosePrior> remaining_queue;
     std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
 
     for (const auto& prior : external_pose_priors_queue_) {
+      // Drop priors that are older than the oldest pose still active in the
+      // optimizer window (fixed-lag behavior).
+      if (oldest_active_pose_timestamp > 0 &&
+          prior.timestamp_kf_nsec_ + external_prior_timestamp_tolerance_ns_ <
+              oldest_active_pose_timestamp) {
+        ++num_external_priors_dropped_marginalized;
+        continue;
+      }
+
       // Drop priors that are too old w.r.t current backend timestamp.
       if (prior.timestamp_kf_nsec_ + kMaxPriorAgeNs < timestamp_kf_nsec) {
         ++num_external_priors_dropped_old;
@@ -1712,6 +1840,25 @@ bool VioBackend::optimize(
       }
 
       if (!matched) {
+        // zy
+        // Fixed-lag policy: if a prior cannot be matched to any active key now,
+        // discard it instead of deferring indefinitely. Future priors were
+        // already handled by the future-gate above.
+        if (!FLAGS_use_cbs_optimizer) {
+          ++num_external_priors_dropped_marginalized;
+          continue;
+        }
+
+        // zy
+        // If backend has already progressed past this prior (even after
+        // tolerance) and we still cannot match it to an active key, discard it
+        // instead of deferring indefinitely.
+        if (newest_active_pose_timestamp > 0 &&
+            prior.timestamp_kf_nsec_ + external_prior_timestamp_tolerance_ns_ <
+                newest_active_pose_timestamp) {
+          ++num_external_priors_dropped_marginalized;
+          continue;
+        }
         remaining_queue.push_back(prior);
         ++num_external_priors_deferred;
         continue;
@@ -1880,11 +2027,14 @@ bool VioBackend::optimize(
   #endif
 
   if (num_external_priors_injected > 0 || num_external_priors_dropped_old > 0 ||
+      num_external_priors_dropped_marginalized > 0 ||
       num_external_priors_dropped_inactive > 0 ||
       num_external_priors_deferred_budget > 0) {
     VLOG(1) << "External prior stats: injected=" << num_external_priors_injected
             << ", deferred=" << num_external_priors_deferred
             << ", dropped_old=" << num_external_priors_dropped_old
+            << ", dropped_marginalized="
+            << num_external_priors_dropped_marginalized
             << ", dropped_inactive=" << num_external_priors_dropped_inactive
             << ", deferred_budget=" << num_external_priors_deferred_budget
             << ", queue_size_now=" << external_pose_priors_queue_.size();
