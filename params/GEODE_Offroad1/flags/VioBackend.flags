@@ -13,3 +13,4 @@
 --cbs_pose_rounds_per_epoch=1
 --cbs_pose_convergence_abs_residual=1e-3
 --cbs_pose_convergence_rel_residual=1e-3
+--no_incremental_pose=true

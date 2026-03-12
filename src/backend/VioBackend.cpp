@@ -127,6 +127,11 @@ DEFINE_bool(use_cbs_optimizer,
             "If true (and compiled with KIMERA_USE_CBS), use CBS BPSAM as the "
             "backend optimization heart. Set false to fall back to legacy "
             "fixed-lag smoother.");
+DEFINE_bool(cbs_replace_fixed_lag_optimizer,
+            false,
+            "If true, CBS replaces Kimera fixed-lag smoothing as the backend "
+            "optimization heart. If false, Kimera fixed-lag remains the "
+            "optimization heart and CBS can still be used for belief handling.");
 //zy Step 40a
 // Runtime toggle for CBS GkCM/PCM consistency filtering on incoming belief factors.
 DEFINE_bool(cbs_enable_gkcm,
@@ -156,6 +161,16 @@ DEFINE_double(cbs_pose_convergence_rel_residual,
               1e-3,
               "Relative residual-change threshold for early stopping of CBS pose rounds.");
 #endif
+
+namespace {
+inline bool useCbsOptimizerHeart() {
+#ifdef KIMERA_USE_CBS
+  return FLAGS_use_cbs_optimizer && FLAGS_cbs_replace_fixed_lag_optimizer;
+#else
+  return false;
+#endif
+}
+}  // namespace
 
 
 
@@ -241,8 +256,12 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
   // LOG(INFO) << "CBS BPSAM scaffold initialized (inactive)."; (zy cancelled it)
   // zy Step 27: startup log must state runtime mode so we can verify CBS-heart activation from logs.
-  LOG(INFO) << "CBS BPSAM initialized. use_cbs_optimizer="
-          << (FLAGS_use_cbs_optimizer ? "true" : "false");
+  LOG(INFO) << "CBS BPSAM initialized. use_cbs_optimizer_flag="
+            << (FLAGS_use_cbs_optimizer ? "true" : "false")
+            << ", cbs_replace_fixed_lag_optimizer="
+            << (FLAGS_cbs_replace_fixed_lag_optimizer ? "true" : "false")
+            << ", cbs_heart_active="
+            << (useCbsOptimizerHeart() ? "true" : "false");
   LOG(INFO) << "CBS belief contraction params: type=Contract, metric=Hellinger"
             << ", alpha=" << FLAGS_cbs_belief_contract_alpha
             << ", d_reset=" << FLAGS_cbs_belief_d_reset
@@ -301,7 +320,7 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   // zy
   // In fixed-lag mode, keep timestamp->key lookup bounded to the active lag
   // window so very old external beliefs can be identified and dropped.
-  if (!FLAGS_use_cbs_optimizer) {
+  if (!useCbsOptimizerHeart()) {
     const size_t lag_states =
         backend_params_.nr_states_ > 0
             ? static_cast<size_t>(backend_params_.nr_states_)
@@ -365,7 +384,7 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
     // Intuition: always read/output factors from the optimizer that is currently active (CBS or legacy smoother).
     const gtsam::NonlinearFactorGraph* output_factor_graph = nullptr;
 #ifdef KIMERA_USE_CBS
-    if (FLAGS_use_cbs_optimizer) {
+    if (useCbsOptimizerHeart()) {
       CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
       output_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
     } else
@@ -473,7 +492,7 @@ void VioBackend::registerMapUpdateCallback(
 
 void VioBackend::saveGraph(const std::string& filepath) const {
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     // Intuition: when CBS is active, graph export must come from BPSAM (true optimization heart), not legacy smoother.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     cbs_optimizer_->getFactorsUnsafe().saveGraph(filepath);
@@ -977,7 +996,7 @@ PointsWithIdMap VioBackend::getMapLmkIdsTo3dPointsInTimeHorizon(
 // NOT TESTED (--> There is a UnitTest function in UtilsOpenCV)
 void VioBackend::computeStateCovariance() {
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     // Intuition: in CBS-heart mode, covariance must come from BPSAM marginals, not from the legacy fixed-lag smoother.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     
@@ -1065,7 +1084,7 @@ bool VioBackend::getLatestExternalPoseBelief(
 
 #ifdef KIMERA_USE_CBS
   // In CBS mode, export covariance from BPSAM marginals so shared beliefs reflect the CBS state.
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     bool local_marginals_active = false;
     try {
@@ -1206,7 +1225,7 @@ bool VioBackend::getExternalPoseBeliefAtTimestamp(
 
 #ifdef KIMERA_USE_CBS
   // Intuition: in CBS mode, query arbitrary historical pose beliefs directly from BPSAM marginals.
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 
     if (!cbs_optimizer_->valueExists(pose_symbol)) {
@@ -1773,7 +1792,7 @@ bool VioBackend::optimize(
       const gtsam::Symbol pose_symbol(kPoseSymbolChar, it->second);
       bool pose_key_is_active = false;
 #ifdef KIMERA_USE_CBS
-      if (FLAGS_use_cbs_optimizer) {
+      if (useCbsOptimizerHeart()) {
         CHECK(cbs_optimizer_)
             << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
         pose_key_is_active = cbs_optimizer_->valueExists(pose_symbol) ||
@@ -1870,7 +1889,7 @@ bool VioBackend::optimize(
         // Fixed-lag policy: if a prior cannot be matched to any active key now,
         // discard it instead of deferring indefinitely. Future priors were
         // already handled by the future-gate above.
-        if (!FLAGS_use_cbs_optimizer) {
+        if (!useCbsOptimizerHeart()) {
           ++num_external_priors_dropped_marginalized;
           continue;
         }
@@ -1902,7 +1921,7 @@ bool VioBackend::optimize(
       // zy Step 28a: key-availability must be checked against the optimizer that is actually active (CBS or legacy).
       bool pose_key_is_active = false;
 #ifdef KIMERA_USE_CBS
-      if (FLAGS_use_cbs_optimizer) {
+      if (useCbsOptimizerHeart()) {
         CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
         pose_key_is_active =
             cbs_optimizer_->valueExists(pose_symbol) || new_values_.exists(pose_symbol);
@@ -1915,7 +1934,7 @@ bool VioBackend::optimize(
 
       if (pose_key_is_active) {
 #ifdef KIMERA_USE_CBS
-        if (FLAGS_use_cbs_optimizer) {
+        if (useCbsOptimizerHeart()) {
           // In CBS mode, route matched external measurements through BPSAM belief ingestion (not direct priors).
           CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 
@@ -2039,7 +2058,7 @@ bool VioBackend::optimize(
 
   // zy Step 12c
   #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer && !cbs_incoming_beliefs.empty()) {
+  if (useCbsOptimizerHeart() && !cbs_incoming_beliefs.empty()) {
     // Flush staged beliefs once per optimize cycle so CBS receives a coherent batch for this iteration.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     num_external_beliefs_rejected = cbs_optimizer_->addBeliefs(cbs_incoming_beliefs);
@@ -2090,7 +2109,7 @@ bool VioBackend::optimize(
   // zy Step 22a: pick the currently active optimizer graph (CBS or legacy) so debug/bookkeeping reads the correct factor graph.
   const gtsam::NonlinearFactorGraph* active_factor_graph = nullptr;
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     active_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
   } else
@@ -2128,7 +2147,7 @@ bool VioBackend::optimize(
 
 //       bool slot_is_active = false;
 // #ifdef KIMERA_USE_CBS
-//       if (FLAGS_use_cbs_optimizer) {
+//       if (useCbsOptimizerHeart()) {
 //         // Intuition: when CBS is active, slot validity must be checked against the CBS factor graph.
 //         CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 //         slot_is_active = cbs_optimizer_->getFactorsUnsafe().exists(slot);
@@ -2158,7 +2177,7 @@ bool VioBackend::optimize(
 
 //       bool slot_is_active = false;
 // #ifdef KIMERA_USE_CBS
-//       if (FLAGS_use_cbs_optimizer) {
+//       if (useCbsOptimizerHeart()) {
 //         // Intuition: in CBS mode, validate smart-factor slots against CBS factor graph, not the legacy smoother graph.
 //         CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 //         slot_is_active = cbs_optimizer_->getFactorsUnsafe().exists(slot);
@@ -2217,7 +2236,7 @@ bool VioBackend::optimize(
 
       bool slot_is_active = false;
 #ifdef KIMERA_USE_CBS
-      if (FLAGS_use_cbs_optimizer) {
+      if (useCbsOptimizerHeart()) {
         // Intuition: in CBS mode, validate smart-factor slots against CBS graph ownership.
         CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
         slot_is_active = cbs_optimizer_->getFactorsUnsafe().exists(slot);
@@ -2279,7 +2298,7 @@ bool VioBackend::optimize(
   // zy Step 22b
   if (VLOG_IS_ON(10)) {
 #ifdef KIMERA_USE_CBS
-    if (FLAGS_use_cbs_optimizer) {
+    if (useCbsOptimizerHeart()) {
       // Intuition: avoid dumping stale fixed-lag internals when CBS is the active optimization heart.
       VLOG(10) << "CBS mode: skipping legacy printSmootherInfo() dump.";
     } else {
@@ -2402,7 +2421,7 @@ bool VioBackend::optimize(
 
     // ZY Step 21: CBS already performs its own incremental update; repeating empty legacy-style iterations adds no value.
 #ifdef KIMERA_USE_CBS
-    const bool run_extra_iterations = !FLAGS_use_cbs_optimizer;
+    const bool run_extra_iterations = !useCbsOptimizerHeart();
 #else
     const bool run_extra_iterations = true;
 #endif
@@ -2444,7 +2463,7 @@ bool VioBackend::optimize(
       size_t num_factors_active = 0;
       const char* optimizer_mode = "LEGACY";
 #ifdef KIMERA_USE_CBS
-      if (FLAGS_use_cbs_optimizer) {
+      if (useCbsOptimizerHeart()) {
         CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
         optimizer_mode = "CBS";
         num_factors_active = cbs_optimizer_->getFactorsUnsafe().size();
@@ -2566,7 +2585,7 @@ void VioBackend::updateStates(const FrameId& cur_id) {
   // ---
     VLOG(10) << "Starting to calculate estimate.";
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     state_ = cbs_optimizer_->calculateEstimate();
   } else {
@@ -2638,7 +2657,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
   CHECK_NOTNULL(result);
   // zy Step 16a
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     // Intuition: in CBS mode, BPSAM is the single optimization heart, so we skip the legacy smoother update path.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 
@@ -3060,7 +3079,7 @@ void VioBackend::deleteLmkFromExtraStructures(const LandmarkId& lmk_id) {
 //   const gtsam::NonlinearFactorGraph* factor_graph = nullptr;
 
 // #ifdef KIMERA_USE_CBS
-//   if (FLAGS_use_cbs_optimizer) {
+//   if (useCbsOptimizerHeart()) {
 //     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 //     if (!cbs_has_last_update_result_) {
 //       VLOG(2) << "CBS smart-factor slot update skipped: no cached CBS update result yet.";
@@ -3137,7 +3156,7 @@ void VioBackend::updateNewSmartFactorsSlots(
   CHECK_NOTNULL(old_smart_factors);
 
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     // Intuition: CBS may inject extra factors internally, so index-based remap is unsafe; remap by pointer identity instead.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     if (!cbs_has_last_update_result_) {
@@ -3362,7 +3381,7 @@ void VioBackend::printSmootherInfo(
     graph = &(debug_info_.graphBeforeOpt);
   } else {
 #ifdef KIMERA_USE_CBS
-    if (FLAGS_use_cbs_optimizer) {
+    if (useCbsOptimizerHeart()) {
       // Intuition: when CBS is active, debug dumps must reflect CBS graph, not stale smoother graph.
       CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
       which_graph = &cbs_get_factors;
@@ -3545,7 +3564,7 @@ void VioBackend::computeSmartFactorStatistics() {
   // zy Step 25b: smart-factor stats must be computed from the currently active optimizer graph.
   const gtsam::NonlinearFactorGraph* active_factor_graph = nullptr;
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     active_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
   } else
@@ -3620,7 +3639,7 @@ void VioBackend::computeSparsityStatistics() {
   // zy Step 25c: sparsity/hessian diagnostics must use the same graph that produced the current estimate.
   const gtsam::NonlinearFactorGraph* active_factor_graph = nullptr;
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer) {
+  if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     active_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
   } else
@@ -3692,7 +3711,7 @@ void VioBackend::postDebug(
     // zy Step 25c: error-before/after debug must compare against the active optimizer graph (CBS or legacy).
     const gtsam::NonlinearFactorGraph* active_factor_graph = nullptr;
 #ifdef KIMERA_USE_CBS
-    if (FLAGS_use_cbs_optimizer) {
+    if (useCbsOptimizerHeart()) {
       CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
       active_factor_graph = &cbs_optimizer_->getFactorsUnsafe();
     } else
