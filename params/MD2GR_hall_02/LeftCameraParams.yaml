@@ -1,0 +1,23 @@
+%YAML:1.0
+# General sensor definitions.
+camera_id: left_cam
+
+# Sensor extrinsics wrt. the body-frame (body = /camera/imu).
+# Derived from calibration_Results.txt by chaining:
+#   T_I_C = inv(T_L_I) * T_L_C
+# where T_L_* are "to LiDAR" extrinsics.
+T_BS:
+  cols: 4
+  rows: 4
+  data:  [1.00000000, 0.00000000, 0.00000000, -0.16058000,
+          0.00000000, 1.00000000, 0.00000000, -0.06235000,
+          0.00000000, 0.00000000, 1.00000000, -0.07288000,
+          0.00000000, 0.00000000, 0.00000000, 1.00000000]
+
+# Camera specific definitions
+rate_hz: 15
+resolution: [1280, 1024]  # [width, height]
+camera_model: pinhole
+intrinsics: [540.645056202188, 539.8545023658869, 626.4125666883942, 523.947634226782]  # [fu, fv, cu, cv]
+distortion_model: radtan
+distortion_coefficients: [-0.07015146608431883, 0.008586142263125124, -0.021968993685891842, 0.007442211946112636]  # [k1,k2,p1,p2]
