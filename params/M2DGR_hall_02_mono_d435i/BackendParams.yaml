@@ -10,8 +10,8 @@ initialPositionSigma: 1e-05
 initialRollPitchSigma: 0.174533 # 10.0/180.0*M_PI
 initialYawSigma: 0.00174533 # 0.1/180.0*M_PI
 initialVelocitySigma: 0.001
-initialAccBiasSigma: 0.0001
-initialGyroBiasSigma: 0.001
+initialAccBiasSigma: 0.1
+initialGyroBiasSigma: 0.01
 
 # VISION PARAMETERS ###########################################################
 ## Smart Factors ##

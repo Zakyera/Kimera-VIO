@@ -117,6 +117,11 @@ DEFINE_int32(external_prior_max_per_optimize,
              400,
              "Maximum number of external priors processed in one optimize() "
              "cycle before deferring the remainder.");
+DEFINE_bool(external_pose_belief_safe_covariance_fallback,
+            false,
+            "If true, publish external pose beliefs with a safe covariance "
+            "fallback when state covariance is unavailable. If false, keep "
+            "legacy covariance fallback behavior.");
 
 // zy Step 11a & 26
 #ifdef KIMERA_USE_CBS
@@ -124,14 +129,13 @@ DEFINE_int32(external_prior_max_per_optimize,
 // Default to legacy fixed-lag backend unless explicitly enabling CBS at runtime.
 DEFINE_bool(use_cbs_optimizer,
             false,
-            "If true (and compiled with KIMERA_USE_CBS), use CBS BPSAM as the "
-            "backend optimization heart. Set false to fall back to legacy "
-            "fixed-lag smoother.");
+            "If true (and compiled with KIMERA_USE_CBS), enable CBS belief "
+            "exchange (belief validation/merging) while keeping Kimera fixed-lag "
+            "smoothing as the optimization heart.");
 DEFINE_bool(cbs_replace_fixed_lag_optimizer,
             false,
-            "If true, CBS replaces Kimera fixed-lag smoothing as the backend "
-            "optimization heart. If false, Kimera fixed-lag remains the "
-            "optimization heart and CBS can still be used for belief handling.");
+            "Deprecated: retained for compatibility. Kimera fixed-lag remains "
+            "the optimization heart in CBS mode.");
 //zy Step 40a
 // Runtime toggle for CBS GkCM/PCM consistency filtering on incoming belief factors.
 DEFINE_bool(cbs_enable_gkcm,
@@ -163,9 +167,20 @@ DEFINE_double(cbs_pose_convergence_rel_residual,
 #endif
 
 namespace {
+inline bool useCbsBeliefExchange() {
+#ifdef KIMERA_USE_CBS
+  return FLAGS_use_cbs_optimizer;
+#else
+  return false;
+#endif
+}
+
 inline bool useCbsOptimizerHeart() {
 #ifdef KIMERA_USE_CBS
-  return FLAGS_use_cbs_optimizer && FLAGS_cbs_replace_fixed_lag_optimizer;
+  // zy Step 41a
+  // Keep Kimera fixed-lag as the single optimization heart in CBS mode.
+  // CBS remains enabled only for inter-agent belief exchange/validation.
+  return false;
 #else
   return false;
 #endif
@@ -231,6 +246,14 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
 // zy-------
 // zy Step 10f
 #ifdef KIMERA_USE_CBS
+  if (FLAGS_use_cbs_optimizer && FLAGS_cbs_replace_fixed_lag_optimizer) {
+    // zy Step 41b
+    // Guardrail: CBS belief exchange is enabled, but Kimera keeps fixed-lag heart.
+    LOG(WARNING) << "cbs_replace_fixed_lag_optimizer=true is deprecated. "
+                 << "Forcing fixed-lag optimization heart in Kimera.";
+    FLAGS_cbs_replace_fixed_lag_optimizer = false;
+  }
+
   // Build CBS optimizer with Kimera's current ISAM2 parameterization.
   gtsam::ISAM2Params cbs_isam_params;
   BackendParams::setIsam2Params(backend_params, &cbs_isam_params);
@@ -316,6 +339,9 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << FLAGS_external_prior_queue_time_horizon_ns;
   LOG(INFO) << "External prior max per optimize [count]: "
             << FLAGS_external_prior_max_per_optimize;
+  LOG(INFO) << "External belief safe covariance fallback: "
+            << (FLAGS_external_pose_belief_safe_covariance_fallback ? "ON"
+                                                                    : "OFF");
 
   // zy
   // In fixed-lag mode, keep timestamp->key lookup bounded to the active lag
@@ -1043,6 +1069,7 @@ void VioBackend::computeStateCovariance() {
     // Intuition: enforce numeric symmetry before publishing/consuming covariance downstream.
     state_covariance_lkf_ =
         0.5 * (state_covariance_lkf_ + state_covariance_lkf_.transpose());
+    state_covariance_lkf_valid_ = true;
     return;
   }
 #endif
@@ -1061,6 +1088,7 @@ void VioBackend::computeStateCovariance() {
   state_covariance_lkf_ = UtilsOpenCV::Covariance_bvx2xvb(
       marginals.jointMarginalCovariance(keys)
           .fullMatrix());  // 6 + 3 + 6 = 15x15matrix
+  state_covariance_lkf_valid_ = true;
 }
 
 
@@ -1124,20 +1152,50 @@ bool VioBackend::getLatestExternalPoseBelief(
   }
 #endif
 
-  // Fallback: use Kimera stored state covariance (if available), preserving legacy behavior.
+  // Optional safe path: only use backend covariance when it has been explicitly
+  // computed and validated.
   if (!covariance_set) {
-    if (state_covariance_lkf_.rows() >= 6 && state_covariance_lkf_.cols() >= 6) {
-      belief->covariance_ = state_covariance_lkf_.topLeftCorner<6, 6>();
-      covariance_set = true;
+    if (FLAGS_external_pose_belief_safe_covariance_fallback) {
+      if (state_covariance_lkf_valid_ && state_covariance_lkf_.rows() >= 6 &&
+          state_covariance_lkf_.cols() >= 6) {
+        const gtsam::Matrix66 pose_cov =
+            state_covariance_lkf_.topLeftCorner<6, 6>();
+        if (pose_cov.allFinite()) {
+          belief->covariance_ = pose_cov;
+          covariance_set = true;
+        }
+      }
+    } else {
+      // Legacy path (preserve existing behavior outside explicitly tuned runs).
+      if (state_covariance_lkf_.rows() >= 6 && state_covariance_lkf_.cols() >= 6) {
+        belief->covariance_ = state_covariance_lkf_.topLeftCorner<6, 6>();
+        covariance_set = true;
+      }
     }
   }
 
-  // Last-resort fallback keeps outbound belief always valid even when marginals are not ready yet.
+  // Fallback when covariance is unavailable.
   if (!covariance_set) {
-    belief->covariance_.setIdentity();
-    belief->covariance_.topLeftCorner<3, 3>() *= 1e-2;      // rot
-    belief->covariance_.bottomRightCorner<3, 3>() *= 1e-2;  // trans
-    VLOG(2) << "State covariance unavailable, using fallback identity covariance.";
+    if (FLAGS_external_pose_belief_safe_covariance_fallback) {
+      // Conservative fallback for explicitly enabled datasets/profiles.
+      belief->covariance_.setZero();
+      constexpr double kFallbackRotVar = 5e-2;    // rad^2
+      constexpr double kFallbackTransVar = 5e-1;  // m^2
+      belief->covariance_.topLeftCorner<3, 3>().diagonal().setConstant(
+          kFallbackRotVar);
+      belief->covariance_.bottomRightCorner<3, 3>().diagonal().setConstant(
+          kFallbackTransVar);
+      VLOG(1) << "State covariance unavailable, using conservative fallback "
+                 "pose covariance (rot_var="
+              << kFallbackRotVar << ", trans_var=" << kFallbackTransVar
+              << ").";
+    } else {
+      // Legacy fallback.
+      belief->covariance_.setIdentity();
+      belief->covariance_.topLeftCorner<3, 3>() *= 1e-2;      // rot
+      belief->covariance_.bottomRightCorner<3, 3>() *= 1e-2;  // trans
+      VLOG(2) << "State covariance unavailable, using fallback identity covariance.";
+    }
   }
 
   if (!belief->covariance_.allFinite()) {
@@ -1642,6 +1700,12 @@ bool VioBackend::enqueueExternalPosePriorFromCovariance(
     const gtsam::Matrix6& covariance,
     const std::string& source,
     uint64_t source_seq) {
+  if (!useCbsBeliefExchange()) {
+    LOG_EVERY_N(WARNING, 200)
+        << "Dropping external pose prior because CBS belief exchange is OFF.";
+    return false;
+  }
+
   if (!covariance.allFinite()) {
     LOG(WARNING) << "enqueueExternalPosePriorFromCovariance: covariance has "
                     "non-finite entries, dropping prior.";
@@ -1748,18 +1812,21 @@ bool VioBackend::optimize(
           ? static_cast<size_t>(FLAGS_external_prior_max_per_optimize)
           : static_cast<size_t>(400);
 
+  const bool cbs_exchange_active = useCbsBeliefExchange();
+  const bool cbs_heart_active = useCbsOptimizerHeart();
+
   size_t num_external_priors_injected = 0;
   size_t num_external_priors_deferred = 0;
   size_t num_external_priors_dropped_old = 0;
   size_t num_external_priors_dropped_marginalized = 0;
   size_t num_external_priors_dropped_inactive = 0;
+  size_t num_external_priors_dropped_disabled_mode = 0;
   size_t num_external_priors_deferred_budget = 0;
 
   // zy Step 12a
-  // In CBS mode, we stage external pose messages as Gaussian beliefs and inject them in one batch.
+  // In CBS mode, stage/query belief acceptance counters while keeping fixed-lag
+  // as optimization heart.
   #ifdef KIMERA_USE_CBS
-  std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
-      cbs_incoming_beliefs;
   size_t num_external_beliefs_staged = 0;
   size_t num_external_beliefs_rejected = 0;
   size_t num_external_beliefs_dropped_bad_noise = 0;
@@ -1828,6 +1895,11 @@ bool VioBackend::optimize(
     std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
 
     for (const auto& prior : external_pose_priors_queue_) {
+      if (!cbs_exchange_active) {
+        ++num_external_priors_dropped_disabled_mode;
+        continue;
+      }
+
       // Drop priors that are older than the oldest pose still active in the
       // optimizer window (fixed-lag behavior).
       if (oldest_active_pose_timestamp > 0 &&
@@ -1889,7 +1961,7 @@ bool VioBackend::optimize(
         // Fixed-lag policy: if a prior cannot be matched to any active key now,
         // discard it instead of deferring indefinitely. Future priors were
         // already handled by the future-gate above.
-        if (!useCbsOptimizerHeart()) {
+        if (!cbs_heart_active) {
           ++num_external_priors_dropped_marginalized;
           continue;
         }
@@ -1921,7 +1993,7 @@ bool VioBackend::optimize(
       // zy Step 28a: key-availability must be checked against the optimizer that is actually active (CBS or legacy).
       bool pose_key_is_active = false;
 #ifdef KIMERA_USE_CBS
-      if (useCbsOptimizerHeart()) {
+      if (cbs_heart_active) {
         CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
         pose_key_is_active =
             cbs_optimizer_->valueExists(pose_symbol) || new_values_.exists(pose_symbol);
@@ -1934,14 +2006,16 @@ bool VioBackend::optimize(
 
       if (pose_key_is_active) {
 #ifdef KIMERA_USE_CBS
-        if (useCbsOptimizerHeart()) {
-          // In CBS mode, route matched external measurements through BPSAM belief ingestion (not direct priors).
+        if (cbs_exchange_active) {
+          // zy Step 41c
+          // In CBS mode with fixed-lag heart, use CBS belief gate for
+          // acceptance/rejection, then inject accepted priors into Kimera graph.
           CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 
+          bool accepted_by_cbs = true;
           gtsam::Matrix66 cov = gtsam::Matrix66::Zero();
           bool have_cov = false;
 
-          // Convert supported Kimera noise models into covariance because gbp::Gaussian is moment-parameterized.
           if (auto gaussian_model =
                   boost::dynamic_pointer_cast<gtsam::noiseModel::Gaussian>(
                       prior.noise_model_)) {
@@ -1961,25 +2035,13 @@ bool VioBackend::optimize(
 
           if (!have_cov || !cov.allFinite()) {
             ++num_external_beliefs_dropped_bad_noise;
+            accepted_by_cbs = false;
             VLOG(2) << "Dropping external belief with unsupported/non-finite noise. "
                     << "source=" << prior.source_
                     << ", seq=" << prior.source_seq_
                     << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
-            continue;
           }
 
-          const gtsam::Vector6 mu =
-              gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_B_);
-
-          // // Map source tags into CBS agent ids so BPSAM tracks per-sender belief streams.
-          // cbs::AgentId sender_id = static_cast<cbs::AgentId>(1);  // default remote
-          // if (prior.source_ == "kimera" || prior.source_ == "self") {
-          //   sender_id = static_cast<cbs::AgentId>(0);
-          // } else if (prior.source_ == "liorf" || prior.source_ == "liosam") {
-          //   sender_id = static_cast<cbs::AgentId>(1);
-          // } (zy cancelled it)
-
-          // zy Step 33c: map sender tags to stable CBS multi-agent IDs used by labeled robot anchors.
           cbs::AgentId sender_id = kKimeraAgentId;
           bool known_source = true;
           if (prior.source_ == "kimera" || prior.source_ == "self") {
@@ -1990,58 +2052,60 @@ bool VioBackend::optimize(
             known_source = false;
           }
 
-
-          if (!known_source) {
+          if (accepted_by_cbs && !known_source) {
             ++num_external_beliefs_dropped_unknown_source;
+            accepted_by_cbs = false;
             VLOG(2) << "Dropping external belief with unknown source tag. "
                     << "source=" << prior.source_
                     << ", seq=" << prior.source_seq_
                     << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
-            continue;
           }
 
-          // zy Step 35b
-          if (sender_id == kKimeraAgentId) {
+          if (accepted_by_cbs && sender_id == kKimeraAgentId) {
             ++num_external_beliefs_dropped_self_source;
+            accepted_by_cbs = false;
             VLOG(2) << "Dropping self-source belief to prevent feedback loop. "
                     << "source=" << prior.source_
                     << ", seq=" << prior.source_seq_
                     << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
+          }
+
+          if (accepted_by_cbs) {
+            const gtsam::Vector6 mu =
+                gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_B_);
+            gbp::Gaussian belief(pose_symbol, mu, cov, 1);
+            std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
+                single_belief;
+            single_belief[pose_symbol].emplace_back(sender_id, belief);
+            ++num_external_beliefs_staged;
+            const size_t rejected_count =
+                static_cast<size_t>(cbs_optimizer_->addBeliefs(single_belief));
+            num_external_beliefs_rejected += rejected_count;
+            accepted_by_cbs = (rejected_count == 0u);
+          }
+
+          if (!accepted_by_cbs) {
             continue;
           }
 
-
-
-
-
-          // Stage belief by matched pose key; addBeliefs() will contractively merge before the update step.
-          gbp::Gaussian belief(pose_symbol, mu, cov, 1);
-          cbs_incoming_beliefs[pose_symbol].emplace_back(sender_id, belief);
-          ++num_external_beliefs_staged;
+          // zy Step 41d
+          // Inject accepted external belief as a standard PriorFactor so fixed-lag
+          // smoothing remains the only optimization heart.
+          addExternalPosePrior(matched_frame_id, prior.W_Pose_B_, prior.noise_model_);
           ++num_external_priors_injected;
-
-          VLOG(2) << "Staged external CBS belief: source=" << prior.source_
-                  << ", seq=" << prior.source_seq_
+          VLOG(2) << "Injected external prior factor from CBS-accepted belief. source="
+                  << prior.source_ << ", seq=" << prior.source_seq_
                   << ", ts[nsec]=" << prior.timestamp_kf_nsec_
                   << ", matched_frame_id=" << matched_frame_id;
         } else {
-          // Legacy fallback: keep direct prior injection when CBS runtime switch is disabled.
-          addExternalPosePrior(
-              matched_frame_id, prior.W_Pose_B_, prior.noise_model_);
-          ++num_external_priors_injected;
-          VLOG(2) << "Injected external prior: source=" << prior.source_
-                  << ", seq=" << prior.source_seq_
-                  << ", ts[nsec]=" << prior.timestamp_kf_nsec_
-                  << ", matched_frame_id=" << matched_frame_id;
+          ++num_external_priors_dropped_disabled_mode;
+          VLOG(2) << "Dropping external prior because CBS belief exchange is OFF. source="
+                  << prior.source_ << ", seq=" << prior.source_seq_
+                  << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
         }
 #else
-        addExternalPosePrior(
-            matched_frame_id, prior.W_Pose_B_, prior.noise_model_);
-        ++num_external_priors_injected;
-        VLOG(2) << "Injected external prior: source=" << prior.source_
-                << ", seq=" << prior.source_seq_
-                << ", ts[nsec]=" << prior.timestamp_kf_nsec_
-                << ", matched_frame_id=" << matched_frame_id;
+        ++num_external_priors_dropped_disabled_mode;
+        VLOG(2) << "Dropping external prior because CBS support is not compiled.";
 #endif
       } else {
 
@@ -2058,15 +2122,21 @@ bool VioBackend::optimize(
 
   // zy Step 12c
   #ifdef KIMERA_USE_CBS
-  if (useCbsOptimizerHeart() && !cbs_incoming_beliefs.empty()) {
-    // Flush staged beliefs once per optimize cycle so CBS receives a coherent batch for this iteration.
-    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
-    num_external_beliefs_rejected = cbs_optimizer_->addBeliefs(cbs_incoming_beliefs);
-    VLOG(2) << "CBS addBeliefs: staged=" << num_external_beliefs_staged
-            << ", rejected=" << num_external_beliefs_rejected
-            << ", bad_noise=" << num_external_beliefs_dropped_bad_noise
-            << ", unknown_source=" << num_external_beliefs_dropped_unknown_source
-            << ", self_source=" << num_external_beliefs_dropped_self_source;
+  if (cbs_exchange_active && num_external_beliefs_staged > 0) {
+    const size_t num_external_beliefs_accepted =
+        (num_external_beliefs_staged >= num_external_beliefs_rejected)
+            ? (num_external_beliefs_staged - num_external_beliefs_rejected)
+            : 0u;
+    LOG_EVERY_N(INFO, 20) << "CBS addBeliefs: staged="
+                          << num_external_beliefs_staged
+                          << ", rejected=" << num_external_beliefs_rejected
+                          << ", accepted=" << num_external_beliefs_accepted
+                          << ", bad_noise="
+                          << num_external_beliefs_dropped_bad_noise
+                          << ", unknown_source="
+                          << num_external_beliefs_dropped_unknown_source
+                          << ", self_source="
+                          << num_external_beliefs_dropped_self_source;
 
   }
   #endif
@@ -2074,15 +2144,17 @@ bool VioBackend::optimize(
   if (num_external_priors_injected > 0 || num_external_priors_dropped_old > 0 ||
       num_external_priors_dropped_marginalized > 0 ||
       num_external_priors_dropped_inactive > 0 ||
+      num_external_priors_dropped_disabled_mode > 0 ||
       num_external_priors_deferred_budget > 0) {
-    VLOG(1) << "External prior stats: injected=" << num_external_priors_injected
-            << ", deferred=" << num_external_priors_deferred
-            << ", dropped_old=" << num_external_priors_dropped_old
-            << ", dropped_marginalized="
-            << num_external_priors_dropped_marginalized
-            << ", dropped_inactive=" << num_external_priors_dropped_inactive
-            << ", deferred_budget=" << num_external_priors_deferred_budget
-            << ", queue_size_now=" << external_pose_priors_queue_.size();
+    LOG_EVERY_N(INFO, 20)
+        << "External prior stats: injected=" << num_external_priors_injected
+        << ", deferred=" << num_external_priors_deferred
+        << ", dropped_old=" << num_external_priors_dropped_old
+        << ", dropped_marginalized=" << num_external_priors_dropped_marginalized
+        << ", dropped_inactive=" << num_external_priors_dropped_inactive
+        << ", dropped_disabled_mode=" << num_external_priors_dropped_disabled_mode
+        << ", deferred_budget=" << num_external_priors_deferred_budget
+        << ", queue_size_now=" << external_pose_priors_queue_.size();
   }
 
 

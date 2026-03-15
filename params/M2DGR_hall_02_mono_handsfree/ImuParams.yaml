@@ -1,0 +1,32 @@
+%YAML:1.0
+# Type of IMU preintegration:
+# 0: CombinedImuFactor
+# 1: ImuFactor
+imu_preintegration_type: 1
+
+# Sensor extrinsics wrt. the body-frame (IMU chosen as body frame).
+T_BS:
+  cols: 4
+  rows: 4
+  data: [1.0, 0.0, 0.0, 0.0,
+         0.0, 1.0, 0.0, 0.0,
+         0.0, 0.0, 1.0, 0.0,
+         0.0, 0.0, 0.0, 1.0]
+
+# /handsfree/imu measured from hall_02.bag: ~145.9 Hz.
+rate_hz: 150
+
+# M2DGR calibration_results.txt (handsfree IMU)
+imu_bias_init_sigma: 1e-3
+gyroscope_noise_density: 2.3417543020438883e-03
+gyroscope_random_walk: 1.4428407712885209e-05
+accelerometer_noise_density: 3.7686306102624571e-02
+accelerometer_random_walk: 1.1416642385952368e-03
+
+# other parameters
+do_imu_rate_time_alignment: 1
+time_alignment_window_size_s: 10.0
+time_alignment_variance_threshold_scaling: 30.0
+imu_integration_sigma: 1e-08
+imu_time_shift: 0.0
+n_gravity: [0.00000000, 0.00000000, -9.80511000]

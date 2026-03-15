@@ -1,0 +1,22 @@
+#!/bin/bash
+--debug_graph_before_opt=false
+--process_cheirality=true
+--max_number_of_cheirality_exceptions=5
+--compute_state_covariance=true
+
+# Standalone (no CBS): CBS optimizer + external belief queues can keep extra graphs/values alive.
+--use_cbs_optimizer=false
+
+# zy CBS tuned profile for M2DGR:
+# keep priors fresh and low-rate, but allow moderate timestamp mismatch.
+--external_prior_timestamp_tolerance_ns=300000000
+--external_prior_max_future_lead_ns=50000000
+--external_prior_max_age_ns=3000000000
+--external_prior_max_queue_size=60
+--external_prior_queue_time_horizon_ns=3000000000
+--external_prior_max_per_optimize=2
+--external_pose_belief_safe_covariance_fallback=true
+
+# Keep legacy behavior.
+--no_incremental_pose=true
+--cbs_replace_fixed_lag_optimizer=false

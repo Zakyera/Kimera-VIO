@@ -1,6 +1,6 @@
 %YAML:1.0
 # General sensor definitions.
-camera_id: left_cam
+camera_id: right_cam
 
 # Sensor extrinsics wrt. the body-frame (body = /camera/imu).
 # Derived from calibration_Results.txt by chaining:
@@ -9,15 +9,15 @@ camera_id: left_cam
 T_BS:
   cols: 4
   rows: 4
-  data:  [1.00000000, 0.00000000, 0.00000000, -0.16058000,
-          0.00000000, 1.00000000, 0.00000000, -0.06235000,
-          0.00000000, 0.00000000, 1.00000000, -0.07288000,
+  data:  [1.00000000, 0.00000000, 0.00000000, -0.16077700,
+          0.00000000, 1.00000000, 0.00000000, 0.25990000,
+          0.00000000, 0.00000000, 1.00000000, -0.07301000,
           0.00000000, 0.00000000, 0.00000000, 1.00000000]
 
 # Camera specific definitions
 rate_hz: 15
 resolution: [1280, 1024]  # [width, height]
 camera_model: pinhole
-intrinsics: [540.645056202188, 539.8545023658869, 626.4125666883942, 523.947634226782]  # [fu, fv, cu, cv]
+intrinsics: [540.6832252229977, 539.3921307247979, 632.9173957218305, 503.3766864767991]  # [fu, fv, cu, cv]
 distortion_model: radtan
-distortion_coefficients: [-0.07015146608431883, 0.008586142263125124, -0.021968993685891842, 0.007442211946112636]  # [k1,k2,p1,p2]
+distortion_coefficients: [-0.07147685334620411, 0.006423830171528276, -0.02354604292216998, 0.009181757660952325]  # [k1,k2,p1,p2]

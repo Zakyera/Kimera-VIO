@@ -552,6 +552,8 @@ class VioBackend {
 
   // State covariance. (initialize to zero)
   gtsam::Matrix state_covariance_lkf_ = Eigen::MatrixXd::Zero(15, 15);
+  // True once computeStateCovariance() has produced a valid matrix.
+  bool state_covariance_lkf_valid_ = false;
 
   // Vision params.
   gtsam::SmartStereoProjectionParams smart_factors_params_;

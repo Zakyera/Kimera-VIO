@@ -1,0 +1,22 @@
+%YAML:1.0
+# General sensor definitions.
+camera_id: left_cam
+
+# Sensor extrinsics wrt. the body-frame (body = /handsfree/imu).
+# zy: from official M2DGR calibration_results.txt:
+# T_handsfree_camcolor = inv(T_lidar_handsfree) * T_lidar_camcolor.
+T_BS:
+  cols: 4
+  rows: 4
+  data:  [0.0, 0.0, 1.0, 0.57711000,
+         -1.0, 0.0, 0.0, -0.00012000,
+          0.0,-1.0, 0.0, 0.83330000,
+          0.0, 0.0, 0.0, 1.0]
+
+# Camera specific definitions
+rate_hz: 15
+resolution: [640, 480]  # [width, height]
+camera_model: pinhole
+intrinsics: [617.971050917033, 616.445131524790, 327.710279392468, 253.976983707814]  # [fu, fv, cu, cv]
+distortion_model: radtan
+distortion_coefficients: [0.148000794688248, -0.217835187249065, 0.0, 0.0]  # [k1,k2,p1,p2]
