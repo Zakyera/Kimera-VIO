@@ -21,16 +21,16 @@ initialGyroBiasSigma: 0.001
 linearizationMode: 0
 # How to manage degeneracy
 # 0: Ignore degeneracy, 1: Zero on degeneracy, 2: handle infinity
-degeneracyMode: 1
+degeneracyMode: 2
 # rankTolerance: threshold to decide whether triangulation is result.degenerate
 # (the rank is the number of singular values of the triangulation matrix which
 # are larger than rankTolerance)
-rankTolerance: 1
+rankTolerance: 0.1
 # /** landmarkDistanceThreshold
 #   * if the landmark is triangulated at distance larger than this,
 #   * result is flagged as degenerate.
 #   */
-landmarkDistanceThreshold: 20
+landmarkDistanceThreshold: 80
 
 # DynamicOutlierRejection:
 #  /**
@@ -38,7 +38,7 @@ landmarkDistanceThreshold: 20
 #   * is smaller than this threshold after triangulation, otherwise result is
 #   * flagged as degenerate.
 #   */
-outlierRejection: 3
+outlierRejection: 5
 # ///< threshold to decide whether to re-triangulate
 retriangulationThreshold: 0.001
 
@@ -89,5 +89,5 @@ useDogLeg: 0
 #   STEREO = 2
 #   PNP = 3
 #   EXTERNAL_ODOM = 4
-pose_guess_source: 0
+pose_guess_source: 1
 mono_translation_scale_factor: 0.1
