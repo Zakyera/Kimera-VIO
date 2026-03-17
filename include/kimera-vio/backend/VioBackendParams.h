@@ -147,6 +147,12 @@ class BackendParams : public PipelineParams {
   double no_motion_position_precision_ = 1000;
   double no_motion_rotation_precision_ = 10000;
   double constant_vel_precision_ = 100;
+  // When enabled, LOW_DISPARITY handling checks IMU-predicted motion and
+  // uses a constant-velocity prior instead of no-motion factors while moving.
+  bool low_disparity_use_imu_motion_gate_ = false;
+  double low_disparity_motion_translation_threshold_m_ = 0.08;
+  double low_disparity_motion_rotation_threshold_rad_ = 0.03;
+  double low_disparity_motion_delta_speed_threshold_mps_ = 0.2;
 
   //! Source of the initial guess for the keyframe pose
   PoseGuessSource pose_guess_source_ = PoseGuessSource::IMU;

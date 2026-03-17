@@ -53,9 +53,11 @@
 
 
 #include <limits>  // for numeric_limits<>
+#include <algorithm>
 #include <map>
 #include <string>
 #include <utility>  // for make_pair
+#include <unordered_set>
 #include <vector>
 #include <cmath> // zy step 5_c
 
@@ -677,6 +679,51 @@ bool VioBackend::addVisualInertialStateAndOptimize(
   switch (kfTrackingStatus_mono) {
     // vehicle is not moving
     case TrackingStatus::LOW_DISPARITY: {
+      if (backend_params_.low_disparity_use_imu_motion_gate_) {
+        const gtsam::NavState navstate_lkf(W_Pose_B_lkf_from_state_,
+                                           W_Vel_B_lkf_);
+        const gtsam::NavState predicted_state =
+            pim.predict(navstate_lkf, imu_bias_lkf_);
+        const gtsam::Pose3 B_lkf_Pose_kf_imu =
+            W_Pose_B_lkf_from_state_.between(predicted_state.pose());
+        const double imu_dt_s = pim.deltaTij();
+        const double imu_translation_norm_m =
+            B_lkf_Pose_kf_imu.translation().norm();
+        const double imu_rotation_norm_rad =
+            gtsam::Rot3::Logmap(B_lkf_Pose_kf_imu.rotation()).norm();
+        const double imu_delta_speed_norm_mps =
+            (predicted_state.velocity() - W_Vel_B_lkf_).norm();
+
+        const bool imu_indicates_motion =
+            std::isfinite(imu_dt_s) && imu_dt_s > 0.0 &&
+            (imu_translation_norm_m >
+                 backend_params_
+                     .low_disparity_motion_translation_threshold_m_ ||
+             imu_rotation_norm_rad >
+                 backend_params_.low_disparity_motion_rotation_threshold_rad_ ||
+             imu_delta_speed_norm_mps >
+                 backend_params_
+                     .low_disparity_motion_delta_speed_threshold_mps_);
+
+        if (imu_indicates_motion) {
+          LOG(WARNING)
+              << "Low disparity with IMU-indicated motion: using constant "
+                 "velocity factor instead of no-motion priors."
+              << " imu_dt_s=" << imu_dt_s
+              << " imu_translation_m=" << imu_translation_norm_m
+              << " imu_rotation_rad=" << imu_rotation_norm_rad
+              << " imu_delta_speed_mps=" << imu_delta_speed_norm_mps;
+          if (backend_params_.constant_vel_precision_ > 0.0) {
+            addConstantVelocityFactor(last_kf_id_, curr_kf_id_);
+          } else {
+            LOG(WARNING)
+                << "Low disparity with IMU motion but constant_vel_precision "
+                   "is zero: skipping no-motion constraints for this keyframe.";
+          }
+          break;
+        }
+      }
+
       LOG(WARNING)
           << "Low disparity: adding zero velocity and no motion factors.";
       if (backend_params_.zero_velocity_precision_ > 0.0) {
@@ -775,15 +822,32 @@ void VioBackend::addLandmarksToGraph(const LandmarkIds& landmarks_kf) {
     }
 
     if (!ft.in_ba_graph_) {
-      ft.in_ba_graph_ = true;
-      addLandmarkToGraph(lmk_id, ft);
-      ++n_new_landmarks;
+      const bool added = addLandmarkToGraph(lmk_id, ft);
+      ft.in_ba_graph_ = added;
+      if (added) {
+        ++n_new_landmarks;
+      }
     } else {
       const std::pair<FrameId, StereoPoint2> obs_kf = ft.obs_.back();
 
       LOG_IF(FATAL, obs_kf.first != static_cast<FrameId>(curr_kf_id_))
           << "addLandmarksToGraph: last obs is not from the current "
              "keyframe!\n";
+
+      if (old_smart_factors_.find(lmk_id) == old_smart_factors_.end()) {
+        // After backend recovery/cleanup a track may still be marked
+        // in_ba_graph_ while its smart-factor bookkeeping entry is gone.
+        // Recreate the factor from the full track instead of hard-failing.
+        LOG(WARNING) << "Landmark " << lmk_id
+                     << " missing from old_smart_factors_. Re-adding it from "
+                        "feature track history.";
+        const bool added = addLandmarkToGraph(lmk_id, ft);
+        ft.in_ba_graph_ = added;
+        if (added) {
+          ++n_new_landmarks;
+        }
+        continue;
+      }
 
       updateLandmarkInGraph(lmk_id, obs_kf);
       ++n_updated_landmarks;
@@ -796,7 +860,7 @@ void VioBackend::addLandmarksToGraph(const LandmarkIds& landmarks_kf) {
 
 /* -------------------------------------------------------------------------- */
 // Adds a landmark to the graph for the first time.
-void VioBackend::addLandmarkToGraph(const LandmarkId& lmk_id,
+bool VioBackend::addLandmarkToGraph(const LandmarkId& lmk_id,
                                     const FeatureTrack& ft) {
   // We use a unit pinhole projection camera for the smart factors to be
   // more efficient.
@@ -807,22 +871,49 @@ void VioBackend::addLandmarkToGraph(const LandmarkId& lmk_id,
            << " landmarks to graph, with keys: ";
 
   // Add observations to smart factor
+  size_t num_active_observations = 0u;
   if (VLOG_IS_ON(10)) new_factor->print();
   std::stringstream ss;
   for (const std::pair<FrameId, StereoPoint2>& obs : ft.obs_) {
     const FrameId& frame_id = obs.first;
     const gtsam::Symbol& pose_symbol = gtsam::Symbol(kPoseSymbolChar, frame_id);
+    bool pose_key_is_active = false;
+#ifdef KIMERA_USE_CBS
+    if (useCbsOptimizerHeart()) {
+      CHECK(cbs_optimizer_)
+          << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+      pose_key_is_active =
+          cbs_optimizer_->valueExists(pose_symbol) ||
+          new_values_.exists(pose_symbol);
+    } else
+#endif
+    {
+      pose_key_is_active =
+          state_.exists(pose_symbol) || new_values_.exists(pose_symbol);
+    }
+    if (!pose_key_is_active) {
+      continue;
+    }
     const StereoPoint2& measurement = obs.second;
     new_factor->add(measurement, pose_symbol, stereo_cal_);
+    ++num_active_observations;
 
     if (VLOG_IS_ON(10)) ss << " " << obs.first;
   }
   VLOG(10) << ss.str() << std::endl;
 
+  if (num_active_observations < 2u) {
+    VLOG(2) << "Skipping smart-factor add for landmark " << lmk_id
+            << ": only " << num_active_observations
+            << " active observation(s) in current optimizer window.";
+    return false;
+  }
+
   // add new factor to suitable structures:
   new_smart_factors_.insert(std::make_pair(lmk_id, new_factor));
   old_smart_factors_.insert(
       std::make_pair(lmk_id, std::make_pair(new_factor, -1)));
+  return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -832,8 +923,11 @@ void VioBackend::updateLandmarkInGraph(
     const std::pair<FrameId, StereoPoint2>& new_measurement) {
   // Update existing smart-factor
   auto old_smart_factors_it = old_smart_factors_.find(lmk_id);
-  CHECK(old_smart_factors_it != old_smart_factors_.end())
-      << "Landmark not found in old_smart_factors_ with id: " << lmk_id;
+  if (old_smart_factors_it == old_smart_factors_.end()) {
+    LOG(WARNING) << "updateLandmarkInGraph: landmark " << lmk_id
+                 << " is missing from old_smart_factors_. Skipping update.";
+    return;
+  }
 
   const auto& old_factor = old_smart_factors_it->second.first;
   // Clone old factor to keep all previous measurements, now append one.
@@ -846,13 +940,12 @@ void VioBackend::updateLandmarkInGraph(
   // Update the factor
   Slot slot = old_smart_factors_it->second.second;
   if (slot != -1) {
-    new_smart_factors_.insert(std::make_pair(lmk_id, new_factor));
+    new_smart_factors_[lmk_id] = new_factor;
   } else {
-    // If it's slot in the graph is still -1, it means that the factor has not
-    // been inserted yet in the graph...
-    LOG(FATAL) << "When updating the smart factor, its slot should not be -1!"
-                  " Offensive lmk_id: "
-               << lmk_id;
+    // Factor not yet inserted in the graph: keep the queued version updated.
+    LOG(WARNING) << "updateLandmarkInGraph: slot == -1 for landmark "
+                 << lmk_id << ". Updating queued smart factor.";
+    new_smart_factors_[lmk_id] = new_factor;
   }
   old_smart_factors_it->second.first = new_factor;
   VLOG(10) << "updateLandmarkInGraph: added observation to point: " << lmk_id;
@@ -2655,22 +2748,56 @@ void VioBackend::addConstantVelocityFactor(const FrameId& from_id,
 void VioBackend::updateStates(const FrameId& cur_id) {
   // zy Step 11c, edited the original
   // ---
-    VLOG(10) << "Starting to calculate estimate.";
+  VLOG(10) << "Starting to calculate estimate.";
+  try {
 #ifdef KIMERA_USE_CBS
-  if (useCbsOptimizerHeart()) {
-    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
-    state_ = cbs_optimizer_->calculateEstimate();
-  } else {
-    state_ = smoother_->calculateEstimate();
-  }
+    if (useCbsOptimizerHeart()) {
+      CHECK(cbs_optimizer_)
+          << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+      state_ = cbs_optimizer_->calculateEstimate();
+    } else {
+      state_ = smoother_->calculateEstimate();
+    }
 #else
-  state_ = smoother_->calculateEstimate();
+    state_ = smoother_->calculateEstimate();
 #endif
+  } catch (const gtsam::ValuesKeyDoesNotExist& e) {
+    LOG(ERROR) << "updateStates(): calculateEstimate missing key: " << e.what()
+               << ". Skipping this backend cycle.";
+    return;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "updateStates(): calculateEstimate failed: " << e.what()
+               << ". Skipping this backend cycle.";
+    return;
+  } catch (...) {
+    LOG(ERROR) << "updateStates(): calculateEstimate failed with unknown "
+                  "exception. Skipping this backend cycle.";
+    return;
+  }
   VLOG(10) << "Finished to calculate estimate.";
 
 
-  gtsam::Pose3 W_Pose_B_kf =
-      state_.at<gtsam::Pose3>(gtsam::Symbol(kPoseSymbolChar, cur_id));
+  const gtsam::Symbol pose_key(kPoseSymbolChar, cur_id);
+  const gtsam::Symbol vel_key(kVelocitySymbolChar, cur_id);
+  const gtsam::Symbol bias_key(kImuBiasSymbolChar, cur_id);
+  if (!state_.exists(pose_key) || !state_.exists(vel_key) ||
+      !state_.exists(bias_key)) {
+    LOG(ERROR) << "updateStates(): missing current state key(s) at frame "
+               << cur_id << " [pose=" << state_.exists(pose_key)
+               << ", vel=" << state_.exists(vel_key)
+               << ", bias=" << state_.exists(bias_key)
+               << "]. Skipping this backend cycle.";
+    return;
+  }
+
+  gtsam::Pose3 W_Pose_B_kf;
+  try {
+    W_Pose_B_kf = state_.at<gtsam::Pose3>(pose_key);
+  } catch (const gtsam::ValuesKeyDoesNotExist& e) {
+    LOG(ERROR) << "updateStates(): pose access failed: " << e.what()
+               << ". Skipping this backend cycle.";
+    return;
+  }
   gtsam::Pose3 W_Pose_B_lkf = gtsam::Pose3();
   gtsam::Pose3 B_lkf_Pose_kf = gtsam::Pose3();
 
@@ -2691,10 +2818,14 @@ void VioBackend::updateStates(const FrameId& cur_id) {
   if (cur_id > 0) {
     const gtsam::Symbol prev_pose_key(kPoseSymbolChar, cur_id - 1);
     if (state_.exists(prev_pose_key)) {
-      W_Pose_B_lkf = state_.at<gtsam::Pose3>(prev_pose_key);
-
-      // Compute relative pose as odometry to append to pose estimate trajectory.
-      B_lkf_Pose_kf = W_Pose_B_lkf.between(W_Pose_B_kf);
+      try {
+        W_Pose_B_lkf = state_.at<gtsam::Pose3>(prev_pose_key);
+        // Compute relative pose as odometry to append to pose estimate trajectory.
+        B_lkf_Pose_kf = W_Pose_B_lkf.between(W_Pose_B_kf);
+      } catch (const gtsam::ValuesKeyDoesNotExist& e) {
+        LOG(ERROR) << "updateStates(): prev pose access failed: " << e.what()
+                   << ". Using identity increment for frame " << cur_id;
+      }
     } else {
       // Intuition: if x(k-1) is temporarily unavailable, keep backend alive with identity increment instead of hard-failing.
       VLOG(2) << "Previous pose key missing in state: " << prev_pose_key
@@ -2705,9 +2836,14 @@ void VioBackend::updateStates(const FrameId& cur_id) {
 
   // Update latest state estimate
   W_Pose_B_lkf_from_state_ = W_Pose_B_kf;
-  W_Vel_B_lkf_ = state_.at<Vector3>(gtsam::Symbol(kVelocitySymbolChar, cur_id));
-  imu_bias_lkf_ = state_.at<gtsam::imuBias::ConstantBias>(
-      gtsam::Symbol(kImuBiasSymbolChar, cur_id));
+  try {
+    W_Vel_B_lkf_ = state_.at<Vector3>(vel_key);
+    imu_bias_lkf_ = state_.at<gtsam::imuBias::ConstantBias>(bias_key);
+  } catch (const gtsam::ValuesKeyDoesNotExist& e) {
+    LOG(ERROR) << "updateStates(): velocity/bias access failed: " << e.what()
+               << ". Skipping this backend cycle.";
+    return;
+  }
 
   // Update output estimate by chaining relative motion estimates
   W_Pose_B_lkf_from_increments_ =
@@ -2830,6 +2966,10 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       debug_smoother_ = false;
     }
   } catch (const gtsam::IndeterminantLinearSystemException& e) {
+    // zy: GEODE mono robustness path.
+    // zy: When the linear system becomes underconstrained, we add
+    // zy: stabilizing priors on x/b/v (failure-near + new states) and try a
+    // zy: priors-only fallback update instead of hard-stopping the backend.
     LOG(ERROR) << e.what();
     const gtsam::Key& var = e.nearbyVariable();
     gtsam::Symbol symb(var);
@@ -2847,59 +2987,99 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     // Add priors on all variables to fix indeterminant linear system
     gtsam::Values values = smoother_->calculateEstimate();
 
-    // Add priors on keys with these prefixes (pose, imu bias, velocity)
+    // Add priors on pose/velocity/bias keys near the failure and on newly
+    // introduced states for this update.
     std::vector<unsigned char> key_prefixes_to_prior = {'x', 'b', 'v'};
     gtsam::Symbol first_key = values.keys().at(0);
-    gtsam::KeyVector prior_keys;
+    std::unordered_set<gtsam::Key> prior_keys_set;
     for (const auto& prefix : key_prefixes_to_prior) {
-      prior_keys.push_back(gtsam::Symbol(prefix, symb.index()));
-      prior_keys.push_back(gtsam::Symbol(prefix, first_key.index()));
+      prior_keys_set.insert(gtsam::Symbol(prefix, symb.index()));
+      prior_keys_set.insert(gtsam::Symbol(prefix, first_key.index()));
     }
-    CHECK_EQ(prior_keys.size(), 6u);
+    for (const auto& key_value : new_values) {
+      const gtsam::Symbol candidate(key_value.key);
+      if (candidate.chr() == 'x' || candidate.chr() == 'b' ||
+          candidate.chr() == 'v') {
+        prior_keys_set.insert(candidate.key());
+      }
+    }
+    std::vector<gtsam::Key> prior_keys(prior_keys_set.begin(),
+                                       prior_keys_set.end());
+    std::sort(prior_keys.begin(), prior_keys.end());
     gtsam::NonlinearFactorGraph nfg;
 
-    // Only add priors on first state and the state nearest the failure
-    for (const gtsam::Symbol& key : prior_keys) {
-      CHECK(values.exists(key));
-      LOG(ERROR) << "Adding prior on key: " << key.chr() << key.index();
+    auto add_stabilizing_prior =
+        [&](const gtsam::Symbol& key,
+            gtsam::NonlinearFactorGraph* graph_to_update) -> bool {
+      CHECK_NOTNULL(graph_to_update);
       switch (key.chr()) {
         case 'x': {
-          gtsam::Pose3 pose = values.at<gtsam::Pose3>(key);
+          gtsam::Pose3 pose;
+          if (values.exists(key)) {
+            pose = values.at<gtsam::Pose3>(key);
+          } else if (new_values.exists(key)) {
+            pose = new_values.at<gtsam::Pose3>(key);
+          } else {
+            return false;
+          }
           gtsam::Vector6 sigmas;
           sigmas.head<3>().setConstant(0.01);  // rotation
           sigmas.tail<3>().setConstant(0.1);   // translation
           gtsam::SharedNoiseModel noise =
               gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-          nfg.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+          graph_to_update->emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
               key, pose, noise);
-          break;
+          return true;
         }
         case 'b': {
-          gtsam::imuBias::ConstantBias bias =
-              values.at<gtsam::imuBias::ConstantBias>(key);
+          gtsam::imuBias::ConstantBias bias;
+          if (values.exists(key)) {
+            bias = values.at<gtsam::imuBias::ConstantBias>(key);
+          } else if (new_values.exists(key)) {
+            bias = new_values.at<gtsam::imuBias::ConstantBias>(key);
+          } else {
+            return false;
+          }
           gtsam::Vector6 sigmas;
           sigmas.head<3>().setConstant(backend_params_.initialAccBiasSigma_);
           sigmas.tail<3>().setConstant(backend_params_.initialGyroBiasSigma_);
           gtsam::SharedNoiseModel noise =
               gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-          nfg.emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(
-              key, bias, noise);
-          break;
+          graph_to_update
+              ->emplace_shared<gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(
+                  key, bias, noise);
+          return true;
         }
         case 'v': {
-          gtsam::Vector3 vel = values.at<gtsam::Vector3>(key);
+          gtsam::Vector3 vel;
+          if (values.exists(key)) {
+            vel = values.at<gtsam::Vector3>(key);
+          } else if (new_values.exists(key)) {
+            vel = new_values.at<gtsam::Vector3>(key);
+          } else {
+            return false;
+          }
           gtsam::Vector3 sigmas;
           sigmas.setConstant(0.1);
           gtsam::SharedNoiseModel noise =
               gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-          nfg.emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
+          graph_to_update->emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
               key, vel, noise);
-          break;
+          return true;
         }
-        default: {
-          LOG(FATAL)
-              << "Key not recognized in indeterminant exception handling.";
-        }
+        default:
+          return false;
+      }
+    };
+
+    // Only add priors on first state and the state nearest the failure
+    for (const gtsam::Key& raw_key : prior_keys) {
+      const gtsam::Symbol key(raw_key);
+      if (add_stabilizing_prior(key, &nfg)) {
+        LOG(ERROR) << "Adding prior on key: " << key.chr() << key.index();
+      } else {
+        VLOG(2) << "Skipping stabilizing prior on unavailable key: "
+                << key.chr() << key.index();
       }
     }
     gtsam::NonlinearFactorGraph new_factors_mutable;
@@ -2918,7 +3098,24 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       LOG(ERROR) << "Smoother recovery failed. Most likely, the additional "
                     "prior factors were insufficient to keep the system from "
                     "becoming indeterminant.";
-      return false;
+      // Final fallback: keep this backend cycle alive by applying only
+      // stabilizing priors plus new values.
+      *smoother_ = smoother_backup;
+      gtsam::NonlinearFactorGraph fallback_priors;
+      for (const gtsam::Key& raw_key : prior_keys) {
+        const gtsam::Symbol key(raw_key);
+        add_stabilizing_prior(key, &fallback_priors);
+      }
+      try {
+        LOG(ERROR) << "Attempting priors-only fallback update after failed "
+                      "indeterminant recovery.";
+        *result = smoother_->update(
+            fallback_priors, new_values, timestamps, delete_slots);
+        LOG(ERROR) << "Priors-only fallback update succeeded.";
+      } catch (...) {
+        LOG(ERROR) << "Priors-only fallback update also failed.";
+        return false;
+      }
     }
   } catch (const gtsam::InvalidNoiseModel& e) {
     LOG(ERROR) << e.what();
@@ -2938,7 +3135,110 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     return false;
   } catch (const gtsam::ValuesKeyDoesNotExist& e) {
     LOG(ERROR) << e.what();
-    printSmootherInfo(new_factors, delete_slots);
+    constexpr size_t kMaxMissingKeyRecoveryAttempts = 5u;
+    std::unordered_set<gtsam::Key> missing_keys;
+    missing_keys.insert(e.key());
+
+    for (size_t attempt = 0u; attempt < kMaxMissingKeyRecoveryAttempts;
+         ++attempt) {
+      *smoother_ = smoother_backup;
+
+      gtsam::NonlinearFactorGraph recovery_new_factors;
+      size_t dropped_new_factor_count = 0u;
+      for (const auto& factor : new_factors) {
+        if (!factor) {
+          continue;
+        }
+        bool has_missing_key = false;
+        for (const gtsam::Key key : factor->keys()) {
+          if (missing_keys.count(key) > 0u) {
+            has_missing_key = true;
+            break;
+          }
+        }
+        if (has_missing_key) {
+          ++dropped_new_factor_count;
+          continue;
+        }
+        recovery_new_factors.push_back(factor);
+      }
+
+      gtsam::FactorIndices recovery_delete_slots = delete_slots;
+      const auto& factors = smoother_->getFactors();
+      for (size_t slot_idx = 0; slot_idx < factors.size(); ++slot_idx) {
+        const auto& factor = factors.at(slot_idx);
+        if (!factor) {
+          continue;
+        }
+        for (const gtsam::Key key : factor->keys()) {
+          if (missing_keys.count(key) > 0u) {
+            recovery_delete_slots.push_back(slot_idx);
+            break;
+          }
+        }
+      }
+
+      std::sort(recovery_delete_slots.begin(), recovery_delete_slots.end());
+      recovery_delete_slots.erase(std::unique(recovery_delete_slots.begin(),
+                                              recovery_delete_slots.end()),
+                                  recovery_delete_slots.end());
+      recovery_delete_slots.erase(
+          std::remove_if(
+              recovery_delete_slots.begin(),
+              recovery_delete_slots.end(),
+              [&factors](const gtsam::FactorIndex idx) {
+                return idx >= static_cast<gtsam::FactorIndex>(factors.size());
+              }),
+          recovery_delete_slots.end());
+
+      if (recovery_delete_slots.empty() && dropped_new_factor_count == 0u) {
+        LOG(ERROR) << "Missing-key recovery attempt " << (attempt + 1)
+                   << " found no removable stale slots/factors; skipping this "
+                      "backend update cycle.";
+        if (VLOG_IS_ON(1)) {
+          printSmootherInfo(new_factors, delete_slots);
+        }
+        *result = Smoother::Result();
+        return true;
+      }
+
+      try {
+        LOG(ERROR) << "Retrying smoother update after missing-key cleanup "
+                   << "(attempt " << (attempt + 1) << "): dropped_new_factors="
+                   << dropped_new_factor_count
+                   << ", delete_slots=" << recovery_delete_slots.size();
+        *result = smoother_->update(
+            recovery_new_factors, new_values, timestamps, recovery_delete_slots);
+        LOG(ERROR) << "Recovered smoother update after missing-key cleanup.";
+        return true;
+      } catch (const gtsam::ValuesKeyDoesNotExist& nested_missing) {
+        const gtsam::Key nested_missing_key = nested_missing.key();
+        const gtsam::Symbol nested_missing_sym(nested_missing_key);
+        LOG(ERROR) << "Missing-key recovery attempt " << (attempt + 1)
+                   << " still failed with key " << nested_missing_sym.chr()
+                   << nested_missing_sym.index() << ": "
+                   << nested_missing.what();
+        missing_keys.insert(nested_missing_key);
+        continue;
+      } catch (const std::exception& recovery_e) {
+        LOG(ERROR) << "Missing-key recovery failed: " << recovery_e.what();
+        if (VLOG_IS_ON(1)) {
+          printSmootherInfo(new_factors, recovery_delete_slots);
+        }
+        return false;
+      } catch (...) {
+        LOG(ERROR) << "Missing-key recovery failed with unknown exception.";
+        if (VLOG_IS_ON(1)) {
+          printSmootherInfo(new_factors, recovery_delete_slots);
+        }
+        return false;
+      }
+    }
+
+    LOG(ERROR) << "Exhausted missing-key recovery attempts.";
+    if (VLOG_IS_ON(1)) {
+      printSmootherInfo(new_factors, delete_slots);
+    }
     return false;
   } catch (const gtsam::CholeskyFailed& e) {
     LOG(ERROR) << e.what();
@@ -3273,32 +3573,67 @@ void VioBackend::updateNewSmartFactorsSlots(
   // Intuition: keep original fast index-based remap for legacy smoother path.
   const gtsam::ISAM2Result& result = smoother_->getISAM2Result();
   const gtsam::NonlinearFactorGraph& factor_graph = smoother_->getFactors();
+  const size_t expected_new_smart_factors = lmk_ids_of_new_smart_factors.size();
+  const size_t inserted_new_factors = result.newFactorsIndices.size();
+  const size_t matched_factors =
+      std::min(expected_new_smart_factors, inserted_new_factors);
 
-  for (size_t i = 0u; i < lmk_ids_of_new_smart_factors.size(); ++i) {
-    DCHECK(i < result.newFactorsIndices.size())
-        << "There are more new smart factors than new factors added to the "
-           "graph.";
+  if (inserted_new_factors < expected_new_smart_factors) {
+    LOG(WARNING) << "Smart-factor slot remap: expected "
+                 << expected_new_smart_factors
+                 << " new smart factors but smoother reported only "
+                 << inserted_new_factors
+                 << " new factor slots. This can happen after backend recovery; "
+                    "dropping unmatched smart-factor bookkeeping entries.";
+  }
 
-    const size_t& slot = result.newFactorsIndices.at(i);
+  for (size_t i = 0u; i < matched_factors; ++i) {
+    const LandmarkId lmk_id = lmk_ids_of_new_smart_factors.at(i);
+    const size_t slot = result.newFactorsIndices.at(i);
 
-    const auto& it =
-        old_smart_factors->find(lmk_ids_of_new_smart_factors.at(i));
+    auto it = old_smart_factors->find(lmk_id);
+    if (it == old_smart_factors->end()) {
+      LOG(WARNING) << "Smart-factor slot remap: missing bookkeeping entry for "
+                   << "lmk id " << lmk_id << ".";
+      continue;
+    }
 
-    DCHECK(it != old_smart_factors->end())
-        << "Trying to access unavailable factor.";
+    if (slot >= factor_graph.size() || !factor_graph.exists(slot)) {
+      LOG(WARNING) << "Smart-factor slot remap: invalid slot " << slot
+                   << " for lmk id " << lmk_id
+                   << ". Dropping stale bookkeeping entry.";
+      old_smart_factors->erase(it);
+      continue;
+    }
 
-    DCHECK(factor_graph.exists(slot));
     const auto sptr = dynamic_cast<const SmartStereoFactor*>(
         factor_graph.at(slot).get());
-    DCHECK(sptr);
+    if (!sptr) {
+      LOG(WARNING) << "Smart-factor slot remap: slot " << slot
+                   << " is not a SmartStereoFactor for lmk id " << lmk_id
+                   << ". Dropping stale bookkeeping entry.";
+      old_smart_factors->erase(it);
+      continue;
+    }
 
-    DCHECK_EQ(it->second.first.get(), sptr)
-        << "Non-matching addresses for same factors for lmk with id: "
-        << lmk_ids_of_new_smart_factors.at(i) << " in old_smart_factors_ "
-        << "VS factor in graph at slot: " << slot
-        << ". Slot previous to update was: " << it->second.second;
+    if (it->second.first.get() != sptr) {
+      LOG(WARNING) << "Smart-factor slot remap mismatch for lmk id " << lmk_id
+                   << ": expected factor pointer " << it->second.first.get()
+                   << " but slot " << slot << " points to " << sptr
+                   << ". Dropping stale bookkeeping entry.";
+      old_smart_factors->erase(it);
+      continue;
+    }
 
-    it->second.second = slot;
+    it->second.second = static_cast<Slot>(slot);
+  }
+
+  for (size_t i = matched_factors; i < expected_new_smart_factors; ++i) {
+    const LandmarkId lmk_id = lmk_ids_of_new_smart_factors.at(i);
+    auto it = old_smart_factors->find(lmk_id);
+    if (it != old_smart_factors->end()) {
+      old_smart_factors->erase(it);
+    }
   }
 }
 

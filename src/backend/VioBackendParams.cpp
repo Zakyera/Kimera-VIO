@@ -132,6 +132,22 @@ bool BackendParams::parseYAMLVioBackendParams(const YamlParser& yaml_parser) {
   yaml_parser.getYamlParam("no_motion_position_precision", &no_motion_position_precision_);
   yaml_parser.getYamlParam("no_motion_rotation_precision", &no_motion_rotation_precision_);
   yaml_parser.getYamlParam("constant_vel_precision", &constant_vel_precision_);
+  if (yaml_parser.hasParam("low_disparity_use_imu_motion_gate")) {
+    yaml_parser.getYamlParam("low_disparity_use_imu_motion_gate",
+                             &low_disparity_use_imu_motion_gate_);
+  }
+  if (yaml_parser.hasParam("low_disparity_motion_translation_threshold_m")) {
+    yaml_parser.getYamlParam("low_disparity_motion_translation_threshold_m",
+                             &low_disparity_motion_translation_threshold_m_);
+  }
+  if (yaml_parser.hasParam("low_disparity_motion_rotation_threshold_rad")) {
+    yaml_parser.getYamlParam("low_disparity_motion_rotation_threshold_rad",
+                             &low_disparity_motion_rotation_threshold_rad_);
+  }
+  if (yaml_parser.hasParam("low_disparity_motion_delta_speed_threshold_mps")) {
+    yaml_parser.getYamlParam("low_disparity_motion_delta_speed_threshold_mps",
+                             &low_disparity_motion_delta_speed_threshold_mps_);
+  }
   yaml_parser.getYamlParam("numOptimize", &numOptimize_);
   yaml_parser.getYamlParam("nr_states", &nr_states_);
   yaml_parser.getYamlParam("wildfire_threshold", &wildfire_threshold_);
@@ -207,12 +223,20 @@ bool BackendParams::equalsVioBackendParams(const BackendParams& vp2,
       (fabs(no_motion_position_precision_ - vp2.no_motion_position_precision_) <= tol) &&
       (fabs(no_motion_rotation_precision_ - vp2.no_motion_rotation_precision_) <= tol) &&
       (fabs(constant_vel_precision_ - vp2.constant_vel_precision_) <= tol) &&
+      (low_disparity_use_imu_motion_gate_ ==
+       vp2.low_disparity_use_imu_motion_gate_) &&
+      (fabs(low_disparity_motion_translation_threshold_m_ -
+            vp2.low_disparity_motion_translation_threshold_m_) <= tol) &&
+      (fabs(low_disparity_motion_rotation_threshold_rad_ -
+            vp2.low_disparity_motion_rotation_threshold_rad_) <= tol) &&
+      (fabs(low_disparity_motion_delta_speed_threshold_mps_ -
+            vp2.low_disparity_motion_delta_speed_threshold_mps_) <= tol) &&
       (numOptimize_ == vp2.numOptimize_) && (nr_states_ == vp2.nr_states_) &&
       (wildfire_threshold_ == vp2.wildfire_threshold_) &&
       (useDogLeg_ == vp2.useDogLeg_) &&
       (pose_guess_source_ == vp2.pose_guess_source_) &&
-      (fabs(mono_translation_scale_factor_ ==
-            vp2.mono_translation_scale_factor_));
+      (fabs(mono_translation_scale_factor_ -
+            vp2.mono_translation_scale_factor_) <= tol);
 }
 
 void BackendParams::printVioBackendParams() const {
@@ -274,6 +298,14 @@ void BackendParams::printVioBackendParams() const {
       no_motion_rotation_precision_,
       "Constant Velocity Precision",
       constant_vel_precision_,
+      "Low Disparity IMU Motion Gate",
+      low_disparity_use_imu_motion_gate_,
+      "Low Disparity Motion Translation Threshold [m]",
+      low_disparity_motion_translation_threshold_m_,
+      "Low Disparity Motion Rotation Threshold [rad]",
+      low_disparity_motion_rotation_threshold_rad_,
+      "Low Disparity Delta Speed Threshold [m/s]",
+      low_disparity_motion_delta_speed_threshold_mps_,
       "Optimization Iterations",
       numOptimize_,
       "nr_states",

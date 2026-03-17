@@ -300,8 +300,10 @@ class VioBackend {
   // Uses landmark table to add factors in graph.
   void addLandmarksToGraph(const LandmarkIds& landmarks_kf);
 
-  // Adds a landmark to the graph for the first time.
-  void addLandmarkToGraph(const LandmarkId& lm_id, const FeatureTrack& lm);
+  // Adds a landmark smart factor to the graph if enough active observations
+  // are available in the current optimizer window.
+  // Returns true if factor bookkeeping was created/updated.
+  bool addLandmarkToGraph(const LandmarkId& lm_id, const FeatureTrack& lm);
 
   void updateLandmarkInGraph(
       const LandmarkId& lmk_id,

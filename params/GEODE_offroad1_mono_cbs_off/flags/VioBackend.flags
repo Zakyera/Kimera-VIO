@@ -1,0 +1,23 @@
+#!/bin/bash
+--debug_graph_before_opt=false
+--process_cheirality=true
+--max_number_of_cheirality_exceptions=5
+--deterministic_random_number_generator=true
+
+# Standalone (no CBS): CBS optimizer + external belief queues can keep extra graphs/values alive.
+--use_cbs_optimizer=false
+
+# zy B-mid validated profile (GEODE Offroad1, 90s): this gave the best ATE so far.
+# zy Keep prior matching moderately tight to reduce outliers without starving CBS.
+--external_prior_timestamp_tolerance_ns=150000000
+--external_prior_max_future_lead_ns=150000000
+# zy Allow some lag between LIORF and Kimera under rosbag replay/runtime load.
+--external_prior_max_age_ns=10000000000
+# zy Queue/budget tuned to avoid both overload (tail spikes) and over-pruning.
+--external_prior_max_queue_size=60
+--external_prior_queue_time_horizon_ns=10000000000
+--external_prior_max_per_optimize=6
+
+# Keep legacy behavior.
+--no_incremental_pose=true
+--cbs_replace_fixed_lag_optimizer=false
