@@ -18,4 +18,5 @@ resolution: [1224, 1024]  # [width, height]
 camera_model: pinhole
 intrinsics: [1172.771733138536, 1172.364005984343, 617.941545715258, 507.672727295385]  # [fu, fv, cu, cv]
 distortion_model: radtan
-distortion_coefficients: [0,0,0,0]
+# distortion_coefficients: [0,0,0,0] # MIKE'S
+distortion_coefficients: [-0.052628389768906, 0.100832689624109, 0.000395112517197, 0.000362060505238] # alpha.yaml
