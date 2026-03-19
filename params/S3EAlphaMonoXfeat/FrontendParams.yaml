@@ -4,7 +4,7 @@ klt_win_size: 24
 klt_max_iter: 30
 klt_max_level: 4
 klt_eps: 0.1
-maxFeatureAge: 40
+maxFeatureAge: 25 
 
 # Detector Params
 # 0: FAST
@@ -12,7 +12,7 @@ maxFeatureAge: 40
 # 2: AGAST
 # 3: GFTT, aka Good Features To Track
 feature_detector_type: 3
-maxFeaturesPerFrame: 1000
+maxFeaturesPerFrame: 300 
 
 # Good Features To Track specific parameters
 quality_level: 0.001
@@ -36,14 +36,14 @@ bidirectionalMatching: 0
 
 # Non-maximum suppression params
 max_nr_keypoints_before_anms: 500
-enable_non_max_suppression: 0
+enable_non_max_suppression: 1
 non_max_suppression_type: 6
 nr_horizontal_bins: 7
 nr_vertical_bins: 5
 binning_mask: []
 
 # Subpixel corner refinement for the monocular case
-enable_subpixel_corner_finder: 0
+enable_subpixel_corner_finder: 1
 max_iters: 40
 epsilon_error: 0.001
 window_size: 10
