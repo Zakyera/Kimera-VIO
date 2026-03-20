@@ -2163,19 +2163,61 @@ bool VioBackend::optimize(
                     << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
           }
 
-          if (accepted_by_cbs) {
-            const gtsam::Vector6 mu =
-                gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_B_);
-            gbp::Gaussian belief(pose_symbol, mu, cov, 1);
-            std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
-                single_belief;
+	          if (accepted_by_cbs) {
+	            bool have_pose_delta = false;
+	            double pose_delta_rot_rad = std::numeric_limits<double>::quiet_NaN();
+	            double pose_delta_trans_m = std::numeric_limits<double>::quiet_NaN();
+	            double pose_delta_norm = std::numeric_limits<double>::quiet_NaN();
+	            gtsam::Pose3 current_pose_estimate;
+	            bool have_current_pose_estimate = false;
+
+	            if (new_values_.exists(pose_symbol)) {
+	              current_pose_estimate = new_values_.at<gtsam::Pose3>(pose_symbol);
+	              have_current_pose_estimate = true;
+	            } else if (state_.exists(pose_symbol)) {
+	              current_pose_estimate = state_.at<gtsam::Pose3>(pose_symbol);
+	              have_current_pose_estimate = true;
+	            } else if (cbs_optimizer_->valueExists(pose_symbol)) {
+	              current_pose_estimate =
+	                  cbs_optimizer_->calculateEstimate<gtsam::Pose3>(pose_symbol);
+	              have_current_pose_estimate = true;
+	            }
+
+	            if (have_current_pose_estimate) {
+	              const gtsam::Vector6 pose_delta_vec =
+	                  gtsam::traits<gtsam::Pose3>::Logmap(
+	                      current_pose_estimate.between(prior.W_Pose_B_));
+	              pose_delta_rot_rad = pose_delta_vec.head<3>().norm();
+	              pose_delta_trans_m = pose_delta_vec.tail<3>().norm();
+	              pose_delta_norm = pose_delta_vec.norm();
+	              have_pose_delta = true;
+	            }
+
+	            const gtsam::Vector6 mu =
+	                gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_B_);
+	            gbp::Gaussian belief(pose_symbol, mu, cov, 1);
+	            std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
+	                single_belief;
             single_belief[pose_symbol].emplace_back(sender_id, belief);
             ++num_external_beliefs_staged;
-            const size_t rejected_count =
-                static_cast<size_t>(cbs_optimizer_->addBeliefs(single_belief));
-            num_external_beliefs_rejected += rejected_count;
-            accepted_by_cbs = (rejected_count == 0u);
-          }
+	            const size_t rejected_count =
+	                static_cast<size_t>(cbs_optimizer_->addBeliefs(single_belief));
+	            num_external_beliefs_rejected += rejected_count;
+	            accepted_by_cbs = (rejected_count == 0u);
+
+	            LOG(INFO) << "[CBS][KimeraPrior] key=" << pose_symbol.key()
+	                      << ", matched_frame_id=" << matched_frame_id
+	                      << ", source=" << prior.source_
+	                      << ", seq=" << prior.source_seq_
+	                      << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+	                      << ", cbs_result="
+	                      << (accepted_by_cbs ? "accepted" : "rejected")
+	                      << ", cbs_rejected_count=" << rejected_count
+	                      << ", have_pose_delta=" << (have_pose_delta ? 1 : 0)
+	                      << ", delta_trans_m=" << pose_delta_trans_m
+	                      << ", delta_rot_rad=" << pose_delta_rot_rad
+	                      << ", delta_norm=" << pose_delta_norm;
+	          }
 
           if (!accepted_by_cbs) {
             continue;
