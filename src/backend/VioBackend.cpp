@@ -55,11 +55,15 @@
 #include <limits>  // for numeric_limits<>
 #include <algorithm>
 #include <map>
+#include <sstream>
 #include <string>
 #include <utility>  // for make_pair
 #include <unordered_set>
 #include <vector>
 #include <cmath> // zy step 5_c
+#include <iomanip>
+#include <Eigen/Cholesky>
+#include <Eigen/Eigenvalues>
 
 
 
@@ -128,16 +132,16 @@ DEFINE_bool(external_pose_belief_safe_covariance_fallback,
 // zy Step 11a & 26
 #ifdef KIMERA_USE_CBS
 // zy
-// Default to legacy fixed-lag backend unless explicitly enabling CBS at runtime.
+// Enable CBS belief exchange whenever requested at runtime.
 DEFINE_bool(use_cbs_optimizer,
             false,
             "If true (and compiled with KIMERA_USE_CBS), enable CBS belief "
-            "exchange (belief validation/merging) while keeping Kimera fixed-lag "
-            "smoothing as the optimization heart.");
+            "exchange (belief validation/merging).");
 DEFINE_bool(cbs_replace_fixed_lag_optimizer,
             false,
-            "Deprecated: retained for compatibility. Kimera fixed-lag remains "
-            "the optimization heart in CBS mode.");
+            "If true together with --use_cbs_optimizer, make BPSAM the active "
+            "optimizer heart (CBS-heart mode). If false, keep legacy fixed-lag "
+            "smoother as optimization heart.");
 //zy Step 40a
 // Runtime toggle for CBS GkCM/PCM consistency filtering on incoming belief factors.
 DEFINE_bool(cbs_enable_gkcm,
@@ -166,6 +170,11 @@ DEFINE_double(cbs_pose_convergence_abs_residual,
 DEFINE_double(cbs_pose_convergence_rel_residual,
               1e-3,
               "Relative residual-change threshold for early stopping of CBS pose rounds.");
+DEFINE_bool(cbs_diag_align_incoming_mean,
+            false,
+            "Diagnostic mode: align incoming external belief mean with a "
+            "per-source receiver_world<-sender_world transform before CBS "
+            "addBeliefs(). Covariance path is unchanged.");
 #endif
 
 namespace {
@@ -179,13 +188,158 @@ inline bool useCbsBeliefExchange() {
 
 inline bool useCbsOptimizerHeart() {
 #ifdef KIMERA_USE_CBS
-  // zy Step 41a
-  // Keep Kimera fixed-lag as the single optimization heart in CBS mode.
-  // CBS remains enabled only for inter-agent belief exchange/validation.
-  return false;
+  // CBS-heart is an explicit runtime mode: keep legacy fixed-lag smoother as
+  // heart unless both flags are enabled.
+  return FLAGS_use_cbs_optimizer && FLAGS_cbs_replace_fixed_lag_optimizer;
 #else
   return false;
 #endif
+}
+
+#ifdef KIMERA_USE_CBS
+using Vec6 = Eigen::Matrix<double, 6, 1>;
+using Mat6 = Eigen::Matrix<double, 6, 6>;
+
+double logDetSym6(const Mat6& sigma) {
+  if (!sigma.allFinite()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  Eigen::SelfAdjointEigenSolver<Mat6> eig(sigma);
+  if (eig.info() != Eigen::Success) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  double sum = 0.0;
+  for (int i = 0; i < eig.eigenvalues().size(); ++i) {
+    const double ev = eig.eigenvalues()(i);
+    if (!(ev > 0.0) || !std::isfinite(ev)) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    sum += std::log(ev);
+  }
+  return sum;
+}
+
+double hellingerDistance6(const Vec6& mu_a,
+                          const Mat6& sigma_a,
+                          const Vec6& mu_b,
+                          const Mat6& sigma_b) {
+  if (!mu_a.allFinite() || !mu_b.allFinite() || !sigma_a.allFinite() ||
+      !sigma_b.allFinite()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const Mat6 sigma_bar = 0.5 * (sigma_a + sigma_b);
+  const double log_det_a = logDetSym6(sigma_a);
+  const double log_det_b = logDetSym6(sigma_b);
+  const double log_det_bar = logDetSym6(sigma_bar);
+  if (!std::isfinite(log_det_a) || !std::isfinite(log_det_b) ||
+      !std::isfinite(log_det_bar)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  const Vec6 delta = mu_a - mu_b;
+  Eigen::LDLT<Mat6> ldlt(sigma_bar);
+  if (ldlt.info() != Eigen::Success) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const auto d = ldlt.vectorD();
+  for (int i = 0; i < d.size(); ++i) {
+    if (!(d(i) > 0.0) || !std::isfinite(d(i))) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+  }
+  const Vec6 x = ldlt.solve(delta);
+  if (!x.allFinite()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const double quad = delta.dot(x);
+  if (!std::isfinite(quad)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  const double log_coeff = 0.25 * (log_det_a + log_det_b) - 0.5 * log_det_bar;
+  const double coeff = std::exp(log_coeff - 0.125 * quad);
+  if (!std::isfinite(coeff)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const double h2 = std::clamp(1.0 - coeff, 0.0, 1.0);
+  return std::sqrt(h2);
+}
+#endif
+
+enum class PoseCovarianceStatus {
+  kAccepted = 0,
+  kRegularized = 1,
+  kRejected = 2,
+};
+
+PoseCovarianceStatus sanitizePoseCovariance(gtsam::Matrix6* covariance,
+                                            std::string* reason) {
+  if (reason) {
+    reason->clear();
+  }
+  if (covariance == nullptr) {
+    if (reason) {
+      *reason = "null_covariance";
+    }
+    return PoseCovarianceStatus::kRejected;
+  }
+  if (!covariance->allFinite()) {
+    if (reason) {
+      *reason = "non_finite_entries";
+    }
+    return PoseCovarianceStatus::kRejected;
+  }
+
+  gtsam::Matrix6 cov = 0.5 * ((*covariance) + covariance->transpose());
+  bool regularized = false;
+  constexpr double kMinRotVar = 1e-8;    // rad^2
+  constexpr double kMinTransVar = 1e-8;  // m^2
+  for (int i = 0; i < 6; ++i) {
+    const double min_var = (i < 3) ? kMinRotVar : kMinTransVar;
+    if (!std::isfinite(cov(i, i)) || cov(i, i) < min_var) {
+      cov(i, i) = min_var;
+      regularized = true;
+    }
+  }
+
+  Eigen::SelfAdjointEigenSolver<gtsam::Matrix6> eig_solver(cov);
+  if (eig_solver.info() != Eigen::Success ||
+      !eig_solver.eigenvalues().allFinite()) {
+    if (reason) {
+      *reason = "eigendecomposition_failed";
+    }
+    return PoseCovarianceStatus::kRejected;
+  }
+
+  constexpr double kMinEigenvalue = 1e-10;
+  const double min_eig = eig_solver.eigenvalues().minCoeff();
+  if (min_eig <= kMinEigenvalue) {
+    const double shift = (kMinEigenvalue - min_eig) + 1e-12;
+    cov.diagonal().array() += shift;
+    regularized = true;
+
+    eig_solver.compute(cov);
+    if (eig_solver.info() != Eigen::Success ||
+        !eig_solver.eigenvalues().allFinite() ||
+        eig_solver.eigenvalues().minCoeff() <= 0.0) {
+      if (reason) {
+        *reason = "regularization_failed";
+      }
+      return PoseCovarianceStatus::kRejected;
+    }
+  }
+
+  *covariance = 0.5 * (cov + cov.transpose());
+  if (regularized) {
+    if (reason) {
+      *reason = "regularized_to_spd";
+    }
+    return PoseCovarianceStatus::kRegularized;
+  }
+  if (reason) {
+    *reason = "accepted";
+  }
+  return PoseCovarianceStatus::kAccepted;
 }
 }  // namespace
 
@@ -248,14 +402,6 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
 // zy-------
 // zy Step 10f
 #ifdef KIMERA_USE_CBS
-  if (FLAGS_use_cbs_optimizer && FLAGS_cbs_replace_fixed_lag_optimizer) {
-    // zy Step 41b
-    // Guardrail: CBS belief exchange is enabled, but Kimera keeps fixed-lag heart.
-    LOG(WARNING) << "cbs_replace_fixed_lag_optimizer=true is deprecated. "
-                 << "Forcing fixed-lag optimization heart in Kimera.";
-    FLAGS_cbs_replace_fixed_lag_optimizer = false;
-  }
-
   // Build CBS optimizer with Kimera's current ISAM2 parameterization.
   gtsam::ISAM2Params cbs_isam_params;
   BackendParams::setIsam2Params(backend_params, &cbs_isam_params);
@@ -1127,33 +1273,57 @@ void VioBackend::computeStateCovariance() {
     const gtsam::Symbol bias_key(kImuBiasSymbolChar, curr_kf_id_);
 
     if (cbs_optimizer_->valueExists(pose_key)) {
-      const gtsam::Matrix pose_cov = cbs_optimizer_->marginalCovariance(pose_key);
-      if (pose_cov.rows() >= 6 && pose_cov.cols() >= 6 && pose_cov.allFinite()) {
-        state_covariance_lkf_.block(0, 0, 6, 6) = pose_cov.topLeftCorner(6, 6);
-      } else {
-        VLOG(2) << "Invalid CBS pose covariance for key: " << pose_key;
+      try {
+        const gtsam::Matrix pose_cov = cbs_optimizer_->marginalCovariance(
+            pose_key, cbs::BPSAM::MarginalizationType::FULL);
+        if (pose_cov.rows() >= 6 && pose_cov.cols() >= 6 &&
+            pose_cov.allFinite()) {
+          state_covariance_lkf_.block(0, 0, 6, 6) =
+              pose_cov.topLeftCorner(6, 6);
+        } else {
+          VLOG(2) << "Invalid CBS pose covariance for key: " << pose_key;
+        }
+      } catch (const std::exception& e) {
+        VLOG(2) << "CBS pose covariance query failed for key " << pose_key
+                << ": " << e.what();
       }
     } else {
       VLOG(2) << "CBS pose key not found for covariance: " << pose_key;
     }
 
     if (cbs_optimizer_->valueExists(vel_key)) {
-      const gtsam::Matrix vel_cov = cbs_optimizer_->marginalCovariance(vel_key);
-      if (vel_cov.rows() >= 3 && vel_cov.cols() >= 3 && vel_cov.allFinite()) {
-        state_covariance_lkf_.block(6, 6, 3, 3) = vel_cov.topLeftCorner(3, 3);
-      } else {
-        VLOG(2) << "Invalid CBS velocity covariance for key: " << vel_key;
+      try {
+        const gtsam::Matrix vel_cov = cbs_optimizer_->marginalCovariance(
+            vel_key, cbs::BPSAM::MarginalizationType::FULL);
+        if (vel_cov.rows() >= 3 && vel_cov.cols() >= 3 &&
+            vel_cov.allFinite()) {
+          state_covariance_lkf_.block(6, 6, 3, 3) =
+              vel_cov.topLeftCorner(3, 3);
+        } else {
+          VLOG(2) << "Invalid CBS velocity covariance for key: " << vel_key;
+        }
+      } catch (const std::exception& e) {
+        VLOG(2) << "CBS velocity covariance query failed for key " << vel_key
+                << ": " << e.what();
       }
     } else {
       VLOG(2) << "CBS velocity key not found for covariance: " << vel_key;
     }
 
     if (cbs_optimizer_->valueExists(bias_key)) {
-      const gtsam::Matrix bias_cov = cbs_optimizer_->marginalCovariance(bias_key);
-      if (bias_cov.rows() >= 6 && bias_cov.cols() >= 6 && bias_cov.allFinite()) {
-        state_covariance_lkf_.block(9, 9, 6, 6) = bias_cov.topLeftCorner(6, 6);
-      } else {
-        VLOG(2) << "Invalid CBS bias covariance for key: " << bias_key;
+      try {
+        const gtsam::Matrix bias_cov = cbs_optimizer_->marginalCovariance(
+            bias_key, cbs::BPSAM::MarginalizationType::FULL);
+        if (bias_cov.rows() >= 6 && bias_cov.cols() >= 6 &&
+            bias_cov.allFinite()) {
+          state_covariance_lkf_.block(9, 9, 6, 6) =
+              bias_cov.topLeftCorner(6, 6);
+        } else {
+          VLOG(2) << "Invalid CBS bias covariance for key: " << bias_key;
+        }
+      } catch (const std::exception& e) {
+        VLOG(2) << "CBS bias covariance query failed for key " << bias_key
+                << ": " << e.what();
       }
     } else {
       VLOG(2) << "CBS bias key not found for covariance: " << bias_key;
@@ -1202,24 +1372,116 @@ bool VioBackend::getLatestExternalPoseBelief(
 
   bool covariance_set = false;
   const gtsam::Symbol pose_symbol(kPoseSymbolChar, curr_kf_id_);
+  const auto covariance_logdet = [](const gtsam::Matrix66& cov) -> double {
+    Eigen::LLT<gtsam::Matrix66> llt(cov);
+    if (llt.info() != Eigen::Success) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    const auto& L = llt.matrixL();
+    double sum_log_diag = 0.0;
+    for (int i = 0; i < L.rows(); ++i) {
+      const double diag = L(i, i);
+      if (!(diag > 0.0) || !std::isfinite(diag)) {
+        return std::numeric_limits<double>::quiet_NaN();
+      }
+      sum_log_diag += std::log(diag);
+    }
+    return 2.0 * sum_log_diag;
+  };
+  const auto covariance_lambda_min = [](const gtsam::Matrix66& cov) -> double {
+    Eigen::SelfAdjointEigenSolver<gtsam::Matrix66> eig(cov);
+    if (eig.info() != Eigen::Success) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    return eig.eigenvalues().minCoeff();
+  };
+  auto emit_outgoing_cov_diag =
+      [&](const gtsam::Matrix66& local_cov,
+          const std::optional<gtsam::Matrix66>& fused_cov_opt) {
+        const double local_trace = local_cov.trace();
+        const double local_logdet = covariance_logdet(local_cov);
+        const double local_lambda_min = covariance_lambda_min(local_cov);
+
+        double fused_trace = std::numeric_limits<double>::quiet_NaN();
+        double fused_logdet = std::numeric_limits<double>::quiet_NaN();
+        double fused_lambda_min = std::numeric_limits<double>::quiet_NaN();
+        double trace_ratio = std::numeric_limits<double>::quiet_NaN();
+        double logdet_delta = std::numeric_limits<double>::quiet_NaN();
+        double lambda_min_ratio = std::numeric_limits<double>::quiet_NaN();
+        int fused_available = 0;
+
+        if (fused_cov_opt) {
+          fused_available = 1;
+          const gtsam::Matrix66& fused_cov = *fused_cov_opt;
+          fused_trace = fused_cov.trace();
+          fused_logdet = covariance_logdet(fused_cov);
+          fused_lambda_min = covariance_lambda_min(fused_cov);
+          if (std::isfinite(local_trace) && local_trace > 0.0 &&
+              std::isfinite(fused_trace)) {
+            trace_ratio = fused_trace / local_trace;
+          }
+          if (std::isfinite(local_logdet) && std::isfinite(fused_logdet)) {
+            logdet_delta = fused_logdet - local_logdet;
+          }
+          if (std::isfinite(local_lambda_min) && local_lambda_min > 0.0 &&
+              std::isfinite(fused_lambda_min)) {
+            lambda_min_ratio = fused_lambda_min / local_lambda_min;
+          }
+        }
+
+        std::cerr << std::setprecision(12)
+                  << "[CBS][OutgoingBeliefCov] key=" << pose_symbol.key()
+                  << " frame_id=" << curr_kf_id_
+                  << " timestamp_ns=" << timestamp_lkf_
+                  << " local_only_trace=" << local_trace
+                  << " local_only_logdet=" << local_logdet
+                  << " local_only_lambda_min=" << local_lambda_min
+                  << " fused_posterior_available=" << fused_available
+                  << " fused_posterior_trace=" << fused_trace
+                  << " fused_posterior_logdet=" << fused_logdet
+                  << " fused_posterior_lambda_min=" << fused_lambda_min
+                  << " local_to_fused_trace_ratio=" << trace_ratio
+                  << " fused_minus_local_logdet_delta=" << logdet_delta
+                  << " fused_to_local_lambda_min_ratio=" << lambda_min_ratio
+                  // Backward-compatible aliases:
+                  << " local_trace=" << local_trace
+                  << " local_logdet=" << local_logdet
+                  << " local_lambda_min=" << local_lambda_min
+                  << " fused_available=" << fused_available
+                  << " fused_trace=" << fused_trace
+                  << " fused_logdet=" << fused_logdet
+                  << " fused_lambda_min=" << fused_lambda_min
+                  << " trace_ratio=" << trace_ratio
+                  << " logdet_delta=" << logdet_delta
+                  << " lambda_min_ratio=" << lambda_min_ratio
+                  << std::endl;
+      };
 
 #ifdef KIMERA_USE_CBS
   // In CBS mode, export covariance from BPSAM marginals so shared beliefs reflect the CBS state.
   if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
-    bool local_marginals_active = false;
     try {
-      // Match CBS pose-sharing stage: export pose covariance from LOCAL
-      // marginalization (exclude belief factors from covariance computation).
-      cbs_optimizer_->setMarginalizationGraph(
-          cbs::BPSAM::MarginalizationType::LOCAL);
-      local_marginals_active = true;
-
       if (cbs_optimizer_->valueExists(pose_symbol)) {
-        const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(pose_symbol);
+        // Match CBS pose-sharing stage: export pose covariance from LOCAL
+        // marginalization (exclude belief factors from covariance computation).
+        const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(
+            pose_symbol, cbs::BPSAM::MarginalizationType::LOCAL);
         if (cov.rows() >= 6 && cov.cols() >= 6 && cov.allFinite()) {
           belief->covariance_ = cov.topLeftCorner(6, 6);
           covariance_set = true;
+          std::optional<gtsam::Matrix66> fused_cov_opt = std::nullopt;
+          try {
+            const gtsam::Matrix full_cov = cbs_optimizer_->marginalCovariance(
+                pose_symbol, cbs::BPSAM::MarginalizationType::FULL);
+            if (full_cov.rows() >= 6 && full_cov.cols() >= 6 &&
+                full_cov.allFinite()) {
+              fused_cov_opt = full_cov.topLeftCorner(6, 6);
+            }
+          } catch (const std::exception& e) {
+            VLOG(2) << "CBS fused covariance query failed: " << e.what();
+          }
+          emit_outgoing_cov_diag(belief->covariance_, fused_cov_opt);
         } else {
           VLOG(2) << "CBS covariance unavailable/invalid for pose key: "
                   << pose_symbol;
@@ -1229,18 +1491,6 @@ bool VioBackend::getLatestExternalPoseBelief(
       }
     } catch (const std::exception& e) {
       VLOG(2) << "CBS marginal covariance query failed: " << e.what();
-    }
-
-    if (local_marginals_active) {
-      try {
-        cbs_optimizer_->setMarginalizationGraph(
-            cbs::BPSAM::MarginalizationType::FULL);
-      } catch (const std::exception& e) {
-        VLOG(2) << "Failed to restore CBS FULL marginalization graph: "
-                << e.what();
-      } catch (...) {
-        VLOG(2) << "Failed to restore CBS FULL marginalization graph.";
-      }
     }
   }
 #endif
@@ -1385,17 +1635,13 @@ bool VioBackend::getExternalPoseBeliefAtTimestamp(
     }
 
     try {
-      bool local_marginals_active = false;
-      cbs_optimizer_->setMarginalizationGraph(
-          cbs::BPSAM::MarginalizationType::LOCAL);
-      local_marginals_active = true;
-
       belief->timestamp_kf_nsec_ = matched_timestamp;
       belief->frame_id_ = matched_frame_id;
       belief->W_Pose_B_ =
           cbs_optimizer_->calculateEstimate<gtsam::Pose3>(pose_symbol);
 
-      const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(pose_symbol);
+      const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(
+          pose_symbol, cbs::BPSAM::MarginalizationType::LOCAL);
       if (cov.rows() < 6 || cov.cols() < 6 || !cov.allFinite()) {
         VLOG(2) << "Invalid CBS covariance for key: " << pose_symbol;
         return false;
@@ -1412,18 +1658,8 @@ bool VioBackend::getExternalPoseBeliefAtTimestamp(
             belief->covariance_(i, i) = kMinVar;
         }
       }
-
-      if (local_marginals_active) {
-        cbs_optimizer_->setMarginalizationGraph(
-            cbs::BPSAM::MarginalizationType::FULL);
-      }
       return true;
     } catch (const std::exception& e) {
-      try {
-        cbs_optimizer_->setMarginalizationGraph(
-            cbs::BPSAM::MarginalizationType::FULL);
-      } catch (...) {
-      }
       VLOG(2) << "CBS timestamp belief query failed: " << e.what();
       return false;
     }
@@ -1805,18 +2041,21 @@ bool VioBackend::enqueueExternalPosePriorFromCovariance(
     return false;
   }
 
-  // Symmetrize to avoid tiny asymmetries from serialization / numeric noise.
-  gtsam::Matrix6 cov = 0.5 * (covariance + covariance.transpose());
-
-  // Keep covariance numerically well-conditioned.
-  // Ordering is [rot, rot, rot, trans, trans, trans].
-  constexpr double kMinRotVar = 1e-8;    // rad^2
-  constexpr double kMinTransVar = 1e-8;  // m^2
-  for (int i = 0; i < 6; ++i) {
-    const double min_var = (i < 3) ? kMinRotVar : kMinTransVar;
-    if (!std::isfinite(cov(i, i)) || cov(i, i) < min_var) {
-      cov(i, i) = min_var;
-    }
+  gtsam::Matrix6 cov = covariance;
+  std::string cov_reason = "unknown";
+  const PoseCovarianceStatus cov_status =
+      sanitizePoseCovariance(&cov, &cov_reason);
+  if (cov_status == PoseCovarianceStatus::kRejected) {
+    LOG(WARNING)
+        << "enqueueExternalPosePriorFromCovariance: covariance rejected ("
+        << cov_reason << "), dropping prior.";
+    return false;
+  }
+  if (cov_status == PoseCovarianceStatus::kRegularized) {
+    LOG_EVERY_N(WARNING, 50)
+        << "enqueueExternalPosePriorFromCovariance: covariance regularized "
+           "before noise-model creation. regularization_count="
+        << google::COUNTER;
   }
 
   gtsam::SharedNoiseModel noise_model;
@@ -1875,6 +2114,147 @@ void VioBackend::addVelocityPrior(const FrameId& frame_id,
 }
 
 /* -------------------------------------------------------------------------- */
+bool VioBackend::isPoseKeyActiveInOptimizer(
+    const gtsam::Symbol& pose_symbol) const {
+#ifdef KIMERA_USE_CBS
+  if (useCbsOptimizerHeart()) {
+    CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    return cbs_optimizer_->valueExists(pose_symbol) ||
+           new_values_.exists(pose_symbol);
+  }
+#endif
+  return state_.exists(pose_symbol) || new_values_.exists(pose_symbol);
+}
+
+/* -------------------------------------------------------------------------- */
+bool VioBackend::isReceiverLocalBeliefReadyForCbs(
+    const gtsam::Symbol& pose_symbol) const {
+#ifdef KIMERA_USE_CBS
+  if (!useCbsOptimizerHeart()) {
+    return true;
+  }
+  CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+
+  if (!cbs_optimizer_->valueExists(pose_symbol)) {
+    return false;
+  }
+
+  try {
+    const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(
+        pose_symbol, cbs::BPSAM::MarginalizationType::LOCAL);
+    return cov.rows() >= 6 && cov.cols() >= 6 &&
+           cov.topLeftCorner(6, 6).allFinite();
+  } catch (const std::exception&) {
+    return false;
+  } catch (...) {
+    return false;
+  }
+#else
+  (void)pose_symbol;
+  return false;
+#endif
+}
+
+/* -------------------------------------------------------------------------- */
+void VioBackend::pruneTimestampToKeyframeMap(
+    const bool cbs_heart_active,
+    const FrameId& oldest_active_frame_id_by_lag,
+    size_t* num_timestamp_map_pruned,
+    Timestamp* oldest_active_pose_timestamp,
+    Timestamp* newest_active_pose_timestamp) {
+  CHECK_NOTNULL(num_timestamp_map_pruned);
+  CHECK_NOTNULL(oldest_active_pose_timestamp);
+  CHECK_NOTNULL(newest_active_pose_timestamp);
+  *num_timestamp_map_pruned = 0u;
+  *oldest_active_pose_timestamp = -1;
+  *newest_active_pose_timestamp = -1;
+
+  std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
+  for (auto it = timestamp_to_kf_id_map_.begin();
+       it != timestamp_to_kf_id_map_.end();) {
+    if (cbs_heart_active &&
+        static_cast<FrameId>(it->second) < oldest_active_frame_id_by_lag) {
+      it = timestamp_to_kf_id_map_.erase(it);
+      ++(*num_timestamp_map_pruned);
+      continue;
+    }
+
+    const gtsam::Symbol pose_symbol(kPoseSymbolChar, it->second);
+    if (isPoseKeyActiveInOptimizer(pose_symbol)) {
+      ++it;
+    } else {
+      it = timestamp_to_kf_id_map_.erase(it);
+      ++(*num_timestamp_map_pruned);
+    }
+  }
+
+  if (!timestamp_to_kf_id_map_.empty()) {
+    *oldest_active_pose_timestamp = timestamp_to_kf_id_map_.begin()->first;
+    *newest_active_pose_timestamp = timestamp_to_kf_id_map_.rbegin()->first;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+FrameId VioBackend::computeCbsOldestActiveFrame(
+    const FrameId& newest_frame_id) const {
+  const FrameId lag_states = static_cast<FrameId>(backend_params_.nr_states_);
+  if (lag_states == 0u || newest_frame_id + 1 <= lag_states) {
+    return 0u;
+  }
+  return newest_frame_id - lag_states + 1;
+}
+
+#ifdef KIMERA_USE_CBS
+/* -------------------------------------------------------------------------- */
+VioBackend::CbsFixedLagWindowState VioBackend::buildCbsFixedLagWindowState(
+    const std::map<Key, double>& timestamps) const {
+  CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+
+  CbsFixedLagWindowState window_state;
+  window_state.newest_frame_id = curr_kf_id_;
+  for (const auto& key_ts : timestamps) {
+    window_state.newest_frame_id = std::max(
+        window_state.newest_frame_id,
+        static_cast<FrameId>(std::llround(key_ts.second)));
+  }
+  window_state.oldest_active_frame_id =
+      computeCbsOldestActiveFrame(window_state.newest_frame_id);
+
+  if (backend_params_.nr_states_ <= 0) {
+    return window_state;
+  }
+
+  std::unordered_set<gtsam::FactorIndex> lag_remove_slots_set;
+  const auto& variable_index = cbs_optimizer_->getVariableIndex();
+  for (const auto& key_and_slots : variable_index) {
+    const gtsam::Symbol key_symbol(key_and_slots.first);
+    const char key_char = key_symbol.chr();
+    if (key_char != kPoseSymbolChar && key_char != kVelocitySymbolChar &&
+        key_char != kImuBiasSymbolChar) {
+      continue;
+    }
+    if (static_cast<FrameId>(key_symbol.index()) >=
+        window_state.oldest_active_frame_id) {
+      continue;
+    }
+
+    ++window_state.stale_state_keys;
+    if (key_char == kPoseSymbolChar) {
+      ++window_state.stale_pose_keys;
+    }
+    lag_remove_slots_set.insert(
+        key_and_slots.second.begin(), key_and_slots.second.end());
+  }
+
+  window_state.remove_factor_indices.assign(
+      lag_remove_slots_set.begin(), lag_remove_slots_set.end());
+  std::sort(window_state.remove_factor_indices.begin(),
+            window_state.remove_factor_indices.end());
+  return window_state;
+}
+#endif
+
+/* -------------------------------------------------------------------------- */
 // TODO remove global variables from optimize, pass them as local
 // parameters...
 // TODO make changes to global variables to the addVisualInertial blah blah.
@@ -1915,6 +2295,7 @@ bool VioBackend::optimize(
   size_t num_external_priors_dropped_inactive = 0;
   size_t num_external_priors_dropped_disabled_mode = 0;
   size_t num_external_priors_deferred_budget = 0;
+  size_t num_external_priors_deferred_no_local_receiver_state = 0;
 
   // zy Step 12a
   // In CBS mode, stage/query belief acceptance counters while keeping fixed-lag
@@ -1923,6 +2304,8 @@ bool VioBackend::optimize(
   size_t num_external_beliefs_staged = 0;
   size_t num_external_beliefs_rejected = 0;
   size_t num_external_beliefs_dropped_bad_noise = 0;
+  size_t num_external_beliefs_cov_rejected = 0;
+  size_t num_external_beliefs_cov_regularized = 0;
   // Step 31a: avoid silently mixing beliefs from unknown senders into a wrong CBS agent stream.
   size_t num_external_beliefs_dropped_unknown_source = 0;
   // Intuition: avoid self-feedback loops where Kimera re-fuses its own published belief.
@@ -1942,41 +2325,16 @@ bool VioBackend::optimize(
   // longer active in the optimizer and capture the oldest still-active
   // timestamp. Incoming beliefs older than that are guaranteed to target
   // marginalized states and should be dropped early.
+  const FrameId oldest_active_frame_id_by_lag =
+      computeCbsOldestActiveFrame(cur_id);
   Timestamp oldest_active_pose_timestamp = -1;
   Timestamp newest_active_pose_timestamp = -1;
   size_t num_timestamp_map_pruned = 0;
-  {
-    std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
-    for (auto it = timestamp_to_kf_id_map_.begin();
-         it != timestamp_to_kf_id_map_.end();) {
-      const gtsam::Symbol pose_symbol(kPoseSymbolChar, it->second);
-      bool pose_key_is_active = false;
-#ifdef KIMERA_USE_CBS
-      if (useCbsOptimizerHeart()) {
-        CHECK(cbs_optimizer_)
-            << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
-        pose_key_is_active = cbs_optimizer_->valueExists(pose_symbol) ||
-                             new_values_.exists(pose_symbol);
-      } else
-#endif
-      {
-        pose_key_is_active =
-            state_.exists(pose_symbol) || new_values_.exists(pose_symbol);
-      }
-
-      if (pose_key_is_active) {
-        ++it;
-      } else {
-        it = timestamp_to_kf_id_map_.erase(it);
-        ++num_timestamp_map_pruned;
-      }
-    }
-
-    if (!timestamp_to_kf_id_map_.empty()) {
-      oldest_active_pose_timestamp = timestamp_to_kf_id_map_.begin()->first;
-      newest_active_pose_timestamp = timestamp_to_kf_id_map_.rbegin()->first;
-    }
-  }
+  pruneTimestampToKeyframeMap(cbs_heart_active,
+                              oldest_active_frame_id_by_lag,
+                              &num_timestamp_map_pruned,
+                              &oldest_active_pose_timestamp,
+                              &newest_active_pose_timestamp);
   if (num_timestamp_map_pruned > 0) {
     VLOG(2) << "Pruned " << num_timestamp_map_pruned
             << " marginalized timestamp->key entries. oldest_active_ts[nsec]="
@@ -2082,27 +2440,29 @@ bool VioBackend::optimize(
       }
 
       const gtsam::Symbol pose_symbol(kPoseSymbolChar, matched_frame_id);
-      // zy Step 12b, edited the original one
-      // zy Step 28a: key-availability must be checked against the optimizer that is actually active (CBS or legacy).
-      bool pose_key_is_active = false;
 #ifdef KIMERA_USE_CBS
-      if (cbs_heart_active) {
-        CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
-        pose_key_is_active =
-            cbs_optimizer_->valueExists(pose_symbol) || new_values_.exists(pose_symbol);
-      } else
-#endif
-      {
-        pose_key_is_active =
-            state_.exists(pose_symbol) || new_values_.exists(pose_symbol);
+      if (cbs_exchange_active && cbs_heart_active &&
+          !isReceiverLocalBeliefReadyForCbs(pose_symbol)) {
+        remaining_queue.push_back(prior);
+        ++num_external_priors_deferred;
+        ++num_external_priors_deferred_no_local_receiver_state;
+        VLOG(2) << "Deferring external prior: receiver LOCAL CBS state not "
+                   "ready yet. source="
+                << prior.source_ << ", seq=" << prior.source_seq_
+                << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+                << ", matched_frame_id=" << matched_frame_id;
+        continue;
       }
+#endif
+      const bool pose_key_is_active = isPoseKeyActiveInOptimizer(pose_symbol);
 
       if (pose_key_is_active) {
 #ifdef KIMERA_USE_CBS
         if (cbs_exchange_active) {
-          // zy Step 41c
-          // In CBS mode with fixed-lag heart, use CBS belief gate for
-          // acceptance/rejection, then inject accepted priors into Kimera graph.
+          // Use CBS belief gate for acceptance/rejection. In CBS-heart mode,
+          // accepted beliefs remain inside BPSAM message passing. In legacy
+          // mode, accepted beliefs are injected as PriorFactor into the
+          // legacy fixed-lag smoother graph.
           CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 
           bool accepted_by_cbs = true;
@@ -2128,11 +2488,35 @@ bool VioBackend::optimize(
 
           if (!have_cov || !cov.allFinite()) {
             ++num_external_beliefs_dropped_bad_noise;
+            ++num_external_beliefs_cov_rejected;
             accepted_by_cbs = false;
             VLOG(2) << "Dropping external belief with unsupported/non-finite noise. "
                     << "source=" << prior.source_
                     << ", seq=" << prior.source_seq_
                     << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
+          }
+
+          // Validate/regularize external covariance before creating CBS belief.
+          if (accepted_by_cbs) {
+            std::string cov_reason = "unknown";
+            const PoseCovarianceStatus cov_status =
+                sanitizePoseCovariance(&cov, &cov_reason);
+            if (cov_status == PoseCovarianceStatus::kRejected) {
+              ++num_external_beliefs_dropped_bad_noise;
+              ++num_external_beliefs_cov_rejected;
+              accepted_by_cbs = false;
+              VLOG(2) << "Dropping external belief with invalid covariance. "
+                      << "reason=" << cov_reason
+                      << "source=" << prior.source_
+                      << ", seq=" << prior.source_seq_
+                      << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
+            } else if (cov_status == PoseCovarianceStatus::kRegularized) {
+              ++num_external_beliefs_cov_regularized;
+              VLOG(2) << "Regularized external belief covariance before CBS "
+                         "injection. source="
+                      << prior.source_ << ", seq=" << prior.source_seq_
+                      << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
+            }
           }
 
           cbs::AgentId sender_id = kKimeraAgentId;
@@ -2163,75 +2547,260 @@ bool VioBackend::optimize(
                     << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
           }
 
-	          if (accepted_by_cbs) {
-	            bool have_pose_delta = false;
-	            double pose_delta_rot_rad = std::numeric_limits<double>::quiet_NaN();
-	            double pose_delta_trans_m = std::numeric_limits<double>::quiet_NaN();
-	            double pose_delta_norm = std::numeric_limits<double>::quiet_NaN();
-	            gtsam::Pose3 current_pose_estimate;
-	            bool have_current_pose_estimate = false;
+          if (accepted_by_cbs) {
+            const gtsam::Pose3 incoming_pose_raw = prior.W_Pose_B_;
+            gtsam::Pose3 incoming_pose_aligned = incoming_pose_raw;
+            bool alignment_mode_enabled = FLAGS_cbs_diag_align_incoming_mean;
+            bool alignment_prev_available = false;
+            bool alignment_applied = false;
+            gtsam::Pose3 alignment_prev = gtsam::Pose3();
+            if (alignment_mode_enabled) {
+              std::lock_guard<std::mutex> lock(external_mean_alignment_mutex_);
+              const auto it = external_mean_alignment_by_source_.find(prior.source_);
+              if (it != external_mean_alignment_by_source_.end()) {
+                alignment_prev_available = true;
+                alignment_prev = it->second;
+                incoming_pose_aligned = alignment_prev.compose(incoming_pose_raw);
+                alignment_applied = true;
+              }
+            }
 
-	            if (new_values_.exists(pose_symbol)) {
-	              current_pose_estimate = new_values_.at<gtsam::Pose3>(pose_symbol);
-	              have_current_pose_estimate = true;
-	            } else if (state_.exists(pose_symbol)) {
-	              current_pose_estimate = state_.at<gtsam::Pose3>(pose_symbol);
-	              have_current_pose_estimate = true;
-	            } else if (cbs_optimizer_->valueExists(pose_symbol)) {
-	              current_pose_estimate =
-	                  cbs_optimizer_->calculateEstimate<gtsam::Pose3>(pose_symbol);
-	              have_current_pose_estimate = true;
-	            }
+            bool have_pose_delta = false;
+            double pose_delta_rot_rad = std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_trans_m = std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_norm = std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_rot_rad_before_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_trans_m_before_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_norm_before_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_rot_rad_after_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_trans_m_after_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_norm_after_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double div_hell_local_incoming_before_align =
+                std::numeric_limits<double>::quiet_NaN();
+            double div_hell_local_incoming_after_align =
+                std::numeric_limits<double>::quiet_NaN();
+            gtsam::Pose3 current_pose_estimate;
+            bool have_current_pose_estimate = false;
+            double receiver_local_tx = std::numeric_limits<double>::quiet_NaN();
+            double receiver_local_ty = std::numeric_limits<double>::quiet_NaN();
+            double receiver_local_tz = std::numeric_limits<double>::quiet_NaN();
+            double receiver_local_qx = std::numeric_limits<double>::quiet_NaN();
+            double receiver_local_qy = std::numeric_limits<double>::quiet_NaN();
+            double receiver_local_qz = std::numeric_limits<double>::quiet_NaN();
+            double receiver_local_qw = std::numeric_limits<double>::quiet_NaN();
+            const gtsam::Quaternion incoming_q_raw =
+                incoming_pose_raw.rotation().toQuaternion();
+            const gtsam::Quaternion incoming_q_aligned =
+                incoming_pose_aligned.rotation().toQuaternion();
 
-	            if (have_current_pose_estimate) {
-	              const gtsam::Vector6 pose_delta_vec =
-	                  gtsam::traits<gtsam::Pose3>::Logmap(
-	                      current_pose_estimate.between(prior.W_Pose_B_));
-	              pose_delta_rot_rad = pose_delta_vec.head<3>().norm();
-	              pose_delta_trans_m = pose_delta_vec.tail<3>().norm();
-	              pose_delta_norm = pose_delta_vec.norm();
-	              have_pose_delta = true;
-	            }
+            if (new_values_.exists(pose_symbol)) {
+              current_pose_estimate = new_values_.at<gtsam::Pose3>(pose_symbol);
+              have_current_pose_estimate = true;
+            } else if (state_.exists(pose_symbol)) {
+              current_pose_estimate = state_.at<gtsam::Pose3>(pose_symbol);
+              have_current_pose_estimate = true;
+            } else if (cbs_optimizer_->valueExists(pose_symbol)) {
+              current_pose_estimate =
+                  cbs_optimizer_->calculateEstimate<gtsam::Pose3>(pose_symbol);
+              have_current_pose_estimate = true;
+            }
 
-	            const gtsam::Vector6 mu =
-	                gtsam::traits<gtsam::Pose3>::Logmap(prior.W_Pose_B_);
-	            gbp::Gaussian belief(pose_symbol, mu, cov, 1);
-	            std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
-	                single_belief;
+            gtsam::Matrix66 receiver_local_cov_for_diag = gtsam::Matrix66::Zero();
+            bool have_receiver_local_cov_for_diag = false;
+            if (have_current_pose_estimate && cbs_optimizer_ &&
+                cbs_optimizer_->valueExists(pose_symbol)) {
+              try {
+                const gtsam::Matrix local_cov_dynamic =
+                    cbs_optimizer_->marginalCovariance(
+                        pose_symbol, cbs::BPSAM::MarginalizationType::LOCAL);
+                if (local_cov_dynamic.rows() >= 6 &&
+                    local_cov_dynamic.cols() >= 6 &&
+                    local_cov_dynamic.block<6, 6>(0, 0).allFinite()) {
+                  receiver_local_cov_for_diag =
+                      local_cov_dynamic.block<6, 6>(0, 0);
+                  have_receiver_local_cov_for_diag = true;
+                }
+              } catch (...) {
+                have_receiver_local_cov_for_diag = false;
+              }
+            }
+
+            if (have_current_pose_estimate) {
+              const gtsam::Quaternion local_q =
+                  current_pose_estimate.rotation().toQuaternion();
+              receiver_local_tx = current_pose_estimate.x();
+              receiver_local_ty = current_pose_estimate.y();
+              receiver_local_tz = current_pose_estimate.z();
+              receiver_local_qx = local_q.x();
+              receiver_local_qy = local_q.y();
+              receiver_local_qz = local_q.z();
+              receiver_local_qw = local_q.w();
+              const gtsam::Vector6 pose_delta_vec_before =
+                  gtsam::traits<gtsam::Pose3>::Logmap(
+                      current_pose_estimate.between(incoming_pose_raw));
+              pose_delta_rot_rad_before_align = pose_delta_vec_before.head<3>().norm();
+              pose_delta_trans_m_before_align =
+                  pose_delta_vec_before.tail<3>().norm();
+              pose_delta_norm_before_align = pose_delta_vec_before.norm();
+
+              const gtsam::Vector6 pose_delta_vec_after =
+                  gtsam::traits<gtsam::Pose3>::Logmap(
+                      current_pose_estimate.between(incoming_pose_aligned));
+              pose_delta_rot_rad_after_align = pose_delta_vec_after.head<3>().norm();
+              pose_delta_trans_m_after_align =
+                  pose_delta_vec_after.tail<3>().norm();
+              pose_delta_norm_after_align = pose_delta_vec_after.norm();
+              pose_delta_rot_rad = pose_delta_rot_rad_after_align;
+              pose_delta_trans_m = pose_delta_trans_m_after_align;
+              pose_delta_norm = pose_delta_norm_after_align;
+              have_pose_delta = true;
+
+              if (have_receiver_local_cov_for_diag) {
+                const Vec6 mu_local =
+                    gtsam::traits<gtsam::Pose3>::Logmap(current_pose_estimate);
+                const Vec6 mu_incoming_before =
+                    gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose_raw);
+                const Vec6 mu_incoming_after =
+                    gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose_aligned);
+                const Mat6 sigma_local = receiver_local_cov_for_diag;
+                const Mat6 sigma_incoming = cov;
+                div_hell_local_incoming_before_align = hellingerDistance6(
+                    mu_local, sigma_local, mu_incoming_before, sigma_incoming);
+                div_hell_local_incoming_after_align = hellingerDistance6(
+                    mu_local, sigma_local, mu_incoming_after, sigma_incoming);
+              }
+            }
+
+            bool alignment_updated = false;
+            gtsam::Pose3 alignment_update = gtsam::Pose3();
+            if (alignment_mode_enabled && have_current_pose_estimate) {
+              alignment_update = current_pose_estimate.compose(
+                  incoming_pose_raw.inverse());
+              {
+                std::lock_guard<std::mutex> lock(external_mean_alignment_mutex_);
+                external_mean_alignment_by_source_[prior.source_] = alignment_update;
+              }
+              alignment_updated = true;
+            }
+            const gtsam::Quaternion alignment_prev_q =
+                alignment_prev.rotation().toQuaternion();
+            const gtsam::Quaternion alignment_update_q =
+                alignment_update.rotation().toQuaternion();
+
+            const gtsam::Vector6 mu =
+                gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose_aligned);
+            gbp::Gaussian belief(pose_symbol, mu, cov, 1);
+            std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
+                single_belief;
             single_belief[pose_symbol].emplace_back(sender_id, belief);
             ++num_external_beliefs_staged;
-	            const size_t rejected_count =
-	                static_cast<size_t>(cbs_optimizer_->addBeliefs(single_belief));
-	            num_external_beliefs_rejected += rejected_count;
-	            accepted_by_cbs = (rejected_count == 0u);
+            const size_t rejected_count =
+                static_cast<size_t>(cbs_optimizer_->addBeliefs(single_belief));
+            num_external_beliefs_rejected += rejected_count;
+            accepted_by_cbs = (rejected_count == 0u);
 
-	            LOG(INFO) << "[CBS][KimeraPrior] key=" << pose_symbol.key()
-	                      << ", matched_frame_id=" << matched_frame_id
-	                      << ", source=" << prior.source_
-	                      << ", seq=" << prior.source_seq_
-	                      << ", ts[nsec]=" << prior.timestamp_kf_nsec_
-	                      << ", cbs_result="
-	                      << (accepted_by_cbs ? "accepted" : "rejected")
-	                      << ", cbs_rejected_count=" << rejected_count
-	                      << ", have_pose_delta=" << (have_pose_delta ? 1 : 0)
-	                      << ", delta_trans_m=" << pose_delta_trans_m
-	                      << ", delta_rot_rad=" << pose_delta_rot_rad
-	                      << ", delta_norm=" << pose_delta_norm;
-	          }
+            LOG(INFO) << "[CBS][KimeraPrior] key=" << pose_symbol.key()
+                      << ", matched_frame_id=" << matched_frame_id
+                      << ", source=" << prior.source_
+                      << ", seq=" << prior.source_seq_
+                      << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+                      << ", incoming_raw_mean_semantic=world_to_body_pose"
+                      << ", incoming_raw_mean_tx=" << incoming_pose_raw.x()
+                      << ", incoming_raw_mean_ty=" << incoming_pose_raw.y()
+                      << ", incoming_raw_mean_tz=" << incoming_pose_raw.z()
+                      << ", incoming_raw_mean_qx=" << incoming_q_raw.x()
+                      << ", incoming_raw_mean_qy=" << incoming_q_raw.y()
+                      << ", incoming_raw_mean_qz=" << incoming_q_raw.z()
+                      << ", incoming_raw_mean_qw=" << incoming_q_raw.w()
+                      << ", incoming_mean_semantic=world_to_body_pose"
+                      << ", incoming_mean_tx=" << incoming_pose_aligned.x()
+                      << ", incoming_mean_ty=" << incoming_pose_aligned.y()
+                      << ", incoming_mean_tz=" << incoming_pose_aligned.z()
+                      << ", incoming_mean_qx=" << incoming_q_aligned.x()
+                      << ", incoming_mean_qy=" << incoming_q_aligned.y()
+                      << ", incoming_mean_qz=" << incoming_q_aligned.z()
+                      << ", incoming_mean_qw=" << incoming_q_aligned.w()
+                      << ", receiver_local_mean_semantic=world_to_body_pose"
+                      << ", receiver_local_mean_available="
+                      << (have_current_pose_estimate ? 1 : 0)
+                      << ", receiver_local_mean_tx=" << receiver_local_tx
+                      << ", receiver_local_mean_ty=" << receiver_local_ty
+                      << ", receiver_local_mean_tz=" << receiver_local_tz
+                      << ", receiver_local_mean_qx=" << receiver_local_qx
+                      << ", receiver_local_mean_qy=" << receiver_local_qy
+                      << ", receiver_local_mean_qz=" << receiver_local_qz
+                      << ", receiver_local_mean_qw=" << receiver_local_qw
+                      << ", mean_semantics_match=1"
+                      << ", receiver_extrinsic_applied_to_mean=0"
+                      << ", mean_alignment_mode_enabled="
+                      << (alignment_mode_enabled ? 1 : 0)
+                      << ", mean_alignment_prev_available="
+                      << (alignment_prev_available ? 1 : 0)
+                      << ", mean_alignment_applied=" << (alignment_applied ? 1 : 0)
+                      << ", mean_alignment_prev_tx=" << alignment_prev.x()
+                      << ", mean_alignment_prev_ty=" << alignment_prev.y()
+                      << ", mean_alignment_prev_tz=" << alignment_prev.z()
+                      << ", mean_alignment_prev_qx=" << alignment_prev_q.x()
+                      << ", mean_alignment_prev_qy=" << alignment_prev_q.y()
+                      << ", mean_alignment_prev_qz=" << alignment_prev_q.z()
+                      << ", mean_alignment_prev_qw=" << alignment_prev_q.w()
+                      << ", mean_alignment_updated=" << (alignment_updated ? 1 : 0)
+                      << ", mean_alignment_update_tx=" << alignment_update.x()
+                      << ", mean_alignment_update_ty=" << alignment_update.y()
+                      << ", mean_alignment_update_tz=" << alignment_update.z()
+                      << ", mean_alignment_update_qx=" << alignment_update_q.x()
+                      << ", mean_alignment_update_qy=" << alignment_update_q.y()
+                      << ", mean_alignment_update_qz=" << alignment_update_q.z()
+                      << ", mean_alignment_update_qw=" << alignment_update_q.w()
+                      << ", div_hell_local_incoming_before_align="
+                      << div_hell_local_incoming_before_align
+                      << ", div_hell_local_incoming_after_align="
+                      << div_hell_local_incoming_after_align
+                      << ", cbs_result="
+                      << (accepted_by_cbs ? "accepted" : "rejected")
+                      << ", cbs_rejected_count=" << rejected_count
+                      << ", have_pose_delta=" << (have_pose_delta ? 1 : 0)
+                      << ", delta_trans_m=" << pose_delta_trans_m
+                      << ", delta_rot_rad=" << pose_delta_rot_rad
+                      << ", delta_norm=" << pose_delta_norm
+                      << ", delta_local_incoming_trans_m_before_align="
+                      << pose_delta_trans_m_before_align
+                      << ", delta_local_incoming_rot_rad_before_align="
+                      << pose_delta_rot_rad_before_align
+                      << ", delta_local_incoming_norm_before_align="
+                      << pose_delta_norm_before_align
+                      << ", delta_local_incoming_trans_m_after_align="
+                      << pose_delta_trans_m_after_align
+                      << ", delta_local_incoming_rot_rad_after_align="
+                      << pose_delta_rot_rad_after_align
+                      << ", delta_local_incoming_norm_after_align="
+                      << pose_delta_norm_after_align;
+          }
 
           if (!accepted_by_cbs) {
             continue;
           }
 
-          // zy Step 41d
-          // Inject accepted external belief as a standard PriorFactor so fixed-lag
-          // smoothing remains the only optimization heart.
-          addExternalPosePrior(matched_frame_id, prior.W_Pose_B_, prior.noise_model_);
           ++num_external_priors_injected;
-          VLOG(2) << "Injected external prior factor from CBS-accepted belief. source="
-                  << prior.source_ << ", seq=" << prior.source_seq_
-                  << ", ts[nsec]=" << prior.timestamp_kf_nsec_
-                  << ", matched_frame_id=" << matched_frame_id;
+          if (cbs_heart_active) {
+            VLOG(2) << "Accepted external belief routed to CBS-heart only. source="
+                    << prior.source_ << ", seq=" << prior.source_seq_
+                    << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+                    << ", matched_frame_id=" << matched_frame_id;
+          } else {
+            addExternalPosePrior(
+                matched_frame_id, prior.W_Pose_B_, prior.noise_model_);
+            VLOG(2) << "Injected external prior factor from CBS-accepted belief. source="
+                    << prior.source_ << ", seq=" << prior.source_seq_
+                    << ", ts[nsec]=" << prior.timestamp_kf_nsec_
+                    << ", matched_frame_id=" << matched_frame_id;
+          }
         } else {
           ++num_external_priors_dropped_disabled_mode;
           VLOG(2) << "Dropping external prior because CBS belief exchange is OFF. source="
@@ -2255,9 +2824,21 @@ bool VioBackend::optimize(
     external_pose_priors_queue_.swap(remaining_queue);
   }
 
+  size_t external_queue_size_now = 0u;
+  {
+    std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
+    external_queue_size_now = external_pose_priors_queue_.size();
+  }
+
   // zy Step 12c
   #ifdef KIMERA_USE_CBS
-  if (cbs_exchange_active && num_external_beliefs_staged > 0) {
+  if (cbs_exchange_active &&
+      (num_external_beliefs_staged > 0 ||
+       num_external_beliefs_dropped_bad_noise > 0 ||
+       num_external_beliefs_cov_rejected > 0 ||
+       num_external_beliefs_cov_regularized > 0 ||
+       num_external_beliefs_dropped_unknown_source > 0 ||
+       num_external_beliefs_dropped_self_source > 0)) {
     const size_t num_external_beliefs_accepted =
         (num_external_beliefs_staged >= num_external_beliefs_rejected)
             ? (num_external_beliefs_staged - num_external_beliefs_rejected)
@@ -2268,6 +2849,10 @@ bool VioBackend::optimize(
                           << ", accepted=" << num_external_beliefs_accepted
                           << ", bad_noise="
                           << num_external_beliefs_dropped_bad_noise
+                          << ", cov_rejected="
+                          << num_external_beliefs_cov_rejected
+                          << ", cov_regularized="
+                          << num_external_beliefs_cov_regularized
                           << ", unknown_source="
                           << num_external_beliefs_dropped_unknown_source
                           << ", self_source="
@@ -2289,8 +2874,50 @@ bool VioBackend::optimize(
         << ", dropped_inactive=" << num_external_priors_dropped_inactive
         << ", dropped_disabled_mode=" << num_external_priors_dropped_disabled_mode
         << ", deferred_budget=" << num_external_priors_deferred_budget
-        << ", queue_size_now=" << external_pose_priors_queue_.size();
+        << ", deferred_no_local_receiver_state="
+        << num_external_priors_deferred_no_local_receiver_state
+        << ", queue_size_now=" << external_queue_size_now;
   }
+
+#ifdef KIMERA_USE_CBS
+  if (cbs_exchange_active) {
+    const size_t num_external_beliefs_accepted =
+        (num_external_beliefs_staged >= num_external_beliefs_rejected)
+            ? (num_external_beliefs_staged - num_external_beliefs_rejected)
+            : 0u;
+    std::cerr << std::setprecision(12)
+              << "[CBS][ExternalPriorDiag] timestamp_ns=" << timestamp_kf_nsec
+              << " cbs_heart_active=" << (cbs_heart_active ? 1 : 0)
+              << " use_cbs_optimizer=" << (FLAGS_use_cbs_optimizer ? 1 : 0)
+              << " cbs_replace_fixed_lag_optimizer="
+              << (FLAGS_cbs_replace_fixed_lag_optimizer ? 1 : 0)
+              << " fixed_lag_states=" << backend_params_.nr_states_
+              << " injected=" << num_external_priors_injected
+              << " deferred=" << num_external_priors_deferred
+              << " deferred_budget=" << num_external_priors_deferred_budget
+              << " dropped_old=" << num_external_priors_dropped_old
+              << " dropped_marginalized="
+              << num_external_priors_dropped_marginalized
+              << " dropped_inactive=" << num_external_priors_dropped_inactive
+              << " dropped_disabled_mode="
+              << num_external_priors_dropped_disabled_mode
+              << " deferred_no_local_receiver_state="
+              << num_external_priors_deferred_no_local_receiver_state
+              << " beliefs_staged=" << num_external_beliefs_staged
+              << " beliefs_accepted=" << num_external_beliefs_accepted
+              << " beliefs_rejected=" << num_external_beliefs_rejected
+              << " beliefs_bad_noise=" << num_external_beliefs_dropped_bad_noise
+              << " beliefs_cov_rejected="
+              << num_external_beliefs_cov_rejected
+              << " beliefs_cov_regularized="
+              << num_external_beliefs_cov_regularized
+              << " beliefs_unknown_source="
+              << num_external_beliefs_dropped_unknown_source
+              << " beliefs_self_source="
+              << num_external_beliefs_dropped_self_source
+              << " queue_size_now=" << external_queue_size_now << std::endl;
+  }
+#endif
 
 
 
@@ -2687,6 +3314,35 @@ bool VioBackend::optimize(
               << ", v=" << num_vel_keys
               << ", b=" << num_bias_keys
               << ", cur_kf=" << cur_id;
+
+      const double backend_total_ms =
+          utils::Timer::toc<std::chrono::milliseconds>(total_start_time)
+              .count();
+      std::cerr << std::setprecision(12)
+                << "[CBS][OptimizeDiag] timestamp_ns=" << timestamp_kf_nsec
+                << " curr_kf_id=" << cur_id
+                << " optimizer_mode=" << optimizer_mode
+                << " backend_total_ms=" << backend_total_ms
+                << " active_x=" << num_pose_keys
+                << " active_v=" << num_vel_keys
+                << " active_b=" << num_bias_keys
+                << " active_factors=" << num_factors_active
+                << " use_cbs_optimizer=" << (FLAGS_use_cbs_optimizer ? 1 : 0)
+                << " cbs_replace_fixed_lag_optimizer="
+                << (FLAGS_cbs_replace_fixed_lag_optimizer ? 1 : 0)
+                << " cbs_heart_active=" << (cbs_heart_active ? 1 : 0)
+                << " fixed_lag_states=" << backend_params_.nr_states_
+                << " ext_injected=" << num_external_priors_injected
+                << " ext_deferred=" << num_external_priors_deferred
+                << " ext_dropped_old=" << num_external_priors_dropped_old
+                << " ext_dropped_marginalized="
+                << num_external_priors_dropped_marginalized
+                << " ext_dropped_inactive="
+                << num_external_priors_dropped_inactive
+                << " ext_deferred_budget="
+                << num_external_priors_deferred_budget
+                << " ext_queue_size=" << external_queue_size_now
+                << std::endl;
 // ----- zy
 
       // TODO: Add Update latest covariance --> move flag
@@ -2911,81 +3567,460 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     // Intuition: in CBS mode, BPSAM is the single optimization heart, so we skip the legacy smoother update path.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 
-    cbs::BPSAM::UpdateParams cbs_update_params;
-    cbs_update_params.removeFactorIndices.insert(
-        cbs_update_params.removeFactorIndices.end(),
-        delete_slots.begin(),
-        delete_slots.end());
+    const CbsFixedLagWindowState lag_window_state =
+        buildCbsFixedLagWindowState(timestamps);
 
+    // CBS-heart currently approximates fixed-lag factor removal but does not
+    // yet implement a full marginalization prior. Add a boundary anchor once
+    // per oldest-active frame to reduce gauge drift/underdetermined windows.
+    gtsam::NonlinearFactorGraph cbs_update_factors = new_factors;
+    const FrameId anchor_frame_id = lag_window_state.oldest_active_frame_id;
+    if (anchor_frame_id > 0u &&
+        cbs_last_window_anchor_frame_id_ != anchor_frame_id) {
       try {
-      //zy Step 40f
-      // Run CBS pose-sharing inner rounds per epoch:
-      // round 0 uses incoming factors/values, later rounds run belief-only updates.
-      const int max_pose_rounds = std::max(1, FLAGS_cbs_pose_rounds_per_epoch);
-      const double abs_eps =
-          std::max(0.0, FLAGS_cbs_pose_convergence_abs_residual);
-      const double rel_eps =
-          std::max(0.0, FLAGS_cbs_pose_convergence_rel_residual);
-      auto compute_cbs_residual = [&]() -> std::optional<double> {
-        try {
-          const auto estimate = cbs_optimizer_->calculateEstimate();
-          return cbs_optimizer_->getFactorsUnsafe().error(estimate);
-        } catch (...) {
-          return std::nullopt;
+        const gtsam::Values cbs_values = cbs_optimizer_->calculateEstimate();
+        size_t anchors_added = 0u;
+
+        const gtsam::Symbol pose_key(kPoseSymbolChar, anchor_frame_id);
+        if (cbs_values.exists(pose_key.key())) {
+          const gtsam::Pose3 anchor_pose = cbs_values.at<gtsam::Pose3>(pose_key);
+          gtsam::Vector6 sigmas;
+          sigmas.head<3>().setConstant(0.05);   // rad
+          sigmas.tail<3>().setConstant(0.25);   // m
+          cbs_update_factors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+              pose_key, anchor_pose, gtsam::noiseModel::Diagonal::Sigmas(sigmas));
+          ++anchors_added;
+        }
+
+        const gtsam::Symbol vel_key(kVelocitySymbolChar, anchor_frame_id);
+        if (cbs_values.exists(vel_key.key())) {
+          const gtsam::Vector3 anchor_vel = cbs_values.at<gtsam::Vector3>(vel_key);
+          gtsam::Vector3 vel_sigmas;
+          vel_sigmas.setConstant(0.5);  // m/s
+          cbs_update_factors.emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
+              vel_key, anchor_vel, gtsam::noiseModel::Diagonal::Sigmas(vel_sigmas));
+          ++anchors_added;
+        }
+
+        const gtsam::Symbol bias_key(kImuBiasSymbolChar, anchor_frame_id);
+        if (cbs_values.exists(bias_key.key())) {
+          const gtsam::imuBias::ConstantBias anchor_bias =
+              cbs_values.at<gtsam::imuBias::ConstantBias>(bias_key);
+          gtsam::Vector6 bias_sigmas;
+          bias_sigmas.head<3>().setConstant(
+              std::max(backend_params_.initialAccBiasSigma_, 1e-4));
+          bias_sigmas.tail<3>().setConstant(
+              std::max(backend_params_.initialGyroBiasSigma_, 1e-4));
+          cbs_update_factors.emplace_shared<
+              gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(
+              bias_key,
+              anchor_bias,
+              gtsam::noiseModel::Diagonal::Sigmas(bias_sigmas));
+          ++anchors_added;
+        }
+
+        if (anchors_added > 0u) {
+          cbs_last_window_anchor_frame_id_ = anchor_frame_id;
+          VLOG(1) << "CBS-heart added lag-boundary anchor priors on frame "
+                  << anchor_frame_id << " (count=" << anchors_added << ")";
+        }
+      } catch (const std::exception& e) {
+        LOG(WARNING) << "CBS-heart could not add lag-boundary anchor priors for "
+                     << "frame " << anchor_frame_id << ": " << e.what();
+      }
+    }
+
+    const auto build_cbs_first_update_params =
+        [&](const bool enable_remove_factor_indices) {
+          cbs::BPSAM::UpdateParams params;
+          if (!enable_remove_factor_indices) {
+            VLOG(1) << "CBS-heart running current epoch with "
+                       "removeFactorIndices disabled.";
+            return params;
+          }
+
+          std::vector<size_t> raw_remove_indices;
+          raw_remove_indices.insert(raw_remove_indices.end(),
+                                    delete_slots.begin(),
+                                    delete_slots.end());
+          raw_remove_indices.insert(raw_remove_indices.end(),
+                                    lag_window_state.remove_factor_indices.begin(),
+                                    lag_window_state.remove_factor_indices.end());
+          std::sort(raw_remove_indices.begin(), raw_remove_indices.end());
+          raw_remove_indices.erase(
+              std::unique(raw_remove_indices.begin(), raw_remove_indices.end()),
+              raw_remove_indices.end());
+
+          const gtsam::NonlinearFactorGraph& cbs_factors =
+              cbs_optimizer_->getFactorsUnsafe();
+          size_t dropped_remove_slots = 0u;
+          params.removeFactorIndices.reserve(raw_remove_indices.size());
+          for (const size_t slot : raw_remove_indices) {
+            if (cbs_factors.exists(slot)) {
+              params.removeFactorIndices.push_back(slot);
+            } else {
+              ++dropped_remove_slots;
+            }
+          }
+          if (dropped_remove_slots > 0u) {
+            LOG(WARNING) << "CBS-heart dropped " << dropped_remove_slots
+                         << " stale removeFactorIndices before update.";
+          }
+          return params;
+        };
+    if (!lag_window_state.remove_factor_indices.empty()) {
+      VLOG(2) << "CBS-heart fixed-lag eviction: newest_frame_id="
+              << lag_window_state.newest_frame_id
+              << ", oldest_active_frame_id="
+              << lag_window_state.oldest_active_frame_id
+              << ", stale_state_keys=" << lag_window_state.stale_state_keys
+              << ", stale_pose_keys=" << lag_window_state.stale_pose_keys
+              << ", removed_factor_slots="
+              << lag_window_state.remove_factor_indices.size();
+    }
+
+    auto attempt_cbs_recovery =
+        [&](const std::optional<size_t>& failed_index_opt,
+            const std::string& trigger_reason) -> bool {
+      LOG(ERROR) << "CBS recovery triggered. reason=" << trigger_reason;
+      gtsam::Values cbs_values;
+      try {
+        cbs_values = cbs_optimizer_->calculateEstimate();
+      } catch (const std::exception& est_e) {
+        LOG(ERROR) << "CBS recovery failed to query current estimate: "
+                   << est_e.what();
+      }
+
+      auto add_stabilizing_prior =
+          [&](const gtsam::Symbol& key,
+              gtsam::NonlinearFactorGraph* graph_to_update) -> bool {
+        CHECK_NOTNULL(graph_to_update);
+        switch (key.chr()) {
+          case 'x': {
+            gtsam::Pose3 pose;
+            if (cbs_values.exists(key)) {
+              pose = cbs_values.at<gtsam::Pose3>(key);
+            } else {
+              return false;
+            }
+            gtsam::Vector6 sigmas;
+            sigmas.head<3>().setConstant(0.01);  // rotation
+            sigmas.tail<3>().setConstant(0.1);   // translation
+            const gtsam::SharedNoiseModel noise =
+                gtsam::noiseModel::Diagonal::Sigmas(sigmas);
+            graph_to_update->emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+                key, pose, noise);
+            return true;
+          }
+          case 'b': {
+            gtsam::imuBias::ConstantBias bias;
+            if (cbs_values.exists(key)) {
+              bias = cbs_values.at<gtsam::imuBias::ConstantBias>(key);
+            } else {
+              return false;
+            }
+            gtsam::Vector6 sigmas;
+            sigmas.head<3>().setConstant(backend_params_.initialAccBiasSigma_);
+            sigmas.tail<3>().setConstant(backend_params_.initialGyroBiasSigma_);
+            const gtsam::SharedNoiseModel noise =
+                gtsam::noiseModel::Diagonal::Sigmas(sigmas);
+            graph_to_update->emplace_shared<
+                gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(key, bias, noise);
+            return true;
+          }
+          case 'v': {
+            gtsam::Vector3 vel;
+            if (cbs_values.exists(key)) {
+              vel = cbs_values.at<gtsam::Vector3>(key);
+            } else {
+              return false;
+            }
+            gtsam::Vector3 sigmas;
+            sigmas.setConstant(0.1);
+            const gtsam::SharedNoiseModel noise =
+                gtsam::noiseModel::Diagonal::Sigmas(sigmas);
+            graph_to_update->emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
+                key, vel, noise);
+            return true;
+          }
+          default:
+            return false;
         }
       };
 
-      gtsam::ISAM2Result cbs_result =
-          cbs_optimizer_->update(new_factors, new_values, cbs_update_params);
-      int rounds_executed = 1;
-      std::optional<double> prev_residual = compute_cbs_residual();
-
-      for (int round = 1; round < max_pose_rounds; ++round) {
-        cbs_result = cbs_optimizer_->update(
-            gtsam::NonlinearFactorGraph(), gtsam::Values(), cbs_update_params);
-        ++rounds_executed;
-
-        const std::optional<double> curr_residual = compute_cbs_residual();
-        if (curr_residual && prev_residual) {
-          const double abs_change = std::fabs(*curr_residual - *prev_residual);
-          const double rel_change =
-              abs_change / std::max(std::fabs(*prev_residual), 1e-12);
-          if (abs_change <= abs_eps || rel_change <= rel_eps) {
-            VLOG(2) << "CBS pose rounds converged early at round "
-                    << rounds_executed << "/" << max_pose_rounds
-                    << " (abs=" << abs_change << ", rel=" << rel_change << ")";
-            break;
+      std::unordered_set<gtsam::Key> prior_keys_set;
+      const auto add_state_triplet_for_index = [&](const size_t index) {
+        const gtsam::Symbol pose_key('x', index);
+        const gtsam::Symbol vel_key('v', index);
+        const gtsam::Symbol bias_key('b', index);
+        if (cbs_values.exists(pose_key.key())) {
+          prior_keys_set.insert(pose_key.key());
+        }
+        if (cbs_values.exists(vel_key.key())) {
+          prior_keys_set.insert(vel_key.key());
+        }
+        if (cbs_values.exists(bias_key.key())) {
+          prior_keys_set.insert(bias_key.key());
+        }
+      };
+      if (failed_index_opt) {
+        add_state_triplet_for_index(*failed_index_opt);
+      }
+      add_state_triplet_for_index(curr_kf_id_);
+      for (const auto& key_value : new_values) {
+        const gtsam::Symbol candidate(key_value.key);
+        if (candidate.chr() == 'x' || candidate.chr() == 'v' ||
+            candidate.chr() == 'b') {
+          if (cbs_values.exists(candidate.key())) {
+            prior_keys_set.insert(candidate.key());
           }
         }
+      }
 
-        if (curr_residual) {
-          prev_residual = curr_residual;
+      std::vector<gtsam::Key> prior_keys(prior_keys_set.begin(),
+                                         prior_keys_set.end());
+      std::sort(prior_keys.begin(), prior_keys.end());
+
+      gtsam::NonlinearFactorGraph recovery_priors;
+      size_t priors_added = 0u;
+      for (const gtsam::Key key_raw : prior_keys) {
+        const gtsam::Symbol key(key_raw);
+        if (add_stabilizing_prior(key, &recovery_priors)) {
+          ++priors_added;
+          LOG(ERROR) << "CBS recovery added stabilizing prior on key "
+                     << key.chr() << key.index();
         }
       }
 
-      // Intuition: keep FixedLagSmoother API contract by populating a compatible summary result in CBS mode.
-      result->iterations = rounds_executed;
-      result->intermediateSteps = 0;
-      result->nonlinearVariables = cbs_result.variablesRelinearized;
-      result->linearVariables = cbs_result.variablesReeliminated;
-      result->error = cbs_result.errorAfter ? *cbs_result.errorAfter : 0.0;
-
-      // Intuition: refresh smart-factor slot cache only when this update inserted factors.
-      if (!new_factors.empty()) {
-        cbs_last_update_result_ = cbs_result;
-        cbs_has_last_update_result_ = true;
+      if (priors_added == 0u) {
+        LOG(ERROR) << "CBS recovery could not add any stabilizing priors.";
+        return false;
       }
-    } catch (const std::exception& e) {
-      LOG(ERROR) << "CBS BPSAM update failed: " << e.what();
-      return false;
-    } catch (...) {
-      LOG(ERROR) << "CBS BPSAM update failed with unknown exception.";
-      return false;
+
+      try {
+        LOG(ERROR) << "Attempting CBS recovery update with " << priors_added
+                   << " stabilizing priors (priors-only).";
+        cbs::BPSAM::UpdateParams recovery_params;
+        gtsam::ISAM2Result recovery_result = cbs_optimizer_->update(
+            recovery_priors, gtsam::Values(), recovery_params);
+        result->iterations = 1;
+        result->intermediateSteps = 0;
+        result->nonlinearVariables = recovery_result.variablesRelinearized;
+        result->linearVariables = recovery_result.variablesReeliminated;
+        result->error =
+            recovery_result.errorAfter ? *recovery_result.errorAfter : 0.0;
+        cbs_last_update_result_ = recovery_result;
+        cbs_has_last_update_result_ = true;
+        LOG(ERROR) << "CBS recovery update succeeded.";
+        return true;
+      } catch (const std::exception& recovery_e) {
+        LOG(ERROR) << "CBS recovery update failed: " << recovery_e.what();
+        try {
+          LOG(ERROR)
+              << "Retrying CBS recovery with stabilizing priors + new values.";
+          cbs::BPSAM::UpdateParams recovery_params;
+          const gtsam::ISAM2Result recovery_result =
+              cbs_optimizer_->update(recovery_priors, new_values, recovery_params);
+          result->iterations = 1;
+          result->intermediateSteps = 0;
+          result->nonlinearVariables = recovery_result.variablesRelinearized;
+          result->linearVariables = recovery_result.variablesReeliminated;
+          result->error =
+              recovery_result.errorAfter ? *recovery_result.errorAfter : 0.0;
+          cbs_last_update_result_ = recovery_result;
+          cbs_has_last_update_result_ = true;
+          LOG(ERROR) << "CBS priors-only recovery update succeeded.";
+          return true;
+        } catch (const std::exception& priors_only_e) {
+          LOG(ERROR) << "CBS priors-only recovery failed: " << priors_only_e.what();
+          return false;
+        }
+      } catch (...) {
+        LOG(ERROR) << "CBS recovery update failed with unknown exception.";
+        return false;
+      }
+    };
+
+    const auto run_cbs_update_epoch =
+        [&](const bool enable_remove_factor_indices,
+            bool* should_retry_without_remove) -> bool {
+          CHECK_NOTNULL(should_retry_without_remove);
+          *should_retry_without_remove = false;
+
+          try {
+            // zy Step 40f
+            // Run CBS pose-sharing inner rounds per epoch:
+            // round 0 uses incoming factors/values, later rounds run
+            // belief-only updates.
+            const int max_pose_rounds =
+                std::max(1, FLAGS_cbs_pose_rounds_per_epoch);
+            const double abs_eps =
+                std::max(0.0, FLAGS_cbs_pose_convergence_abs_residual);
+            const double rel_eps =
+                std::max(0.0, FLAGS_cbs_pose_convergence_rel_residual);
+            auto compute_cbs_residual = [&]() -> std::optional<double> {
+              try {
+                const auto estimate = cbs_optimizer_->calculateEstimate();
+                return cbs_optimizer_->getFactorsUnsafe().error(estimate);
+              } catch (...) {
+                return std::nullopt;
+              }
+            };
+            struct ActiveStateCounts {
+              size_t x = 0u;
+              size_t v = 0u;
+              size_t b = 0u;
+            };
+            const auto count_active_state_keys = [&]() {
+              ActiveStateCounts counts;
+              const auto& variable_index = cbs_optimizer_->getVariableIndex();
+              for (const auto& key_and_slots : variable_index) {
+                const gtsam::Symbol key_symbol(key_and_slots.first);
+                if (key_symbol.chr() == kPoseSymbolChar) {
+                  ++counts.x;
+                } else if (key_symbol.chr() == kVelocitySymbolChar) {
+                  ++counts.v;
+                } else if (key_symbol.chr() == kImuBiasSymbolChar) {
+                  ++counts.b;
+                }
+              }
+              return counts;
+            };
+
+            const cbs::BPSAM::UpdateParams cbs_first_update_params =
+                build_cbs_first_update_params(enable_remove_factor_indices);
+            const size_t removed_factor_indices_applied =
+                cbs_first_update_params.removeFactorIndices.size();
+            const ActiveStateCounts active_pre = count_active_state_keys();
+            gtsam::ISAM2Result cbs_result = cbs_optimizer_->update(
+                cbs_update_factors, new_values, cbs_first_update_params);
+            // Only the first round may delete factor slots; belief-only rounds
+            // must not re-apply the same removals.
+            cbs::BPSAM::UpdateParams cbs_inner_round_params;
+            int rounds_executed = 1;
+            std::optional<double> prev_residual = compute_cbs_residual();
+
+            for (int round = 1; round < max_pose_rounds; ++round) {
+              cbs_result = cbs_optimizer_->update(gtsam::NonlinearFactorGraph(),
+                                                  gtsam::Values(),
+                                                  cbs_inner_round_params);
+              ++rounds_executed;
+
+              const std::optional<double> curr_residual = compute_cbs_residual();
+              if (curr_residual && prev_residual) {
+                const double abs_change =
+                    std::fabs(*curr_residual - *prev_residual);
+                const double rel_change =
+                    abs_change / std::max(std::fabs(*prev_residual), 1e-12);
+                if (abs_change <= abs_eps || rel_change <= rel_eps) {
+                  VLOG(2) << "CBS pose rounds converged early at round "
+                          << rounds_executed << "/" << max_pose_rounds
+                          << " (abs=" << abs_change << ", rel=" << rel_change
+                          << ")";
+                  break;
+                }
+              }
+
+              if (curr_residual) {
+                prev_residual = curr_residual;
+              }
+            }
+
+            // Intuition: keep FixedLagSmoother API contract by populating a
+            // compatible summary result in CBS mode.
+            result->iterations = rounds_executed;
+            result->intermediateSteps = 0;
+            result->nonlinearVariables = cbs_result.variablesRelinearized;
+            result->linearVariables = cbs_result.variablesReeliminated;
+            result->error = cbs_result.errorAfter ? *cbs_result.errorAfter : 0.0;
+
+            // Intuition: refresh smart-factor slot cache only when this update
+            // inserted factors.
+            if (!cbs_update_factors.empty()) {
+              cbs_last_update_result_ = cbs_result;
+              cbs_has_last_update_result_ = true;
+            }
+            const ActiveStateCounts active_post = count_active_state_keys();
+            std::cerr
+                << std::setprecision(12)
+                << "[CBS][HeartEpochDiag] curr_kf_id=" << curr_kf_id_
+                << " remove_factor_indices_applied="
+                << removed_factor_indices_applied
+                << " remove_factor_indices_enabled="
+                << (enable_remove_factor_indices ? 1 : 0)
+                << " rounds_executed=" << rounds_executed
+                << " new_factors_count=" << cbs_update_factors.size()
+                << " new_values_count=" << new_values.size()
+                << " active_x_pre=" << active_pre.x
+                << " active_v_pre=" << active_pre.v
+                << " active_b_pre=" << active_pre.b
+                << " active_x_post=" << active_post.x
+                << " active_v_post=" << active_post.v
+                << " active_b_post=" << active_post.b
+                << " fixed_lag_states=" << backend_params_.nr_states_
+                << " cbs_heart_active=" << (useCbsOptimizerHeart() ? 1 : 0)
+                << " use_cbs_optimizer=" << (FLAGS_use_cbs_optimizer ? 1 : 0)
+                << " cbs_replace_fixed_lag_optimizer="
+                << (FLAGS_cbs_replace_fixed_lag_optimizer ? 1 : 0)
+                << std::endl;
+            return true;
+          } catch (const gtsam::IndeterminantLinearSystemException& e) {
+            const gtsam::Symbol failed_symbol(e.nearbyVariable());
+            std::ostringstream reason;
+            reason << e.what() << " failed_symbol=" << failed_symbol.chr()
+                   << failed_symbol.index();
+            LOG(ERROR) << "CBS BPSAM indeterminant system: " << reason.str();
+            return attempt_cbs_recovery(failed_symbol.index(), reason.str());
+          } catch (const std::exception& e) {
+            const std::string err_msg =
+                e.what() ? std::string(e.what()) : std::string();
+            const bool has_map_at = err_msg.find("map::at") != std::string::npos;
+            const bool recoverable_signature =
+                err_msg.find("IndeterminantLinearSystemException") !=
+                    std::string::npos ||
+                err_msg.find("invalid noise model") != std::string::npos ||
+                err_msg.find("nearbyVariable is not a robot key") !=
+                    std::string::npos ||
+                has_map_at;
+
+            if (has_map_at && enable_remove_factor_indices) {
+              LOG(ERROR) << "CBS-heart update hit map::at while applying "
+                            "removeFactorIndices. Retrying this epoch without "
+                            "removeFactorIndices.";
+              *should_retry_without_remove = true;
+              return false;
+            }
+
+            if (recoverable_signature) {
+              LOG(ERROR) << "CBS BPSAM update failed with recoverable signature: "
+                         << err_msg;
+              if (attempt_cbs_recovery(std::nullopt, err_msg)) {
+                return true;
+              }
+            }
+            LOG(ERROR) << "CBS BPSAM update failed: " << err_msg;
+            return false;
+          } catch (...) {
+            LOG(ERROR) << "CBS BPSAM update failed with unknown exception.";
+            return false;
+          }
+        };
+
+    bool retry_without_remove = false;
+    if (run_cbs_update_epoch(/*enable_remove_factor_indices=*/true,
+                             &retry_without_remove)) {
+      return true;
     }
 
+    if (retry_without_remove) {
+      bool ignored_retry_flag = false;
+      if (run_cbs_update_epoch(/*enable_remove_factor_indices=*/false,
+                               &ignored_retry_flag)) {
+        return true;
+      }
+    }
 
-
-    return true;
+    return false;
   }
 #endif
 

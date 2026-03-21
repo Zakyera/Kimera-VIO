@@ -46,6 +46,7 @@
 
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <unordered_map>
 // zy Step 2_a
@@ -399,6 +400,37 @@ class VioBackend {
           gtsam::FixedLagSmoother::KeyTimestampMap(),
       const gtsam::FactorIndices& delete_slots = gtsam::FactorIndices());
 
+  // Returns true when pose key is active in the currently selected optimizer
+  // heart (CBS-heart or legacy fixed-lag).
+  bool isPoseKeyActiveInOptimizer(const gtsam::Symbol& pose_symbol) const;
+
+  // Returns true only when CBS receiver-local state is queryable for normal
+  // belief merge (key exists and LOCAL marginal covariance is available).
+  bool isReceiverLocalBeliefReadyForCbs(
+      const gtsam::Symbol& pose_symbol) const;
+
+  // Prune timestamp->frame map so only active-key targets remain.
+  void pruneTimestampToKeyframeMap(const bool cbs_heart_active,
+                                   const FrameId& oldest_active_frame_id_by_lag,
+                                   size_t* num_timestamp_map_pruned,
+                                   Timestamp* oldest_active_pose_timestamp,
+                                   Timestamp* newest_active_pose_timestamp);
+
+  FrameId computeCbsOldestActiveFrame(const FrameId& newest_frame_id) const;
+
+#ifdef KIMERA_USE_CBS
+  struct CbsFixedLagWindowState {
+    FrameId newest_frame_id = 0;
+    FrameId oldest_active_frame_id = 0;
+    gtsam::FactorIndices remove_factor_indices;
+    size_t stale_state_keys = 0;
+    size_t stale_pose_keys = 0;
+  };
+
+  CbsFixedLagWindowState buildCbsFixedLagWindowState(
+      const std::map<Key, double>& timestamps) const;
+#endif
+
   void cleanCheiralityLmk(
       const gtsam::Symbol& lmk_symbol,
       gtsam::NonlinearFactorGraph* new_factors_tmp_cheirality,
@@ -578,6 +610,10 @@ class VioBackend {
   // zy step 18a cache last CBS iSAM2-style update indices so smart-factor slot bookkeeping can follow CBS slots.
   gtsam::ISAM2Result cbs_last_update_result_;
   bool cbs_has_last_update_result_ = false;
+  // Last lag-boundary frame that received a stabilizing anchor prior in
+  // CBS-heart mode.
+  FrameId cbs_last_window_anchor_frame_id_ =
+      std::numeric_limits<FrameId>::max();
 
   #endif
 
@@ -610,6 +646,11 @@ class VioBackend {
   mutable std::mutex external_pose_priors_queue_mutex_;
   std::deque<ExternalPosePrior> external_pose_priors_queue_;
   size_t max_external_pose_priors_queue_size_ = 1000;
+
+  // Diagnostic-only per-source receiver_world<-sender_world mean alignment
+  // used before CBS addBeliefs().
+  mutable std::mutex external_mean_alignment_mutex_;
+  std::map<std::string, gtsam::Pose3> external_mean_alignment_by_source_;
 
   // zy Step 3_b
   // this map lets us match incoming belief timestamps to Kimera frame IDs, including old poses.
