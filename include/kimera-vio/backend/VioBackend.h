@@ -49,6 +49,7 @@
 #include <limits>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 // zy Step 2_a
 #include <deque>
 #include <mutex>
@@ -398,7 +399,11 @@ class VioBackend {
       const gtsam::Values& new_values = gtsam::Values(),
       const std::map<Key, double>& timestamps =
           gtsam::FixedLagSmoother::KeyTimestampMap(),
-      const gtsam::FactorIndices& delete_slots = gtsam::FactorIndices());
+      const gtsam::FactorIndices& delete_slots = gtsam::FactorIndices(),
+      const bool cbs_allow_heavy_maintenance = true,
+      const size_t cbs_smart_factor_replacements = 0u,
+      const size_t cbs_smart_factor_new_insertions = 0u,
+      const size_t cbs_other_new_factor_count = 0u);
 
   // Returns true when pose key is active in the currently selected optimizer
   // heart (CBS-heart or legacy fixed-lag).
@@ -422,13 +427,19 @@ class VioBackend {
   struct CbsFixedLagWindowState {
     FrameId newest_frame_id = 0;
     FrameId oldest_active_frame_id = 0;
+    FrameId prev_oldest_active_frame_id = 0;
+    FrameId eviction_start_frame_id = 0;
+    FrameId eviction_end_frame_id = 0;  // exclusive
+    bool eviction_incremental = false;
+    bool eviction_full_rescan = true;
+    size_t eviction_frames = 0;
     gtsam::FactorIndices remove_factor_indices;
     size_t stale_state_keys = 0;
     size_t stale_pose_keys = 0;
   };
 
   CbsFixedLagWindowState buildCbsFixedLagWindowState(
-      const std::map<Key, double>& timestamps) const;
+      const std::map<Key, double>& timestamps);
 #endif
 
   void cleanCheiralityLmk(
@@ -605,7 +616,7 @@ class VioBackend {
   std::unique_ptr<Smoother> smoother_;
 
   // zy Step 10d
-  #ifdef KIMERA_USE_CBS
+#ifdef KIMERA_USE_CBS
   std::shared_ptr<cbs::BPSAM> cbs_optimizer_;
   // zy step 18a cache last CBS iSAM2-style update indices so smart-factor slot bookkeeping can follow CBS slots.
   gtsam::ISAM2Result cbs_last_update_result_;
@@ -614,6 +625,17 @@ class VioBackend {
   // CBS-heart mode.
   FrameId cbs_last_window_anchor_frame_id_ =
       std::numeric_limits<FrameId>::max();
+
+  // Snapshot of external-fusion effect counters from the latest optimize()
+  // epoch, used to drive no-fusion fast paths in outgoing belief publication.
+  mutable std::mutex cbs_external_effect_state_mutex_;
+  bool cbs_last_epoch_no_external_effect_ = false;
+  size_t cbs_last_epoch_beliefs_accepted_ = 0u;
+  size_t cbs_last_epoch_priors_injected_ = 0u;
+  Timestamp cbs_last_epoch_timestamp_ns_ = -1;
+  bool cbs_has_prev_oldest_active_frame_id_ = false;
+  FrameId cbs_prev_oldest_active_frame_id_ = 0;
+  std::unordered_set<gtsam::FactorIndex> cbs_prev_epoch_remove_factor_indices_;
 
   #endif
 
@@ -641,6 +663,11 @@ class VioBackend {
   gtsam::SharedNoiseModel noise_model_;
   std::string source_ = "unknown";
   uint64_t source_seq_ = 0;
+  // Earliest backend timestamp when this prior should be reprocessed.
+  // Used to avoid expensive rework of deferred candidates every epoch.
+  Timestamp next_eligible_timestamp_ns_ = std::numeric_limits<Timestamp>::lowest();
+  // Exponential backoff state for deferred priors.
+  Timestamp retry_backoff_ns_ = 0;
   };
 
   mutable std::mutex external_pose_priors_queue_mutex_;
@@ -651,6 +678,12 @@ class VioBackend {
   // used before CBS addBeliefs().
   mutable std::mutex external_mean_alignment_mutex_;
   std::map<std::string, gtsam::Pose3> external_mean_alignment_by_source_;
+
+  // Per-source rejection backoff in CBS-heart mode to avoid repeatedly
+  // re-evaluating clearly inconsistent external streams every epoch.
+  mutable std::mutex external_source_backoff_mutex_;
+  std::map<std::string, Timestamp> external_source_retry_after_ns_;
+  std::map<std::string, Timestamp> external_source_retry_backoff_ns_;
 
   // zy Step 3_b
   // this map lets us match incoming belief timestamps to Kimera frame IDs, including old poses.
