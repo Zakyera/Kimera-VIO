@@ -375,6 +375,12 @@ class VioBackend {
  private:
   bool addVisualInertialStateAndOptimize(const BackendInput& input);
 
+  // Cheap outgoing publish gate evaluated before expensive covariance query.
+  bool shouldPublishOutgoingExternalPoseBelief(std::string* gate_reason) const;
+  // Update last-published outgoing belief bookkeeping after successful publish.
+  void noteOutgoingExternalPoseBeliefPublished(
+      const ExternalPoseBelief& belief);
+
   // Add initial prior factors.
   void addInitialPriorFactors(const FrameId& frame_id);
 
@@ -403,6 +409,24 @@ class VioBackend {
       const bool cbs_allow_heavy_maintenance = true,
       const size_t cbs_smart_factor_replacements = 0u,
       const size_t cbs_smart_factor_new_insertions = 0u,
+      const size_t cbs_delete_slots_total = 0u,
+      const size_t cbs_delete_slots_from_smart_replacement = 0u,
+      const size_t cbs_delete_slots_from_cheirality_cleanup = 0u,
+      const size_t cbs_delete_slots_from_other_cleanup = 0u,
+      const size_t cbs_smart_replacement_same_support_count = 0u,
+      const size_t cbs_smart_replacement_same_pose_key_set_count = 0u,
+      const size_t cbs_smart_replacement_small_support_delta_count = 0u,
+      const size_t cbs_smart_replacement_large_support_delta_count = 0u,
+      const size_t cbs_smart_replacement_due_to_material_support_change = 0u,
+      const size_t cbs_smart_replacement_due_to_pose_key_set_change = 0u,
+      const size_t cbs_smart_replacement_due_to_invalid_to_valid_transition = 0u,
+      const size_t cbs_smart_replacement_due_to_valid_to_invalid_transition = 0u,
+      const size_t cbs_smart_replacement_due_to_degenerate_factor = 0u,
+      const size_t cbs_smart_replacement_due_to_correctness_threshold = 0u,
+      const size_t cbs_smart_replacement_skipped_small_change = 0u,
+      const size_t cbs_smart_replacement_skipped_keep_existing = 0u,
+      const size_t cbs_landmarks_touched_for_replacement = 0u,
+      const size_t cbs_landmarks_touched_for_new_insertion = 0u,
       const size_t cbs_other_new_factor_count = 0u);
 
   // Returns true when pose key is active in the currently selected optimizer
@@ -440,6 +464,184 @@ class VioBackend {
 
   CbsFixedLagWindowState buildCbsFixedLagWindowState(
       const std::map<Key, double>& timestamps);
+
+  // H2.2 sidecar packet built from the same per-epoch local update packet that
+  // the fixed-lag heart receives (external-prior factors excluded by
+  // construction).
+  struct H2LocalCovSidecarPacket {
+    gtsam::NonlinearFactorGraph local_factors;
+    gtsam::Values local_values;
+    gtsam::FactorIndices sidecar_remove_factor_indices;
+    // Position in heart new_factors packet for each local_factors entry.
+    std::vector<size_t> heart_new_factor_positions;
+    // Heart factor slots that were translated into sidecar_remove_factor_indices.
+    gtsam::FactorIndices mapped_heart_remove_factor_slots;
+    size_t filtered_external_factor_count = 0u;
+    size_t smart_factor_replacements = 0u;
+    size_t unmapped_remove_slot_count = 0u;
+    size_t pose_values_count = 0u;
+    size_t vel_values_count = 0u;
+    size_t bias_values_count = 0u;
+    gtsam::FactorIndex first_unmapped_heart_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_unmapped_sidecar_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+  };
+
+  struct H2LocalCovSidecarSyncStats {
+    double update_ms = 0.0;
+    double snapshot_refresh_ms = 0.0;
+    size_t local_factor_count = 0u;
+    size_t filtered_external_factor_count = 0u;
+    size_t remove_count = 0u;
+    size_t values_add_count = 0u;
+    size_t hard_reset_count = 0u;
+    size_t smart_factor_replacements = 0u;
+    size_t value_type_mismatch_count = 0u;
+    size_t missing_value_count = 0u;
+    size_t unsupported_key_type_count = 0u;
+    size_t unmapped_remove_slot_count = 0u;
+    size_t post_prune_remove_count = 0u;
+    size_t packet_pose_values_count = 0u;
+    size_t packet_vel_values_count = 0u;
+    size_t packet_bias_values_count = 0u;
+    size_t packet_remove_count = 0u;
+    size_t packet_mapped_heart_remove_slots_count = 0u;
+    size_t packet_heart_new_factor_positions_count = 0u;
+    size_t sidecar_slot_map_size_before_update = 0u;
+    size_t sidecar_graph_size_before_update = 0u;
+    size_t translated_remove_count = 0u;
+    size_t filtered_stale_remove_count = 0u;
+    size_t sidecar_new_factor_indices_count = 0u;
+    bool h2_repair_epoch_detected = false;
+    size_t h2_repair_epoch_original_new_index_count = 0u;
+    bool h2_replay_add_only_attempted = false;
+    bool h2_replay_add_only_succeeded = false;
+    size_t h2_replay_add_only_new_index_count = 0u;
+    std::string h2_replay_add_only_failure_reason;
+    bool h2_replay_subset_probe_attempted = false;
+    bool h2_replay_subset_probe_clone_available = false;
+    std::string h2_replay_subset_probe_clone_setup_reason;
+    size_t h2_replay_subset_smart_count = 0u;
+    size_t h2_replay_subset_non_smart_count = 0u;
+    size_t h2_replay_subset_imu_count = 0u;
+    size_t h2_replay_subset_between_count = 0u;
+    bool h2_replay_subset_empty_succeeded = false;
+    bool h2_replay_subset_non_smart_succeeded = false;
+    bool h2_replay_subset_smart_succeeded = false;
+    bool h2_replay_subset_imu_only_succeeded = false;
+    bool h2_replay_subset_between_only_succeeded = false;
+    bool h2_replay_subset_full_probe_succeeded = false;
+    std::string h2_replay_subset_empty_reason;
+    std::string h2_replay_subset_non_smart_reason;
+    std::string h2_replay_subset_smart_reason;
+    std::string h2_replay_subset_imu_only_reason;
+    std::string h2_replay_subset_between_only_reason;
+    std::string h2_replay_subset_full_probe_reason;
+    bool h2_replay_probe_bootstrap_empty_succeeded = false;
+    bool h2_replay_probe_bootstrap_non_smart_succeeded = false;
+    bool h2_replay_probe_bootstrap_smart_succeeded = false;
+    bool h2_replay_probe_bootstrap_imu_only_succeeded = false;
+    bool h2_replay_probe_bootstrap_between_only_succeeded = false;
+    bool h2_replay_probe_bootstrap_full_succeeded = false;
+    bool h2_replay_probe_update_empty_succeeded = false;
+    bool h2_replay_probe_update_non_smart_succeeded = false;
+    bool h2_replay_probe_update_smart_succeeded = false;
+    bool h2_replay_probe_update_imu_only_succeeded = false;
+    bool h2_replay_probe_update_between_only_succeeded = false;
+    bool h2_replay_probe_update_full_succeeded = false;
+    std::string h2_replay_probe_bootstrap_empty_reason;
+    std::string h2_replay_probe_bootstrap_non_smart_reason;
+    std::string h2_replay_probe_bootstrap_smart_reason;
+    std::string h2_replay_probe_bootstrap_imu_only_reason;
+    std::string h2_replay_probe_bootstrap_between_only_reason;
+    std::string h2_replay_probe_bootstrap_full_reason;
+    std::string h2_replay_probe_update_empty_reason;
+    std::string h2_replay_probe_update_non_smart_reason;
+    std::string h2_replay_probe_update_smart_reason;
+    std::string h2_replay_probe_update_imu_only_reason;
+    std::string h2_replay_probe_update_between_only_reason;
+    std::string h2_replay_probe_update_full_reason;
+    bool h2_partial_replay_non_smart_only_applied = false;
+    std::string h2_partial_replay_reason;
+    size_t remap_existing_heart_slot_conflict_count = 0u;
+    size_t post_prune_candidate_count = 0u;
+    size_t post_prune_filtered_stale_count = 0u;
+    size_t stale_slot_map_entries_removed_pre_update = 0u;
+    size_t stale_slot_map_entries_removed_during_translation = 0u;
+    size_t stale_slot_map_entries_removed_during_remap = 0u;
+    bool primary_remove_attempted = false;
+    bool primary_remove_deferred_due_to_stale_map = false;
+    bool primary_retry_attempted = false;
+    bool primary_retry_succeeded = false;
+    bool retry_without_remove_factor_indices = false;
+    bool post_prune_retry_with_filtered_slots = false;
+    bool post_prune_threw_map_at = false;
+    bool post_prune_skipped_deferred = false;
+    gtsam::FactorIndex first_unmapped_heart_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_unmapped_sidecar_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_translated_sidecar_remove_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_post_prune_sidecar_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_conflicting_heart_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_conflicting_old_sidecar_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_conflicting_new_sidecar_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_removed_stale_heart_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    gtsam::FactorIndex first_removed_stale_sidecar_slot =
+        std::numeric_limits<gtsam::FactorIndex>::max();
+    std::string sample_remove_indices;
+    std::string sample_heart_new_factor_positions;
+    std::string sample_heart_new_factor_indices;
+    std::string sample_sidecar_new_factor_indices;
+    size_t required_local_key_count = 0u;
+    size_t required_packet_key_count = 0u;
+    bool packet_local_values_exact_required = false;
+    size_t packet_missing_required_local_values_count = 0u;
+    size_t packet_extra_local_values_count = 0u;
+    std::string packet_local_value_keys;
+    std::string packet_missing_required_local_value_keys;
+    std::string packet_extra_local_value_keys;
+    std::string first_failure_key;
+    std::string first_failure_reason;
+    std::string failure_reason;
+  };
+
+  bool refreshH2LocalCovarianceSidecar(
+      const H2LocalCovSidecarPacket& packet,
+      const gtsam::FactorIndices& heart_new_factor_indices,
+      const FrameId& curr_kf_id,
+      H2LocalCovSidecarSyncStats* stats);
+
+  // Supervisor-aligned H2 path: maintain an incremental LOCAL-only side graph
+  // with the same fixed-lag lifecycle as the main smoother.
+  bool refreshH2LocalCovarianceIncrementalSmootherSidecar(
+      const H2LocalCovSidecarPacket& packet,
+      const gtsam::FactorIndices& heart_new_factor_indices,
+      const gtsam::FactorIndices& heart_delete_slots,
+      const FrameId& curr_kf_id,
+      H2LocalCovSidecarSyncStats* stats);
+
+  // Passive H2 mode: keep latest LOCAL-only graph snapshot and query
+  // covariance directly from it.
+  bool refreshH2LocalCovariancePassiveSnapshot(
+      const H2LocalCovSidecarPacket& packet,
+      const FrameId& curr_kf_id,
+      H2LocalCovSidecarSyncStats* stats);
+
+  // Query LOCAL-only covariance from the H2 passive snapshot graph.
+  bool queryH2LocalPoseCovFromActiveSmoother(
+      const gtsam::Symbol& pose_symbol,
+      gtsam::Pose3* pose_out,
+      gtsam::Matrix66* cov_out,
+      std::string* reason_out,
+      std::string* source_path_out = nullptr) const;
 #endif
 
   void cleanCheiralityLmk(
@@ -618,6 +820,25 @@ class VioBackend {
   // zy Step 10d
 #ifdef KIMERA_USE_CBS
   std::shared_ptr<cbs::BPSAM> cbs_optimizer_;
+  // H2.2 sidecar for LOCAL-only covariance extraction when fixed-lag remains
+  // the optimizer heart.
+  std::shared_ptr<cbs::BPSAM> cbs_local_cov_sidecar_;
+  // Incremental local-only side smoother (same smoother family/lifecycle as
+  // the main graph). This is the default H2 execution path.
+  std::unique_ptr<Smoother> cbs_local_cov_smoother_sidecar_;
+  // Heart-slot -> local-side-smoother-slot translation for delete/remove.
+  std::unordered_map<gtsam::FactorIndex, gtsam::FactorIndex>
+      cbs_h2_local_smoother_heart_to_sidecar_slot_map_;
+  // Explicit sidecar bookkeeping: map heart local-factor slots to sidecar local
+  // slots so remove/delete operations can be translated without graph rebuild.
+  std::unordered_map<gtsam::FactorIndex, gtsam::FactorIndex>
+      cbs_h2_sidecar_heart_to_sidecar_slot_map_;
+  // H2 passive LOCAL-only side snapshot used for covariance extraction.
+  gtsam::NonlinearFactorGraph h2_local_graph_snapshot_;
+  gtsam::Values h2_local_values_snapshot_;
+  Timestamp h2_local_snapshot_timestamp_ns_ = -1;
+  FrameId h2_local_snapshot_frame_id_ = 0;
+  bool h2_local_snapshot_valid_ = false;
   // zy step 18a cache last CBS iSAM2-style update indices so smart-factor slot bookkeeping can follow CBS slots.
   gtsam::ISAM2Result cbs_last_update_result_;
   bool cbs_has_last_update_result_ = false;
@@ -636,6 +857,35 @@ class VioBackend {
   bool cbs_has_prev_oldest_active_frame_id_ = false;
   FrameId cbs_prev_oldest_active_frame_id_ = 0;
   std::unordered_set<gtsam::FactorIndex> cbs_prev_epoch_remove_factor_indices_;
+  // Pointer identity set of factors originating from external-prior injection.
+  // Retained for diagnostics/debugging only; H2.2 sidecar sync excludes
+  // externals by construction via per-epoch packet composition.
+  std::unordered_set<const gtsam::NonlinearFactor*>
+      cbs_external_prior_factor_ptrs_;
+  // H2.1 diagnostics/state.
+  bool cbs_h2_sidecar_sync_ok_ = false;
+  size_t cbs_h2_sidecar_desync_streak_ = 0u;
+  mutable size_t cbs_h2_sidecar_fallback_cov_epochs_ = 0u;
+  size_t cbs_h2_sidecar_hard_reset_count_ = 0u;
+  double cbs_h2_sidecar_update_ms_last_epoch_ = 0.0;
+  double cbs_h2_local_snapshot_refresh_ms_last_epoch_ = 0.0;
+  size_t cbs_h2_sidecar_local_factor_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_filtered_external_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_remove_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_values_add_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_smart_factor_replacements_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_value_type_mismatch_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_missing_value_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_unsupported_key_type_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_unmapped_remove_slot_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_post_prune_remove_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_packet_pose_values_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_packet_vel_values_count_last_epoch_ = 0u;
+  size_t cbs_h2_sidecar_packet_bias_values_count_last_epoch_ = 0u;
+  std::string cbs_h2_sidecar_first_failure_key_last_epoch_;
+  std::string cbs_h2_sidecar_first_failure_reason_last_epoch_;
+  std::string cbs_h2_sidecar_last_failure_reason_;
+  bool cbs_h2_first_bad_epoch_logged_ = false;
 
   #endif
 
@@ -648,6 +898,9 @@ class VioBackend {
   // Factors.
   //!< New factors to be added
   gtsam::NonlinearFactorGraph new_imu_prior_and_other_factors_;
+  // External priors are tracked separately so H2 sidecar packets can mirror
+  // only LOCAL factors by construction.
+  gtsam::NonlinearFactorGraph new_external_prior_factors_;
   //!< landmarkId -> {SmartFactorPtr}
   LandmarkIdSmartFactorMap new_smart_factors_;
   //!< landmarkId -> {SmartFactorPtr, SlotIndex}
@@ -714,6 +967,11 @@ class VioBackend {
   // zy Step 8_b
   // stores the bridge callback function in backend state.
   std::function<void(const ExternalPoseBelief&)> external_pose_belief_callback_;
+  bool cbs_outgoing_external_pose_belief_published_once_ = false;
+  Timestamp cbs_outgoing_external_pose_belief_last_published_timestamp_ns_ = -1;
+  FrameId cbs_outgoing_external_pose_belief_last_published_frame_id_ = -1;
+  gtsam::Pose3 cbs_outgoing_external_pose_belief_last_published_pose_ =
+      gtsam::Pose3();
 
 
   // Debug info.
