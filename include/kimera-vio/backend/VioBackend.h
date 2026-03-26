@@ -834,6 +834,7 @@ class VioBackend {
   std::unordered_map<gtsam::FactorIndex, gtsam::FactorIndex>
       cbs_h2_sidecar_heart_to_sidecar_slot_map_;
   // H2 passive LOCAL-only side snapshot used for covariance extraction.
+  mutable std::mutex h2_local_snapshot_mutex_;
   gtsam::NonlinearFactorGraph h2_local_graph_snapshot_;
   gtsam::Values h2_local_values_snapshot_;
   Timestamp h2_local_snapshot_timestamp_ns_ = -1;

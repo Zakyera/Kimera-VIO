@@ -291,6 +291,27 @@ DEFINE_double(cbs_h2_local_cov_anchor_trans_var,
               1e-1,
               "Translation variance for temporary pose-anchor prior used by "
               "H2 local covariance extraction.");
+DEFINE_bool(cbs_h2_local_cov_anchor_state_vars,
+            true,
+            "If true, add temporary weak priors on velocity and bias states "
+            "during H2 local covariance extraction when anchored pose-only "
+            "marginal is ill-posed.");
+DEFINE_double(cbs_h2_local_cov_anchor_vel_var,
+              1.0,
+              "Velocity variance for temporary weak state priors used by H2 "
+              "local covariance extraction.");
+DEFINE_double(cbs_h2_local_cov_anchor_bias_var,
+              1.0,
+              "Bias variance for temporary weak state priors used by H2 "
+              "local covariance extraction.");
+DEFINE_double(cbs_h2_local_cov_anchor_aux_pose_rot_var,
+              10.0,
+              "Rotation variance for temporary weak priors on non-query pose "
+              "states used by H2 local covariance extraction.");
+DEFINE_double(cbs_h2_local_cov_anchor_aux_pose_trans_var,
+              10.0,
+              "Translation variance for temporary weak priors on non-query "
+              "pose states used by H2 local covariance extraction.");
 DEFINE_int32(cbs_smart_replace_material_support_delta,
              3,
              "Minimum absolute support-size delta required to treat a smart "
@@ -632,7 +653,15 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << (FLAGS_cbs_h2_publish_anchored_local_cov ? "true" : "false")
             << ", anchor_rot_var=" << FLAGS_cbs_h2_local_cov_anchor_rot_var
             << ", anchor_trans_var="
-            << FLAGS_cbs_h2_local_cov_anchor_trans_var;
+            << FLAGS_cbs_h2_local_cov_anchor_trans_var
+            << ", anchor_state_vars="
+            << (FLAGS_cbs_h2_local_cov_anchor_state_vars ? "true" : "false")
+            << ", anchor_vel_var=" << FLAGS_cbs_h2_local_cov_anchor_vel_var
+            << ", anchor_bias_var=" << FLAGS_cbs_h2_local_cov_anchor_bias_var
+            << ", anchor_aux_pose_rot_var="
+            << FLAGS_cbs_h2_local_cov_anchor_aux_pose_rot_var
+            << ", anchor_aux_pose_trans_var="
+            << FLAGS_cbs_h2_local_cov_anchor_aux_pose_trans_var;
   if (useCbsH2LocalCovSidecar()) {
     LOG(INFO) << "H2 local covariance mode = " << cbsH2SidecarModeName();
   }
@@ -1064,11 +1093,14 @@ bool VioBackend::initStateAndSetPriors(
   cbs_local_cov_smoother_sidecar_.reset();
   cbs_h2_local_smoother_heart_to_sidecar_slot_map_.clear();
   cbs_h2_sidecar_heart_to_sidecar_slot_map_.clear();
-  h2_local_graph_snapshot_.resize(0);
-  h2_local_values_snapshot_.clear();
-  h2_local_snapshot_timestamp_ns_ = -1;
-  h2_local_snapshot_frame_id_ = 0;
-  h2_local_snapshot_valid_ = false;
+  {
+    std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+    h2_local_graph_snapshot_.resize(0);
+    h2_local_values_snapshot_.clear();
+    h2_local_snapshot_timestamp_ns_ = -1;
+    h2_local_snapshot_frame_id_ = 0;
+    h2_local_snapshot_valid_ = false;
+  }
   cbs_h2_sidecar_sync_ok_ = false;
   cbs_h2_sidecar_desync_streak_ = 0u;
   cbs_h2_sidecar_fallback_cov_epochs_ = 0u;
@@ -1806,16 +1838,33 @@ bool VioBackend::queryH2LocalPoseCovFromActiveSmoother(
     set_reason("h2_mode_inactive");
     return false;
   }
-  if (!h2_local_snapshot_valid_) {
-    set_reason("h2_local_snapshot_invalid");
-    return false;
-  }
 
   const double anchor_rot_var =
       sanitize_anchor_var(FLAGS_cbs_h2_local_cov_anchor_rot_var, 1e-2);
   const double anchor_trans_var =
       sanitize_anchor_var(FLAGS_cbs_h2_local_cov_anchor_trans_var, 1e-1);
+  const bool use_state_anchor_priors = FLAGS_cbs_h2_local_cov_anchor_state_vars;
+  const double anchor_vel_var =
+      sanitize_anchor_var(FLAGS_cbs_h2_local_cov_anchor_vel_var, 1.0);
+  const double anchor_bias_var =
+      sanitize_anchor_var(FLAGS_cbs_h2_local_cov_anchor_bias_var, 1.0);
+  const double anchor_aux_pose_rot_var = sanitize_anchor_var(
+      FLAGS_cbs_h2_local_cov_anchor_aux_pose_rot_var, 10.0);
+  const double anchor_aux_pose_trans_var = sanitize_anchor_var(
+      FLAGS_cbs_h2_local_cov_anchor_aux_pose_trans_var, 10.0);
   const bool use_anchored_covariance = FLAGS_cbs_h2_publish_anchored_local_cov;
+
+  gtsam::NonlinearFactorGraph local_graph_snapshot;
+  gtsam::Values local_values_snapshot;
+  {
+    std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+    if (!h2_local_snapshot_valid_) {
+      set_reason("h2_local_snapshot_invalid");
+      return false;
+    }
+    local_graph_snapshot = h2_local_graph_snapshot_;
+    local_values_snapshot = h2_local_values_snapshot_;
+  }
 
   const auto finalize_covariance = [&](const gtsam::Matrix& cov,
                                        std::string* finalize_reason) -> bool {
@@ -1847,17 +1896,25 @@ bool VioBackend::queryH2LocalPoseCovFromActiveSmoother(
                                     std::string* query_reason) -> bool {
     CHECK_NOTNULL(query_reason);
     *query_reason = "none";
+    const auto append_reason = [&](const std::string& reason) {
+      if (query_reason->empty() || *query_reason == "none") {
+        *query_reason = reason;
+      } else {
+        *query_reason += "|" + reason;
+      }
+    };
 
     if (use_anchored_covariance) {
+      gtsam::NonlinearFactorGraph anchored_graph = graph;
+      gtsam::Vector6 pose_anchor_var;
+      pose_anchor_var << anchor_rot_var, anchor_rot_var, anchor_rot_var,
+          anchor_trans_var, anchor_trans_var, anchor_trans_var;
+      const auto pose_anchor_noise =
+          gtsam::noiseModel::Diagonal::Variances(pose_anchor_var);
+      anchored_graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+          pose_symbol, anchor_pose, pose_anchor_noise);
+
       try {
-        gtsam::NonlinearFactorGraph anchored_graph = graph;
-        gtsam::Vector6 anchor_var;
-        anchor_var << anchor_rot_var, anchor_rot_var, anchor_rot_var,
-            anchor_trans_var, anchor_trans_var, anchor_trans_var;
-        const auto anchor_noise =
-            gtsam::noiseModel::Diagonal::Variances(anchor_var);
-        anchored_graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
-            pose_symbol, anchor_pose, anchor_noise);
         const gtsam::Marginals anchored_marginals(anchored_graph, values);
         const gtsam::Matrix anchored_cov =
             anchored_marginals.marginalCovariance(pose_symbol);
@@ -1866,11 +1923,68 @@ bool VioBackend::queryH2LocalPoseCovFromActiveSmoother(
           set_source_path(anchored_source_path);
           return true;
         }
-        *query_reason = "anchored_covariance_invalid:" + finalize_reason;
+        append_reason("anchored_covariance_invalid:" + finalize_reason);
       } catch (const std::exception& e) {
-        *query_reason = std::string("anchored_covariance_exception:") + e.what();
+        append_reason(std::string("anchored_covariance_exception:") + e.what());
       } catch (...) {
-        *query_reason = "anchored_covariance_unknown_exception";
+        append_reason("anchored_covariance_unknown_exception");
+      }
+
+      if (use_state_anchor_priors) {
+        try {
+          gtsam::NonlinearFactorGraph anchored_state_graph = anchored_graph;
+          const auto velocity_anchor_noise =
+              gtsam::noiseModel::Diagonal::Variances(
+                  gtsam::Vector3::Constant(anchor_vel_var));
+          gtsam::Vector6 bias_anchor_var;
+          bias_anchor_var.setConstant(anchor_bias_var);
+          const auto bias_anchor_noise =
+              gtsam::noiseModel::Diagonal::Variances(bias_anchor_var);
+          gtsam::Vector6 aux_pose_anchor_var;
+          aux_pose_anchor_var << anchor_aux_pose_rot_var,
+              anchor_aux_pose_rot_var,
+              anchor_aux_pose_rot_var,
+              anchor_aux_pose_trans_var,
+              anchor_aux_pose_trans_var,
+              anchor_aux_pose_trans_var;
+          const auto aux_pose_anchor_noise =
+              gtsam::noiseModel::Diagonal::Variances(aux_pose_anchor_var);
+          for (const gtsam::Key key : values.keys()) {
+            const gtsam::Symbol symbol(key);
+            if (symbol.chr() == kPoseSymbolChar && key != pose_symbol.key()) {
+              anchored_state_graph
+                  .emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+                      key, values.at<gtsam::Pose3>(key), aux_pose_anchor_noise);
+            } else if (symbol.chr() == kVelocitySymbolChar) {
+              anchored_state_graph
+                  .emplace_shared<gtsam::PriorFactor<gtsam::Vector3>>(
+                      key, values.at<gtsam::Vector3>(key), velocity_anchor_noise);
+            } else if (symbol.chr() == kImuBiasSymbolChar) {
+              anchored_state_graph.emplace_shared<
+                  gtsam::PriorFactor<gtsam::imuBias::ConstantBias>>(
+                  key,
+                  values.at<gtsam::imuBias::ConstantBias>(key),
+                  bias_anchor_noise);
+            }
+          }
+
+          const gtsam::Marginals anchored_state_marginals(anchored_state_graph,
+                                                          values);
+          const gtsam::Matrix anchored_state_cov =
+              anchored_state_marginals.marginalCovariance(pose_symbol);
+          std::string finalize_reason;
+          if (finalize_covariance(anchored_state_cov, &finalize_reason)) {
+            set_source_path(
+                "h2_local_snapshot_marginal_with_pose_state_anchor_priors");
+            return true;
+          }
+          append_reason("anchored_state_covariance_invalid:" + finalize_reason);
+        } catch (const std::exception& e) {
+          append_reason(std::string("anchored_state_covariance_exception:") +
+                        e.what());
+        } catch (...) {
+          append_reason("anchored_state_covariance_unknown_exception");
+        }
       }
     }
 
@@ -1882,41 +1996,29 @@ bool VioBackend::queryH2LocalPoseCovFromActiveSmoother(
         set_source_path(raw_source_path);
         return true;
       }
-      if (use_anchored_covariance && *query_reason != "none") {
-        *query_reason += "|raw_covariance_invalid:" + finalize_reason;
-      } else {
-        *query_reason = "raw_covariance_invalid:" + finalize_reason;
-      }
+      append_reason("raw_covariance_invalid:" + finalize_reason);
       return false;
     } catch (const std::exception& e) {
-      if (use_anchored_covariance && *query_reason != "none") {
-        *query_reason += "|raw_covariance_exception:" + std::string(e.what());
-      } else {
-        *query_reason = std::string("raw_covariance_exception:") + e.what();
-      }
+      append_reason(std::string("raw_covariance_exception:") + e.what());
       return false;
     } catch (...) {
-      if (use_anchored_covariance && *query_reason != "none") {
-        *query_reason += "|raw_covariance_unknown_exception";
-      } else {
-        *query_reason = "raw_covariance_unknown_exception";
-      }
+      append_reason("raw_covariance_unknown_exception");
       return false;
     }
   };
 
-  if (h2_local_graph_snapshot_.empty()) {
+  if (local_graph_snapshot.empty()) {
     set_reason("h2_local_snapshot_graph_empty");
     return false;
   }
-  if (!h2_local_values_snapshot_.exists(pose_symbol)) {
+  if (!local_values_snapshot.exists(pose_symbol)) {
     set_reason("missing_h2_local_snapshot_value_for_key:" +
                key_to_string(pose_symbol));
     return false;
   }
 
   try {
-    *pose_out = h2_local_values_snapshot_.at<gtsam::Pose3>(pose_symbol);
+    *pose_out = local_values_snapshot.at<gtsam::Pose3>(pose_symbol);
   } catch (const std::exception& e) {
     set_reason(std::string("h2_local_snapshot_pose_cast_exception:") + e.what());
     return false;
@@ -1926,8 +2028,8 @@ bool VioBackend::queryH2LocalPoseCovFromActiveSmoother(
   }
 
   std::string query_reason;
-  if (query_covariance(h2_local_graph_snapshot_,
-                       h2_local_values_snapshot_,
+  if (query_covariance(local_graph_snapshot,
+                       local_values_snapshot,
                        *pose_out,
                        "h2_local_snapshot_marginal",
                        "h2_local_snapshot_marginal_with_pose_anchor_prior",
@@ -3116,11 +3218,14 @@ bool VioBackend::refreshH2LocalCovariancePassiveSnapshot(
   };
   auto fail_and_reset = [&](const std::string& reason,
                             const std::string& failure_key = std::string()) {
-    h2_local_graph_snapshot_.resize(0);
-    h2_local_values_snapshot_.clear();
-    h2_local_snapshot_timestamp_ns_ = -1;
-    h2_local_snapshot_frame_id_ = 0;
-    h2_local_snapshot_valid_ = false;
+    {
+      std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+      h2_local_graph_snapshot_.resize(0);
+      h2_local_values_snapshot_.clear();
+      h2_local_snapshot_timestamp_ns_ = -1;
+      h2_local_snapshot_frame_id_ = 0;
+      h2_local_snapshot_valid_ = false;
+    }
     ++cbs_h2_sidecar_hard_reset_count_;
     stats->hard_reset_count = cbs_h2_sidecar_hard_reset_count_;
     stats->first_failure_key = failure_key;
@@ -3158,26 +3263,63 @@ bool VioBackend::refreshH2LocalCovariancePassiveSnapshot(
     }
   }
 
-  gtsam::NonlinearFactorGraph cloned_local_graph;
-  cloned_local_graph.reserve(packet.local_factors.size());
+  gtsam::NonlinearFactorGraph local_graph_snapshot;
+  local_graph_snapshot.reserve(packet.local_factors.size());
+  std::unordered_set<gtsam::Key> local_factor_keys;
+  size_t clone_fallback_shared_ptr_count = 0u;
   for (const auto& factor : packet.local_factors) {
     if (!factor) {
       continue;
     }
-    try {
-      cloned_local_graph.push_back(factor->clone());
-    } catch (const std::exception&) {
-      return fail_and_reset("h2_local_snapshot_factor_clone_exception");
-    } catch (...) {
-      return fail_and_reset("h2_local_snapshot_factor_clone_unknown_exception");
+    gtsam::NonlinearFactor::shared_ptr copied_factor;
+    if (const auto smart_factor =
+            boost::dynamic_pointer_cast<SmartStereoFactor>(factor)) {
+      // Smart factors are mutable in Kimera lifecycle; copy-construction keeps
+      // snapshot content frozen for a stable local-only covariance query.
+      copied_factor = boost::static_pointer_cast<gtsam::NonlinearFactor>(
+          boost::make_shared<SmartStereoFactor>(*smart_factor));
+    } else {
+      try {
+        copied_factor = factor->clone();
+      } catch (...) {
+        // Best-effort fallback for factor types without clone support.
+        copied_factor = factor;
+        ++clone_fallback_shared_ptr_count;
+      }
+    }
+    local_graph_snapshot.push_back(copied_factor);
+    for (const gtsam::Key key : copied_factor->keys()) {
+      local_factor_keys.insert(key);
     }
   }
+  if (local_graph_snapshot.empty()) {
+    return fail_and_reset("h2_local_snapshot_no_valid_factors");
+  }
+  if (local_factor_keys.empty()) {
+    return fail_and_reset("h2_local_snapshot_no_factor_keys");
+  }
+  gtsam::Values local_values_snapshot = packet.local_values;
+  for (const gtsam::Key key : packet.local_values.keys()) {
+    if (local_factor_keys.count(key) == 0u) {
+      local_values_snapshot.erase(key);
+    }
+  }
+  if (local_values_snapshot.empty()) {
+    return fail_and_reset("h2_local_snapshot_no_values_for_factor_keys");
+  }
+  if (clone_fallback_shared_ptr_count > 0u) {
+    VLOG(2) << "[CBS][H2SnapshotCloneFallback] shared_ptr_fallback_count="
+            << clone_fallback_shared_ptr_count;
+  }
 
-  h2_local_graph_snapshot_ = std::move(cloned_local_graph);
-  h2_local_values_snapshot_ = packet.local_values;
-  h2_local_snapshot_timestamp_ns_ = timestamp_lkf_;
-  h2_local_snapshot_frame_id_ = curr_kf_id;
-  h2_local_snapshot_valid_ = true;
+  {
+    std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+    h2_local_graph_snapshot_ = std::move(local_graph_snapshot);
+    h2_local_values_snapshot_ = std::move(local_values_snapshot);
+    h2_local_snapshot_timestamp_ns_ = timestamp_lkf_;
+    h2_local_snapshot_frame_id_ = curr_kf_id;
+    h2_local_snapshot_valid_ = true;
+  }
   stats->failure_reason = "none";
   stats->snapshot_refresh_ms =
       elapsedMs(sync_start, std::chrono::steady_clock::now());
@@ -10260,11 +10402,14 @@ bool VioBackend::optimize(
           h2_stats.packet_bias_values_count =
               h2_sidecar_packet.bias_values_count;
           h2_stats.snapshot_refresh_ms = 0.0;
-          h2_local_graph_snapshot_.resize(0);
-          h2_local_values_snapshot_.clear();
-          h2_local_snapshot_timestamp_ns_ = -1;
-          h2_local_snapshot_frame_id_ = 0;
-          h2_local_snapshot_valid_ = false;
+          {
+            std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+            h2_local_graph_snapshot_.resize(0);
+            h2_local_values_snapshot_.clear();
+            h2_local_snapshot_timestamp_ns_ = -1;
+            h2_local_snapshot_frame_id_ = 0;
+            h2_local_snapshot_valid_ = false;
+          }
           ++cbs_h2_sidecar_hard_reset_count_;
           h2_stats.hard_reset_count = cbs_h2_sidecar_hard_reset_count_;
         } else {
@@ -10273,11 +10418,14 @@ bool VioBackend::optimize(
               h2_sidecar_packet.filtered_external_factor_count;
           h2_stats.snapshot_refresh_ms = 0.0;
           h2_stats.hard_reset_count = cbs_h2_sidecar_hard_reset_count_;
-          h2_local_graph_snapshot_.resize(0);
-          h2_local_values_snapshot_.clear();
-          h2_local_snapshot_timestamp_ns_ = -1;
-          h2_local_snapshot_frame_id_ = 0;
-          h2_local_snapshot_valid_ = false;
+          {
+            std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+            h2_local_graph_snapshot_.resize(0);
+            h2_local_values_snapshot_.clear();
+            h2_local_snapshot_timestamp_ns_ = -1;
+            h2_local_snapshot_frame_id_ = 0;
+            h2_local_snapshot_valid_ = false;
+          }
         }
         cbs_h2_sidecar_sync_ok_ = h2_sync_ok;
         cbs_h2_sidecar_update_ms_last_epoch_ = 0.0;
@@ -10698,11 +10846,14 @@ bool VioBackend::optimize(
         cbs_h2_sidecar_first_failure_key_last_epoch_.clear();
         cbs_h2_sidecar_first_failure_reason_last_epoch_.clear();
         cbs_h2_sidecar_last_failure_reason_.clear();
-        h2_local_graph_snapshot_.resize(0);
-        h2_local_values_snapshot_.clear();
-        h2_local_snapshot_timestamp_ns_ = -1;
-        h2_local_snapshot_frame_id_ = 0;
-        h2_local_snapshot_valid_ = false;
+        {
+          std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+          h2_local_graph_snapshot_.resize(0);
+          h2_local_values_snapshot_.clear();
+          h2_local_snapshot_timestamp_ns_ = -1;
+          h2_local_snapshot_frame_id_ = 0;
+          h2_local_snapshot_valid_ = false;
+        }
       }
 #endif
       // ---- zy
