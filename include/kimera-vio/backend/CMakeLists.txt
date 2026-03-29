@@ -1,5 +1,6 @@
 ### Add source code just for IDEs
 target_sources(kimera_vio PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/CbsFixedLagBpsamHeart.h"
   "${CMAKE_CURRENT_LIST_DIR}/RegularVioBackend-definitions.h"
   "${CMAKE_CURRENT_LIST_DIR}/RegularVioBackend.h"
   "${CMAKE_CURRENT_LIST_DIR}/RegularVioBackendParams.h"

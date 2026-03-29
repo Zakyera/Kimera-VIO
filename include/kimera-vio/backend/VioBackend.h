@@ -79,6 +79,7 @@ namespace VIO {
 
 // Forward-declarations
 class VioNavState;
+class CbsFixedLagBpsamHeart;
 
 class VioBackend {
  public:
@@ -460,10 +461,17 @@ class VioBackend {
     gtsam::FactorIndices remove_factor_indices;
     size_t stale_state_keys = 0;
     size_t stale_pose_keys = 0;
+    size_t stale_local_factor_slots = 0;
+    size_t stale_belief_factor_slots = 0;
+    size_t orphan_belief_factor_slots = 0;
+    size_t orphan_robot_keys = 0;
+    size_t orphan_gbp_keys = 0;
   };
 
   CbsFixedLagWindowState buildCbsFixedLagWindowState(
       const std::map<Key, double>& timestamps);
+  void augmentCbsLagWindowWithBeliefOwnershipPruning(
+      CbsFixedLagWindowState* window_state) const;
 
   // H2.2 sidecar packet built from the same per-epoch local update packet that
   // the fixed-lag heart receives (external-prior factors excluded by
@@ -820,6 +828,10 @@ class VioBackend {
   // zy Step 10d
 #ifdef KIMERA_USE_CBS
   std::shared_ptr<cbs::BPSAM> cbs_optimizer_;
+  // Persistent PHASE-2 heart object used only behind the experimental bridge
+  // flag. Avoids fresh-per-epoch reconstruction and enables incremental lag
+  // state maintenance.
+  std::shared_ptr<CbsFixedLagBpsamHeart> cbs_phase2_heart_;
   // H2.2 sidecar for LOCAL-only covariance extraction when fixed-lag remains
   // the optimizer heart.
   std::shared_ptr<cbs::BPSAM> cbs_local_cov_sidecar_;
@@ -858,6 +870,20 @@ class VioBackend {
   bool cbs_has_prev_oldest_active_frame_id_ = false;
   FrameId cbs_prev_oldest_active_frame_id_ = 0;
   std::unordered_set<gtsam::FactorIndex> cbs_prev_epoch_remove_factor_indices_;
+  bool cbs_phase2_has_prev_lag_plan_signature_ = false;
+  size_t cbs_phase2_prev_lag_plan_signature_ = 0u;
+  bool cbs_phase2_has_deferred_first_boundary_remove_ = false;
+  bool cbs_phase2_seen_first_boundary_touch_ = false;
+  bool cbs_phase2_pending_first_post_boundary_epoch_ = false;
+  bool cbs_phase2_deferred_lag_remove_packet_pending_ = false;
+  FrameId cbs_phase2_deferred_lag_remove_packet_source_kf_id_ = 0;
+  gtsam::FactorIndices cbs_phase2_deferred_lag_remove_packet_slots_;
+  bool cbs_phase2_delete_slots_suppression_one_shot_used_ = false;
+  bool cbs_first_bad_epoch_snapshot_logged_ = false;
+  bool cbs_have_last_clean_epoch_snapshot_ = false;
+  std::string cbs_last_clean_epoch_snapshot_;
+  std::string cbs_last_clean_primary_packet_ab_snapshot_;
+  FrameId cbs_last_clean_epoch_kf_id_ = 0;
   // Pointer identity set of factors originating from external-prior injection.
   // Retained for diagnostics/debugging only; H2.2 sidecar sync excludes
   // externals by construction via per-epoch packet composition.

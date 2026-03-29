@@ -55,11 +55,14 @@
 #include <limits>  // for numeric_limits<>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <iterator>
 #include <map>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <utility>  // for make_pair
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <cmath> // zy step 5_c
@@ -70,6 +73,7 @@
 
 
 #include "kimera-vio/common/VioNavState.h"
+#include "kimera-vio/backend/CbsFixedLagBpsamHeart.h"
 #include "kimera-vio/imu-frontend/ImuFrontend-definitions.h"
 #include "kimera-vio/logging/Logger.h"
 #include "kimera-vio/utils/GtsamPrinting.h"
@@ -261,6 +265,57 @@ DEFINE_bool(cbs_use_marginalization_prior_bridge,
             false,
             "If true, use covariance-driven lag-boundary priors and bypass "
             "delete_slots->removeFactorIndices bridging (B1 approximation).");
+DEFINE_bool(cbs_experimental_use_new_heart_summary_prior_bridge,
+            false,
+            "EXPERIMENTAL: if true in CBS-heart mode, use the new "
+            "CbsFixedLagBpsamHeart temporary separator-summary-prior bridge "
+            "instead of legacy B1 lag-boundary anchor priors. Default false "
+            "keeps current stable behavior unchanged.");
+DEFINE_bool(cbs_diag_phase2_build_only_no_inject,
+            false,
+            "If true with phase2 summary bridge enabled, build expanded/local "
+            "summary diagnostics but do not inject emitted summary factors into "
+            "the CBS update graph (diagnostic isolation only).");
+DEFINE_bool(cbs_diag_phase2_skip_lag_plan_commit_consume,
+            false,
+            "If true with phase2 summary bridge enabled, keep phase2 "
+            "planning/build and summary diagnostics active, but skip "
+            "committing/consuming the incremental lag-window remove state in "
+            "the CBS update attempt (diagnostic isolation only).");
+DEFINE_bool(cbs_diag_phase2_suppress_delete_slots_first_post_boundary,
+            false,
+            "If true, suppress delete_slots contribution for exactly the first "
+            "post-boundary-touch epoch in CBS-heart mode (diagnostic "
+            "isolation only).");
+DEFINE_bool(cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch,
+            false,
+            "If true, on the first post-boundary epoch only, skip delete_slots "
+            "contribution to BPSAM update remove indices while keeping phase2 "
+            "planning/build diagnostics active (diagnostic isolation only).");
+DEFINE_string(
+    cbs_diag_phase2_exclude_lag_remove_factor_classes_first_post_boundary_epoch,
+    "",
+    "Comma-separated lag-remove factor classes to exclude on first "
+    "post-boundary epoch only (diagnostic isolation). Supported: imu,between,"
+    "prior,other");
+DEFINE_bool(
+    cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch,
+    false,
+    "If true, on first post-boundary epoch only, suppress all lag-derived "
+    "removeFactorIndices while keeping delete_slots and summary logic "
+    "unchanged (diagnostic isolation).");
+DEFINE_bool(
+    cbs_diag_phase2_protect_deferred_anchor_prior_x0,
+    false,
+    "If true, when replaying deferred lag-remove slots, protect/exclude "
+    "single-key prior on root anchor pose x0 (diagnostic isolation only).");
+DEFINE_string(
+    cbs_diag_phase2_wrapper_remove_packet_label,
+    "full_wrapper_packet",
+    "Diagnostic wrapper remove-packet source isolation. Supported labels: "
+    "full_wrapper_packet, deferred_only, fresh_lag_only, delete_slots_only, "
+    "deferred_plus_fresh, deferred_plus_delete_slots, "
+    "fresh_lag_plus_delete_slots.");
 DEFINE_bool(cbs_b1_refresh_cov_only_on_boundary_change,
             false,
             "If true, refresh B1 LOCAL covariance queries only when lag "
@@ -3178,9 +3233,199 @@ VioBackend::CbsFixedLagWindowState VioBackend::buildCbsFixedLagWindowState(
       lag_remove_slots_set.begin(), lag_remove_slots_set.end());
   std::sort(window_state.remove_factor_indices.begin(),
             window_state.remove_factor_indices.end());
+  window_state.stale_local_factor_slots = lag_remove_slots_set.size();
   cbs_prev_oldest_active_frame_id_ = window_state.oldest_active_frame_id;
   cbs_has_prev_oldest_active_frame_id_ = true;
   return window_state;
+}
+
+/* -------------------------------------------------------------------------- */
+void VioBackend::augmentCbsLagWindowWithBeliefOwnershipPruning(
+    CbsFixedLagWindowState* window_state) const {
+  CHECK_NOTNULL(window_state);
+  window_state->stale_belief_factor_slots = 0u;
+  window_state->orphan_belief_factor_slots = 0u;
+  window_state->orphan_robot_keys = 0u;
+  window_state->orphan_gbp_keys = 0u;
+
+  if (!useCbsOptimizerHeart()) {
+    return;
+  }
+  if (window_state->eviction_end_frame_id <= window_state->eviction_start_frame_id) {
+    return;
+  }
+
+  CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+  const gtsam::NonlinearFactorGraph& active_graph = cbs_optimizer_->getFactorsUnsafe();
+  const auto& variable_index = cbs_optimizer_->getVariableIndex();
+  const cbs::AgentId self_id = cbs_optimizer_->getParams().robot_id;
+
+  const auto is_local_state_key = [](const gtsam::Key key) {
+    const gtsam::Symbol symbol(key);
+    const char key_char = symbol.chr();
+    return key_char == kPoseSymbolChar || key_char == kVelocitySymbolChar ||
+           key_char == kImuBiasSymbolChar;
+  };
+  const auto is_stale_local_key = [&](const gtsam::Key key) {
+    if (!is_local_state_key(key)) {
+      return false;
+    }
+    const FrameId key_frame = static_cast<FrameId>(gtsam::Symbol(key).index());
+    return key_frame >= window_state->eviction_start_frame_id &&
+           key_frame < window_state->eviction_end_frame_id;
+  };
+  const auto is_robot_key = [](const gtsam::Key key) {
+    return cbs::isRobotKey(gtsam::LabeledSymbol(key));
+  };
+  const auto is_belief_factor =
+      [&](const gtsam::NonlinearFactor::shared_ptr& factor) {
+        if (!factor || factor->keys().size() != 2u) {
+          return false;
+        }
+        return cbs::isPoseBeliefFactor(self_id, factor) ||
+               cbs::isAnchorBeliefFactor(factor);
+      };
+
+  std::unordered_set<gtsam::FactorIndex> remove_slots_set(
+      window_state->remove_factor_indices.begin(),
+      window_state->remove_factor_indices.end());
+
+  // Explicitly mark belief factors attached to stale local keys.
+  for (const auto& key_and_slots : variable_index) {
+    const gtsam::Key key = key_and_slots.first;
+    if (!is_stale_local_key(key)) {
+      continue;
+    }
+    for (const gtsam::FactorIndex slot : key_and_slots.second) {
+      if (!active_graph.exists(slot)) {
+        continue;
+      }
+      const auto factor = active_graph.at(slot);
+      if (!is_belief_factor(factor)) {
+        continue;
+      }
+      if (remove_slots_set.insert(slot).second) {
+        ++window_state->stale_belief_factor_slots;
+      }
+    }
+  }
+
+  // Build remaining belief-only connectivity after stale-key removals.
+  std::unordered_set<gtsam::FactorIndex> remaining_belief_slots;
+  std::unordered_map<gtsam::Key, std::vector<gtsam::FactorIndex>>
+      belief_key_to_slots;
+  for (size_t slot = 0u; slot < active_graph.size(); ++slot) {
+    if (remove_slots_set.count(slot) > 0u || !active_graph.exists(slot)) {
+      continue;
+    }
+    const auto factor = active_graph.at(slot);
+    if (!is_belief_factor(factor)) {
+      continue;
+    }
+    remaining_belief_slots.insert(slot);
+    for (const gtsam::Key key : factor->keys()) {
+      belief_key_to_slots[key].push_back(slot);
+    }
+  }
+
+  // Support set: active (non-stale) local pose keys.
+  std::unordered_set<gtsam::Key> support_pose_keys;
+  for (const auto& key_and_slots : variable_index) {
+    (void)key_and_slots;
+    const gtsam::Key key = key_and_slots.first;
+    const gtsam::Symbol symbol(key);
+    if (symbol.chr() != kPoseSymbolChar) {
+      continue;
+    }
+    if (is_stale_local_key(key)) {
+      continue;
+    }
+    if (belief_key_to_slots.count(key) > 0u) {
+      support_pose_keys.insert(key);
+    }
+  }
+
+  std::unordered_set<gtsam::Key> reachable_belief_keys;
+  std::unordered_set<gtsam::FactorIndex> reachable_belief_slots;
+  std::queue<gtsam::Key> bfs_queue;
+  for (const gtsam::Key key : support_pose_keys) {
+    if (reachable_belief_keys.insert(key).second) {
+      bfs_queue.push(key);
+    }
+  }
+  while (!bfs_queue.empty()) {
+    const gtsam::Key key = bfs_queue.front();
+    bfs_queue.pop();
+    const auto key_it = belief_key_to_slots.find(key);
+    if (key_it == belief_key_to_slots.end()) {
+      continue;
+    }
+    for (const gtsam::FactorIndex slot : key_it->second) {
+      if (!reachable_belief_slots.insert(slot).second) {
+        continue;
+      }
+      if (!active_graph.exists(slot)) {
+        continue;
+      }
+      const auto factor = active_graph.at(slot);
+      if (!factor) {
+        continue;
+      }
+      for (const gtsam::Key other_key : factor->keys()) {
+        if (reachable_belief_keys.insert(other_key).second) {
+          bfs_queue.push(other_key);
+        }
+      }
+    }
+  }
+
+  // Prune disconnected belief components (orphan-prune).
+  for (const gtsam::FactorIndex slot : remaining_belief_slots) {
+    if (reachable_belief_slots.count(slot) > 0u) {
+      continue;
+    }
+    if (remove_slots_set.insert(slot).second) {
+      ++window_state->orphan_belief_factor_slots;
+    }
+  }
+
+  // Count orphan belief/robot keys after planned removals.
+  const auto has_remaining_incident_factor = [&](const gtsam::Key key) {
+    const auto key_it = variable_index.find(key);
+    if (key_it == variable_index.end()) {
+      return false;
+    }
+    for (const gtsam::FactorIndex slot : key_it->second) {
+      if (remove_slots_set.count(slot) > 0u || !active_graph.exists(slot)) {
+        continue;
+      }
+      if (active_graph.at(slot)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  for (const auto& key_and_slots : variable_index) {
+    (void)key_and_slots;
+    const gtsam::Key key = key_and_slots.first;
+    if (is_local_state_key(key)) {
+      continue;
+    }
+    if (has_remaining_incident_factor(key)) {
+      continue;
+    }
+    if (is_robot_key(key)) {
+      ++window_state->orphan_robot_keys;
+    } else {
+      ++window_state->orphan_gbp_keys;
+    }
+  }
+
+  window_state->remove_factor_indices.assign(
+      remove_slots_set.begin(), remove_slots_set.end());
+  std::sort(window_state->remove_factor_indices.begin(),
+            window_state->remove_factor_indices.end());
 }
 
 /* -------------------------------------------------------------------------- */
@@ -11325,11 +11570,502 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     size_t cbs_b1_vel_cov_queries = 0u;
     size_t cbs_b1_bias_cov_queries = 0u;
     bool cbs_b1_cov_refresh_this_epoch = false;
+    bool cbs_phase2_summary_attempted = false;
+    bool cbs_phase2_summary_injected = false;
+    bool cbs_phase2_summary_injected_this_epoch = false;
+    bool cbs_phase2_summary_bridge_applied = false;
+    bool cbs_phase2_summary_implemented_this_epoch = false;
+    bool cbs_phase2_summary_injection_required_for_lag_remove = false;
+    bool cbs_phase2_fresh_lag_remove_blocked_due_to_no_summary = false;
+    size_t cbs_phase2_fresh_lag_remove_blocked_count = 0u;
+    size_t cbs_phase2_fresh_lag_remove_applied_count = 0u;
+    bool cbs_phase2_fresh_lag_anchor_prior_protection_fired = false;
+    size_t cbs_phase2_fresh_lag_anchor_prior_blocked_count = 0u;
+    std::string cbs_phase2_fresh_lag_anchor_prior_blocked_slots = "none";
+    size_t cbs_phase2_boundary_candidates = 0u;
+    size_t cbs_phase2_summary_targets = 0u;
+    size_t cbs_phase2_summary_requested_targets = 0u;
+    size_t cbs_phase2_summary_realizable_targets = 0u;
+    size_t cbs_phase2_summary_dropped_targets = 0u;
+    size_t cbs_phase2_summary_crossing_factor_count = 0u;
+    size_t cbs_phase2_summary_factor_count_emitted = 0u;
+    bool cbs_phase2_summary_target_coherence_ok = false;
+    double cbs_phase2_summary_build_ms = 0.0;
+    std::string cbs_phase2_summary_mode = "disabled";
+    std::string cbs_phase2_expanded_summary_mode = "disabled";
+    size_t cbs_phase2_expanded_summary_requested_target_count = 0u;
+    size_t cbs_phase2_expanded_summary_realizable_target_count = 0u;
+    size_t cbs_phase2_expanded_summary_crossing_factor_count = 0u;
+    size_t cbs_phase2_expanded_summary_factor_count_emitted = 0u;
+    double cbs_phase2_expanded_summary_build_ms = 0.0;
+    std::string cbs_phase2_first_expanded_summary_failure_reason = "none";
+    size_t cbs_phase2_expanded_included_local_nonbelief_factor_count = 0u;
+    size_t cbs_phase2_expanded_included_mixed_nonbelief_factor_count = 0u;
+    size_t cbs_phase2_expanded_included_belief_factor_count = 0u;
+    size_t cbs_phase2_expanded_excluded_local_nonbelief_factor_count = 0u;
+    size_t cbs_phase2_expanded_excluded_mixed_nonbelief_factor_count = 0u;
+    size_t cbs_phase2_expanded_excluded_belief_factor_count = 0u;
+    size_t cbs_phase2_expanded_selected_factor_slots_count = 0u;
+    size_t cbs_phase2_expanded_selected_key_count = 0u;
+    size_t cbs_phase2_expanded_eliminated_key_count = 0u;
+    size_t cbs_phase2_expanded_emitted_factor_count = 0u;
+    size_t cbs_phase2_expanded_emitted_factor_key_count = 0u;
+    bool cbs_phase2_expanded_emitted_factor_contains_nonlocal_keys = false;
+    bool cbs_phase2_expanded_emitted_factor_contains_belief_keys = false;
+    bool cbs_phase2_expanded_emitted_factor_references_stale_removed_keys = false;
+    bool cbs_phase2_expanded_emitted_factor_references_orphan_pruned_keys = false;
+    size_t cbs_phase2_expanded_emitted_factor_missing_estimate_keys = 0u;
+    long long cbs_phase2_first_expanded_bad_key = -1;
+    long long cbs_phase2_first_expanded_bad_factor_slot = -1;
+    std::string cbs_phase2_first_expanded_exception_context = "none";
+    std::string cbs_phase2_expanded_veto_reason = "none";
+    size_t cbs_phase2_expanded_veto_count = 0u;
+    std::string cbs_phase2_first_summary_failure_reason = "none";
+    std::string cbs_phase2_first_dropped_target_reason = "none";
+    size_t cbs_phase2_skipped_covariance_failure = 0u;
+    size_t cbs_phase2_missing_estimate = 0u;
+    double cbs_phase2_incremental_lag_update_ms = 0.0;
+    size_t cbs_phase2_stale_local_keys = 0u;
+    size_t cbs_phase2_stale_local_factor_slots = 0u;
+    size_t cbs_phase2_stale_belief_factors = 0u;
+    size_t cbs_phase2_orphan_keys = 0u;
+    size_t cbs_phase2_orphan_factor_slots = 0u;
+    size_t cbs_phase2_covariance_queries = 0u;
+    size_t cbs_phase2_temporary_priors_emitted = 0u;
+    bool cbs_phase2_used_full_recompute_fallback = false;
+    bool cbs_phase2_pending_prune_exists = false;
+    bool cbs_phase2_prune_committed_this_epoch = false;
+    std::string cbs_phase2_prune_commit_reason = "none";
+    bool cbs_phase2_prune_skipped_due_to_failed_remove_update = false;
+    bool cbs_phase2_remove_update_succeeded_before_prune_commit = false;
+    bool cbs_phase2_emitted_summary_keys_overlap_remove_keys = false;
+    size_t cbs_phase2_emitted_summary_overlap_key_count = 0u;
+    size_t cbs_phase2_emitted_summary_key_count = 0u;
+    size_t cbs_phase2_remove_touched_key_count = 0u;
+    bool cbs_phase2_deferred_first_boundary_remove = false;
+    size_t cbs_phase2_deferred_lag_remove_candidate_count = 0u;
+    std::string cbs_phase2_remove_guard_reason = "none";
+    size_t cbs_phase2_lag_remove_slots_raw = 0u;
+    size_t cbs_phase2_lag_remove_slots_filtered_boundary_touch = 0u;
+    size_t cbs_phase2_lag_remove_slots_applied = 0u;
+    size_t cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary = 0u;
+    size_t cbs_phase2_lag_remove_boundary_touch_factor_count = 0u;
+    std::string cbs_phase2_lag_remove_filter_reason = "none";
+    std::string cbs_phase2_lag_remove_deferral_reason = "none";
+    size_t cbs_phase2_deferred_lag_remove_packet_size = 0u;
+    std::string cbs_phase2_deferred_lag_remove_packet_slots_preview = "none";
+    size_t cbs_phase2_deferred_lag_remove_replay_subset_size = 0u;
+    long long cbs_phase2_deferred_lag_remove_replay_first_bad_slot = -1;
+    std::string cbs_phase2_deferred_lag_remove_replay_first_bad_factor_type =
+        "none";
+    std::string cbs_phase2_deferred_lag_remove_replay_first_bad_factor_keys =
+        "none";
+    std::string cbs_phase2_deferred_lag_remove_replay_failure_stage = "none";
+    std::string cbs_phase2_deferred_lag_remove_replay_failure_reason = "none";
+    size_t cbs_phase2_deferred_lag_remove_anchor_prior_protected_count = 0u;
+    std::string cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids = "none";
+    std::string cbs_phase2_deferred_lag_remove_anchor_prior_keys = "none";
+    std::string cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason =
+        "none";
+    std::string cbs_phase2_lag_remove_factor_type_counts_raw =
+        "imu:0|between:0|prior:0|other:0";
+    std::string cbs_phase2_lag_remove_factor_type_counts_filtered =
+        "imu:0|between:0|prior:0|other:0";
+    std::string cbs_phase2_lag_remove_factor_type_counts_applied =
+        "imu:0|between:0|prior:0|other:0";
+    std::string cbs_phase2_first_post_boundary_factor_class_filter_reason =
+        "none";
+    bool cbs_phase2_lag_plan_cache_changed_this_epoch = false;
+    bool cbs_phase2_incremental_remove_consumed_this_epoch = false;
+    bool cbs_phase2_skip_lag_plan_commit_consume_effective = false;
+    size_t cbs_phase2_incremental_remove_candidate_count = 0u;
+    std::string cbs_phase2_incremental_remove_candidate_preview = "none";
+    std::string cbs_phase2_wrapper_remove_packet_label = "full_wrapper_packet";
+    std::string cbs_phase2_wrapper_remove_source_counts =
+        "deferred:0|fresh_lag:0|delete_slots:0";
+    std::string cbs_phase2_wrapper_remove_true_source_counts =
+        "deferred:0|fresh_lag:0|delete_slots:0";
+    size_t cbs_phase2_wrapper_remove_deferred_count = 0u;
+    size_t cbs_phase2_wrapper_remove_fresh_lag_count = 0u;
+    size_t cbs_phase2_wrapper_remove_delete_slots_count = 0u;
+    size_t cbs_phase2_wrapper_remove_total_count = 0u;
+    bool cbs_phase2_wrapper_remove_source_coherence_ok = false;
+    const size_t cbs_phase2_delete_slots_size_raw = delete_slots.size();
+    size_t cbs_phase2_delete_slots_size_applied = delete_slots.size();
+    bool cbs_phase2_delete_slots_suppressed_this_epoch = false;
+    std::string cbs_phase2_delete_slots_suppression_reason = "none";
+    bool cbs_phase2_first_post_boundary_epoch = false;
+    bool cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch = false;
+    size_t cbs_diag_delete_slots_suppressed_count = 0u;
+    std::unordered_set<gtsam::Key> cbs_phase2_emitted_summary_keys;
+    const gtsam::FactorIndices delete_slots_forensic = delete_slots;
+    const auto format_factor_slots_preview =
+        [](const gtsam::FactorIndices& slots, const size_t max_items) {
+          std::ostringstream oss;
+          const size_t limit = std::min(max_items, slots.size());
+          for (size_t i = 0; i < limit; ++i) {
+            if (i > 0u) {
+              oss << ",";
+            }
+            oss << slots[i];
+          }
+          if (slots.size() > limit) {
+            oss << ",...";
+          }
+          return oss.str();
+        };
+    const auto sanitize_forensic_token = [](std::string token) {
+      if (token.empty()) {
+        return std::string("none");
+      }
+      for (char& ch : token) {
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+          ch = '_';
+        }
+      }
+      return token;
+    };
+    const auto normalize_wrapper_remove_packet_label = [](std::string label) {
+      if (label.empty()) {
+        return std::string("full_wrapper_packet");
+      }
+      for (char& ch : label) {
+        if (ch == '-' || ch == ' ' || ch == '\t') {
+          ch = '_';
+        } else {
+          ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+      }
+      return label;
+    };
+    const auto format_factor_keys_for_slot =
+        [&](const gtsam::NonlinearFactorGraph& factors, const size_t slot) {
+          if (!factors.exists(slot) || !factors.at(slot)) {
+            return std::string("none");
+          }
+          std::ostringstream oss;
+          bool first = true;
+          for (const gtsam::Key key : factors.at(slot)->keys()) {
+            if (!first) {
+              oss << "|";
+            }
+            first = false;
+            oss << gtsam::DefaultKeyFormatter(key);
+          }
+          const std::string out = oss.str();
+          return out.empty() ? std::string("none") : out;
+        };
+    struct ForensicFactorTypeCounts {
+      size_t smart = 0u;
+      size_t imu = 0u;
+      size_t between = 0u;
+      size_t prior = 0u;
+      size_t external_prior = 0u;
+      size_t other = 0u;
+      size_t missing_slot = 0u;
+      size_t null_factor = 0u;
+    };
+    struct ForensicSlotSetAnalysis {
+      ForensicFactorTypeCounts type_counts;
+      long long first_slot = -1;
+      std::string first_type = "none";
+      size_t refs_new_values_factor_count = 0u;
+      size_t refs_boundary_targets_factor_count = 0u;
+      size_t refs_current_frame_factor_count = 0u;
+      size_t refs_prev_frame_factor_count = 0u;
+      size_t refs_oldest_active_frame_factor_count = 0u;
+      std::unordered_set<gtsam::Key> refs_new_values_keys;
+      std::unordered_set<gtsam::Key> refs_boundary_target_keys;
+      std::unordered_set<gtsam::Key> refs_current_frame_keys;
+      std::unordered_set<gtsam::Key> refs_prev_frame_keys;
+      std::unordered_set<gtsam::Key> refs_oldest_active_frame_keys;
+      std::unordered_set<gtsam::Key> touched_keys;
+    };
+    struct UpdatePacketForensics {
+      size_t input_new_factors_count = 0u;
+      size_t input_new_values_count = 0u;
+      size_t input_timestamps_count = 0u;
+      size_t input_remove_factor_indices_count = 0u;
+      size_t input_delete_slots_count = 0u;
+      size_t input_lag_remove_count = 0u;
+      size_t input_smart_replacements_count = 0u;
+      size_t input_smart_new_insertions_count = 0u;
+      size_t input_anchor_prior_factor_count = 0u;
+      size_t input_summary_factor_count_attempted = 0u;
+      size_t input_summary_factor_count_injected = 0u;
+      size_t input_external_prior_factor_count = 0u;
+
+      size_t new_values_pose_key_count = 0u;
+      size_t new_values_velocity_key_count = 0u;
+      size_t new_values_bias_key_count = 0u;
+      size_t new_values_robot_key_count = 0u;
+      size_t new_values_public_key_count = 0u;
+      size_t new_values_belief_key_count = 0u;
+      size_t new_values_other_key_count = 0u;
+      long long first_unexpected_key = -1;
+      std::string first_unexpected_key_type = "none";
+
+      ForensicSlotSetAnalysis remove_analysis;
+      ForensicSlotSetAnalysis delete_analysis;
+
+      size_t duplicate_new_values_key_count = 0u;
+      size_t duplicate_active_insertion_key_count = 0u;
+      long long first_duplicate_new_values_key = -1;
+      long long first_duplicate_active_insertion_key = -1;
+
+      size_t missing_timestamp_key_count = 0u;
+      long long first_missing_timestamp_key = -1;
+
+      size_t remove_intersects_new_factor_keys_count = 0u;
+      long long first_remove_new_factor_overlap_key = -1;
+      size_t remove_intersects_new_values_keys_count = 0u;
+      long long first_remove_new_values_overlap_key = -1;
+      size_t remove_intersects_boundary_target_keys_count = 0u;
+      long long first_remove_boundary_target_overlap_key = -1;
+
+      size_t new_factor_missing_key_count = 0u;
+      size_t new_factor_missing_key_factor_count = 0u;
+      long long first_missing_factor_key = -1;
+      long long first_missing_factor_slot = -1;
+      std::string first_missing_factor_type = "none";
+
+      std::string first_inconsistency_reason = "none";
+      long long first_inconsistency_key = -1;
+      long long first_inconsistency_factor_slot = -1;
+      std::string first_inconsistency_factor_type = "none";
+      std::string first_inconsistency_factor_keys = "none";
+    };
+    const auto classify_forensic_factor_type =
+        [](const gtsam::NonlinearFactor* factor) -> std::string {
+      if (!factor) {
+        return "null";
+      }
+      if (dynamic_cast<const ExternalPosePriorFactor*>(factor) != nullptr) {
+        return "external_prior";
+      }
+      if (dynamic_cast<const SmartStereoFactor*>(factor) != nullptr) {
+        return "smart";
+      }
+      if (dynamic_cast<const gtsam::CombinedImuFactor*>(factor) != nullptr ||
+          dynamic_cast<const gtsam::ImuFactor*>(factor) != nullptr) {
+        return "imu";
+      }
+      if (dynamic_cast<const gtsam::BetweenFactor<gtsam::Pose3>*>(factor) !=
+              nullptr ||
+          dynamic_cast<const gtsam::BetweenFactor<gtsam::Vector3>*>(factor) !=
+              nullptr ||
+          dynamic_cast<const gtsam::BetweenFactor<
+              gtsam::imuBias::ConstantBias>*>(factor) != nullptr) {
+        return "between";
+      }
+      if (dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(factor) !=
+              nullptr ||
+          dynamic_cast<const gtsam::PriorFactor<gtsam::Vector3>*>(factor) !=
+              nullptr ||
+          dynamic_cast<const gtsam::PriorFactor<
+              gtsam::imuBias::ConstantBias>*>(factor) != nullptr) {
+        return "prior";
+      }
+      return "other";
+    };
+    const auto bump_forensic_factor_type =
+        [](const std::string& factor_type, ForensicFactorTypeCounts* counts) {
+      CHECK_NOTNULL(counts);
+      if (factor_type == "smart") {
+        ++counts->smart;
+      } else if (factor_type == "imu") {
+        ++counts->imu;
+      } else if (factor_type == "between") {
+        ++counts->between;
+      } else if (factor_type == "prior") {
+        ++counts->prior;
+      } else if (factor_type == "external_prior") {
+        ++counts->external_prior;
+      } else if (factor_type == "null") {
+        ++counts->null_factor;
+      } else {
+        ++counts->other;
+      }
+    };
+    const auto format_forensic_factor_type_counts =
+        [](const ForensicFactorTypeCounts& counts) {
+          std::ostringstream oss;
+          oss << "smart:" << counts.smart << "|imu:" << counts.imu
+              << "|between:" << counts.between << "|prior:" << counts.prior
+              << "|external_prior:" << counts.external_prior
+              << "|other:" << counts.other
+              << "|missing:" << counts.missing_slot
+              << "|null:" << counts.null_factor;
+          return oss.str();
+        };
+    const auto format_forensic_key_token = [](const long long key_ll) {
+      if (key_ll < 0) {
+        return std::string("none");
+      }
+      const gtsam::Key key = static_cast<gtsam::Key>(key_ll);
+      const gtsam::Symbol symbol(key);
+      std::ostringstream oss;
+      oss << symbol.chr() << symbol.index();
+      return oss.str();
+    };
+    UpdatePacketForensics cbs_update_packet_forensics;
+
+    const bool cbs_use_marginalization_prior_bridge =
+        FLAGS_cbs_use_marginalization_prior_bridge;
+    const bool cbs_use_phase2_summary_prior_bridge =
+        FLAGS_cbs_experimental_use_new_heart_summary_prior_bridge;
+    const bool cbs_phase2_build_only_no_inject =
+        FLAGS_cbs_diag_phase2_build_only_no_inject;
+    const bool cbs_phase2_skip_lag_plan_commit_consume =
+        FLAGS_cbs_diag_phase2_skip_lag_plan_commit_consume;
+    const bool cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch =
+        FLAGS_cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch ||
+        FLAGS_cbs_diag_phase2_suppress_delete_slots_first_post_boundary;
+    const bool cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch =
+        FLAGS_cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch;
+    const bool cbs_diag_phase2_protect_deferred_anchor_prior_x0 =
+        FLAGS_cbs_diag_phase2_protect_deferred_anchor_prior_x0;
 
     CbsFixedLagWindowState lag_window_state;
+    CbsFixedLagBpsamHeart::LagWindowPlan phase2_incremental_plan;
+    CbsFixedLagBpsamHeart::BoundarySummaryInput phase2_summary_input;
+    bool phase2_plan_ready = false;
     if (cbs_allow_heavy_maintenance) {
       const auto lag_build_start = std::chrono::steady_clock::now();
-      lag_window_state = buildCbsFixedLagWindowState(timestamps);
+      if (cbs_use_phase2_summary_prior_bridge) {
+        const size_t lag_states = backend_params_.nr_states_ > 0
+                                      ? static_cast<size_t>(backend_params_.nr_states_)
+                                      : 0u;
+        if (!cbs_phase2_heart_) {
+          cbs_phase2_heart_ =
+              std::make_shared<CbsFixedLagBpsamHeart>(cbs_optimizer_, lag_states);
+        }
+        cbs_phase2_heart_->setBpsam(cbs_optimizer_);
+        cbs_phase2_heart_->setLagStates(lag_states);
+        CbsFixedLagBpsamHeart::LocalIngestPacket phase2_packet;
+        phase2_packet.local_factors = new_factors;
+        phase2_packet.local_values = new_values;
+        phase2_packet.local_key_timestamps = timestamps;
+        phase2_packet.newest_local_frame_id = curr_kf_id_;
+        cbs_phase2_heart_->ingestLocalKimeraPacket(phase2_packet);
+
+        phase2_incremental_plan =
+            cbs_phase2_heart_->advanceLagWindowIncremental(curr_kf_id_);
+        phase2_summary_input =
+            cbs_phase2_heart_->buildBoundarySummaryInputFromIncrementalState();
+        cbs_phase2_pending_prune_exists =
+            cbs_phase2_heart_->hasPendingPrunePlan();
+        phase2_plan_ready = true;
+        const gtsam::FactorIndices& phase2_incremental_remove_slots =
+            cbs_phase2_heart_->getIncrementalRemoveFactorIndices();
+        cbs_phase2_incremental_remove_candidate_count =
+            phase2_incremental_remove_slots.size();
+        cbs_phase2_incremental_remove_candidate_preview =
+            format_factor_slots_preview(phase2_incremental_remove_slots, 8u);
+
+        auto hash_combine = [](size_t* seed, const size_t value) {
+          *seed ^= value + 0x9e3779b97f4a7c15ULL + ((*seed) << 6) + ((*seed) >> 2);
+        };
+        size_t lag_plan_signature = 0u;
+        hash_combine(&lag_plan_signature,
+                     static_cast<size_t>(
+                         phase2_incremental_plan.stale_eviction.newest_frame_id));
+        hash_combine(
+            &lag_plan_signature,
+            static_cast<size_t>(
+                phase2_incremental_plan.stale_eviction.oldest_active_frame_id));
+        hash_combine(
+            &lag_plan_signature,
+            static_cast<size_t>(
+                phase2_incremental_plan.stale_eviction.eviction_start_frame_id));
+        hash_combine(
+            &lag_plan_signature,
+            static_cast<size_t>(
+                phase2_incremental_plan.stale_eviction.eviction_end_frame_id));
+        hash_combine(
+            &lag_plan_signature,
+            phase2_incremental_plan.stale_eviction.stale_local_keys.size());
+        hash_combine(
+            &lag_plan_signature,
+            phase2_incremental_plan.stale_eviction.stale_local_factor_slots.size());
+        hash_combine(
+            &lag_plan_signature,
+            phase2_incremental_plan.stale_eviction.stale_belief_factor_slots.size());
+        hash_combine(
+            &lag_plan_signature,
+            phase2_incremental_plan.orphan_prune.orphan_belief_factor_slots.size());
+        hash_combine(&lag_plan_signature, phase2_incremental_remove_slots.size());
+        {
+          const size_t limit = std::min<size_t>(8u, phase2_incremental_remove_slots.size());
+          for (size_t i = 0; i < limit; ++i) {
+            hash_combine(&lag_plan_signature,
+                         static_cast<size_t>(phase2_incremental_remove_slots[i]));
+          }
+        }
+        cbs_phase2_lag_plan_cache_changed_this_epoch =
+            !cbs_phase2_has_prev_lag_plan_signature_ ||
+            (lag_plan_signature != cbs_phase2_prev_lag_plan_signature_);
+        cbs_phase2_prev_lag_plan_signature_ = lag_plan_signature;
+        cbs_phase2_has_prev_lag_plan_signature_ = true;
+
+        cbs_phase2_skip_lag_plan_commit_consume_effective =
+            cbs_phase2_skip_lag_plan_commit_consume;
+        if (cbs_phase2_skip_lag_plan_commit_consume_effective) {
+          lag_window_state = buildCbsFixedLagWindowState(timestamps);
+          augmentCbsLagWindowWithBeliefOwnershipPruning(&lag_window_state);
+          cbs_phase2_incremental_remove_consumed_this_epoch = false;
+        } else {
+          lag_window_state.newest_frame_id =
+              phase2_incremental_plan.stale_eviction.newest_frame_id;
+          lag_window_state.oldest_active_frame_id =
+              phase2_incremental_plan.stale_eviction.oldest_active_frame_id;
+          lag_window_state.prev_oldest_active_frame_id =
+              cbs_has_prev_oldest_active_frame_id_
+                  ? cbs_prev_oldest_active_frame_id_
+                  : lag_window_state.oldest_active_frame_id;
+          lag_window_state.eviction_start_frame_id =
+              phase2_incremental_plan.stale_eviction.eviction_start_frame_id;
+          lag_window_state.eviction_end_frame_id =
+              phase2_incremental_plan.stale_eviction.eviction_end_frame_id;
+          lag_window_state.eviction_incremental =
+              !phase2_incremental_plan.stale_eviction.full_rescan;
+          lag_window_state.eviction_full_rescan =
+              phase2_incremental_plan.stale_eviction.full_rescan;
+          lag_window_state.eviction_frames =
+              lag_window_state.eviction_end_frame_id >
+                      lag_window_state.eviction_start_frame_id
+                  ? static_cast<size_t>(lag_window_state.eviction_end_frame_id -
+                                        lag_window_state.eviction_start_frame_id)
+                  : 0u;
+          lag_window_state.remove_factor_indices = phase2_incremental_remove_slots;
+          cbs_phase2_incremental_remove_consumed_this_epoch = true;
+          lag_window_state.stale_state_keys =
+              phase2_incremental_plan.stale_eviction.stale_local_keys.size();
+          lag_window_state.stale_pose_keys = 0u;
+          lag_window_state.stale_local_factor_slots =
+              phase2_incremental_plan.stale_eviction.stale_local_factor_slots.size();
+          for (const auto stale_key :
+               phase2_incremental_plan.stale_eviction.stale_local_keys) {
+            const gtsam::Symbol sym(stale_key);
+            if (sym.chr() == kPoseSymbolChar) {
+              ++lag_window_state.stale_pose_keys;
+            }
+          }
+          lag_window_state.stale_belief_factor_slots =
+              phase2_incremental_plan.stale_eviction.stale_belief_factor_slots.size();
+          lag_window_state.orphan_belief_factor_slots =
+              phase2_incremental_plan.orphan_prune.orphan_belief_factor_slots.size();
+          lag_window_state.orphan_robot_keys =
+              phase2_incremental_plan.orphan_prune.orphan_robot_keys.size();
+          lag_window_state.orphan_gbp_keys =
+              phase2_incremental_plan.orphan_prune.orphan_gbp_keys.size();
+        }
+      } else {
+        lag_window_state = buildCbsFixedLagWindowState(timestamps);
+        augmentCbsLagWindowWithBeliefOwnershipPruning(&lag_window_state);
+      }
+      cbs_prev_oldest_active_frame_id_ = lag_window_state.oldest_active_frame_id;
+      cbs_has_prev_oldest_active_frame_id_ = true;
       cbs_lag_window_build_ms +=
           elapsedMs(lag_build_start, std::chrono::steady_clock::now());
     } else {
@@ -11349,20 +12085,223 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       cbs_prev_oldest_active_frame_id_ = lag_window_state.oldest_active_frame_id;
       cbs_has_prev_oldest_active_frame_id_ = true;
     }
+    cbs_phase2_stale_local_factor_slots = lag_window_state.stale_local_factor_slots;
+    cbs_phase2_orphan_factor_slots = lag_window_state.orphan_belief_factor_slots;
 
     // CBS-heart currently approximates fixed-lag factor removal but does not
     // yet implement a full marginalization prior. Add a boundary anchor once
     // per oldest-active frame to reduce gauge drift/underdetermined windows.
     gtsam::NonlinearFactorGraph cbs_update_factors = new_factors;
-    const bool cbs_use_marginalization_prior_bridge =
-        FLAGS_cbs_use_marginalization_prior_bridge;
     const FrameId anchor_frame_id = lag_window_state.oldest_active_frame_id;
     if (cbs_allow_heavy_maintenance &&
         !FLAGS_cbs_diag_disable_lag_boundary_anchor_priors &&
         anchor_frame_id > 0u &&
         cbs_last_window_anchor_frame_id_ != anchor_frame_id) {
       const auto anchor_start = std::chrono::steady_clock::now();
-      try {
+      if (cbs_use_phase2_summary_prior_bridge) {
+        try {
+          if (!cbs_phase2_heart_ || !phase2_plan_ready) {
+            LOG(WARNING) << "CBS-heart PHASE-2 incremental lag plan not ready; "
+                         << "falling back to no-op summary bridge this epoch.";
+          } else {
+            cbs_phase2_boundary_candidates =
+                phase2_summary_input.separator_keys.size();
+            cbs_phase2_summary_targets =
+                phase2_summary_input.summary_target_keys.size();
+            cbs_phase2_summary_requested_targets =
+                phase2_summary_input.summary_target_keys.size();
+          }
+
+          gtsam::NonlinearFactorGraph phase2_summary_factors;
+          CbsFixedLagBpsamHeart::SummaryBuildStats phase2_stats;
+          cbs_phase2_summary_attempted = (cbs_phase2_heart_ && phase2_plan_ready);
+          const bool emitted =
+              cbs_phase2_summary_attempted
+                  ? cbs_phase2_heart_->appendLagEdgeSummaryFactors(
+                        &phase2_incremental_plan,
+                        &phase2_summary_factors,
+                        &phase2_stats)
+                  : false;
+          CbsFixedLagBpsamHeart::Diagnostics phase2_diag;
+          if (cbs_phase2_heart_) {
+            phase2_diag = cbs_phase2_heart_->getLastIncrementalDiagnostics();
+          }
+
+          cbs_phase2_emitted_summary_keys.clear();
+          for (const auto& factor_ptr : phase2_summary_factors) {
+            if (!factor_ptr) {
+              continue;
+            }
+            for (const gtsam::Key key : factor_ptr->keys()) {
+              cbs_phase2_emitted_summary_keys.insert(key);
+            }
+          }
+          cbs_phase2_emitted_summary_key_count =
+              cbs_phase2_emitted_summary_keys.size();
+
+          size_t phase2_summary_factor_count_built = 0u;
+          for (const auto& factor_ptr : phase2_summary_factors) {
+            if (factor_ptr) {
+              ++phase2_summary_factor_count_built;
+            }
+          }
+          size_t phase2_summary_factor_count_pushed = 0u;
+          if (!cbs_phase2_build_only_no_inject) {
+            for (const auto& factor_ptr : phase2_summary_factors) {
+              if (factor_ptr) {
+                cbs_update_factors.push_back(factor_ptr);
+                ++phase2_summary_factor_count_pushed;
+              }
+            }
+          }
+
+          const size_t emitted_priors = phase2_stats.summary_factor_count_emitted;
+          auto sanitize_diag_token = [](std::string token) {
+            if (token.empty()) {
+              return std::string("none");
+            }
+            for (char& ch : token) {
+              if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+                ch = '_';
+              }
+            }
+            return token;
+          };
+          const bool cbs_phase2_summary_mode_success =
+              (phase2_stats.summary_mode == "exact_schur") ||
+              (phase2_stats.summary_mode == "exact_expanded_partial_scope");
+          cbs_phase2_summary_injected_this_epoch =
+              emitted && phase2_stats.summary_implemented_this_epoch &&
+              cbs_phase2_summary_mode_success && (emitted_priors > 0u) &&
+              (phase2_summary_factor_count_built > 0u) &&
+              !cbs_phase2_build_only_no_inject &&
+              (phase2_summary_factor_count_pushed > 0u);
+          cbs_phase2_summary_injected = cbs_phase2_summary_injected_this_epoch;
+          cbs_anchor_priors_added =
+              cbs_phase2_summary_injected_this_epoch
+                  ? phase2_summary_factor_count_pushed
+                  : 0u;
+          cbs_phase2_summary_bridge_applied = cbs_phase2_summary_injected_this_epoch;
+          cbs_phase2_summary_implemented_this_epoch =
+              phase2_stats.summary_implemented_this_epoch;
+          cbs_phase2_summary_target_coherence_ok =
+              phase2_stats.summary_target_coherence_ok;
+          cbs_phase2_summary_requested_targets =
+              phase2_stats.summary_requested_target_count;
+          cbs_phase2_summary_realizable_targets =
+              phase2_stats.summary_realizable_target_count;
+          cbs_phase2_summary_dropped_targets =
+              phase2_stats.summary_dropped_target_count;
+          cbs_phase2_summary_crossing_factor_count =
+              phase2_stats.summary_crossing_factor_count;
+          cbs_phase2_summary_factor_count_emitted =
+              phase2_stats.summary_factor_count_emitted;
+          cbs_phase2_summary_build_ms = phase2_stats.summary_build_ms;
+          cbs_phase2_summary_mode = sanitize_diag_token(phase2_stats.summary_mode);
+          cbs_phase2_expanded_summary_mode =
+              sanitize_diag_token(phase2_stats.expanded_summary_mode);
+          cbs_phase2_expanded_summary_requested_target_count =
+              phase2_stats.expanded_summary_requested_target_count;
+          cbs_phase2_expanded_summary_realizable_target_count =
+              phase2_stats.expanded_summary_realizable_target_count;
+          cbs_phase2_expanded_summary_crossing_factor_count =
+              phase2_stats.expanded_summary_crossing_factor_count;
+          cbs_phase2_expanded_summary_factor_count_emitted =
+              phase2_stats.expanded_summary_factor_count_emitted;
+          cbs_phase2_expanded_summary_build_ms =
+              phase2_stats.expanded_summary_build_ms;
+          cbs_phase2_first_expanded_summary_failure_reason = sanitize_diag_token(
+              phase2_stats.first_expanded_summary_failure_reason);
+          cbs_phase2_expanded_included_local_nonbelief_factor_count =
+              phase2_stats.expanded_included_local_nonbelief_factor_count;
+          cbs_phase2_expanded_included_mixed_nonbelief_factor_count =
+              phase2_stats.expanded_included_mixed_nonbelief_factor_count;
+          cbs_phase2_expanded_included_belief_factor_count =
+              phase2_stats.expanded_included_belief_factor_count;
+          cbs_phase2_expanded_excluded_local_nonbelief_factor_count =
+              phase2_stats.expanded_excluded_local_nonbelief_factor_count;
+          cbs_phase2_expanded_excluded_mixed_nonbelief_factor_count =
+              phase2_stats.expanded_excluded_mixed_nonbelief_factor_count;
+          cbs_phase2_expanded_excluded_belief_factor_count =
+              phase2_stats.expanded_excluded_belief_factor_count;
+          cbs_phase2_expanded_selected_factor_slots_count =
+              phase2_stats.expanded_selected_factor_slots_count;
+          cbs_phase2_expanded_selected_key_count =
+              phase2_stats.expanded_selected_key_count;
+          cbs_phase2_expanded_eliminated_key_count =
+              phase2_stats.expanded_eliminated_key_count;
+          cbs_phase2_expanded_emitted_factor_count =
+              phase2_stats.expanded_emitted_factor_count;
+          cbs_phase2_expanded_emitted_factor_key_count =
+              phase2_stats.expanded_emitted_factor_key_count;
+          cbs_phase2_expanded_emitted_factor_contains_nonlocal_keys =
+              phase2_stats.expanded_emitted_factor_contains_nonlocal_keys;
+          cbs_phase2_expanded_emitted_factor_contains_belief_keys =
+              phase2_stats.expanded_emitted_factor_contains_belief_keys;
+          cbs_phase2_expanded_emitted_factor_references_stale_removed_keys =
+              phase2_stats.expanded_emitted_factor_references_stale_removed_keys;
+          cbs_phase2_expanded_emitted_factor_references_orphan_pruned_keys =
+              phase2_stats.expanded_emitted_factor_references_orphan_pruned_keys;
+          cbs_phase2_expanded_emitted_factor_missing_estimate_keys =
+              phase2_stats.expanded_emitted_factor_missing_estimate_keys;
+          cbs_phase2_first_expanded_bad_key =
+              phase2_stats.first_expanded_bad_key ==
+                      std::numeric_limits<gtsam::Key>::max()
+                  ? -1
+                  : static_cast<long long>(phase2_stats.first_expanded_bad_key);
+          cbs_phase2_first_expanded_bad_factor_slot =
+              phase2_stats.first_expanded_bad_factor_slot ==
+                      std::numeric_limits<gtsam::FactorIndex>::max()
+                  ? -1
+                  : static_cast<long long>(
+                        phase2_stats.first_expanded_bad_factor_slot);
+          cbs_phase2_first_expanded_exception_context = sanitize_diag_token(
+              phase2_stats.first_expanded_exception_context);
+          cbs_phase2_expanded_veto_reason =
+              sanitize_diag_token(phase2_stats.expanded_veto_reason);
+          cbs_phase2_expanded_veto_count = phase2_stats.expanded_veto_count;
+          cbs_phase2_first_summary_failure_reason = sanitize_diag_token(
+              phase2_stats.first_summary_failure_reason);
+          cbs_phase2_first_dropped_target_reason = sanitize_diag_token(
+              phase2_stats.first_dropped_target_reason);
+          cbs_phase2_summary_targets = phase2_stats.summary_target_key_count;
+          cbs_phase2_skipped_covariance_failure = 0u;
+          cbs_phase2_missing_estimate = 0u;
+          cbs_phase2_incremental_lag_update_ms =
+              phase2_diag.incremental_lag_update_ms;
+          cbs_phase2_stale_local_keys = phase2_diag.stale_local_key_count;
+          cbs_phase2_stale_local_factor_slots =
+              phase2_incremental_plan.stale_eviction.stale_local_factor_slots.size();
+          cbs_phase2_stale_belief_factors =
+              phase2_diag.stale_belief_factor_count;
+          cbs_phase2_orphan_keys = phase2_diag.orphan_key_count;
+          cbs_phase2_orphan_factor_slots =
+              phase2_incremental_plan.orphan_prune.orphan_belief_factor_slots.size();
+          cbs_phase2_covariance_queries = 0u;
+          cbs_phase2_temporary_priors_emitted = 0u;
+          cbs_phase2_used_full_recompute_fallback =
+              phase2_diag.used_full_recompute_fallback;
+
+          if (emitted_priors > 0u && cbs_phase2_build_only_no_inject) {
+            VLOG(1) << "CBS-heart PHASE-2 summary build-only mode: built "
+                    << emitted_priors
+                    << " summary factors but injection is disabled by "
+                       "--cbs_diag_phase2_build_only_no_inject.";
+          }
+
+          if (emitted_priors > 0u && cbs_phase2_summary_injected) {
+            cbs_last_window_anchor_frame_id_ = anchor_frame_id;
+            VLOG(1) << "CBS-heart PHASE-2 lag-edge summary injected "
+                    << emitted_priors << " summary factors on frame "
+                    << anchor_frame_id;
+          }
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "CBS-heart PHASE-2 lag-edge summary construction "
+                       << "failed for frame " << anchor_frame_id << ": "
+                       << e.what();
+        }
+      } else {
+        try {
         const auto estimate_extract_start = std::chrono::steady_clock::now();
         const gtsam::Values cbs_values = cbs_optimizer_->calculateEstimate();
         cbs_b1_estimate_extract_ms +=
@@ -11552,12 +12491,53 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
         LOG(WARNING) << "CBS-heart could not add lag-boundary anchor priors for "
                      << "frame " << anchor_frame_id << ": " << e.what();
       }
+      }
       cbs_anchor_prior_ms +=
           elapsedMs(anchor_start, std::chrono::steady_clock::now());
     }
 
+    const bool cbs_phase2_boundary_transition_this_epoch =
+        cbs_allow_heavy_maintenance &&
+        (lag_window_state.oldest_active_frame_id >
+         lag_window_state.prev_oldest_active_frame_id);
+    cbs_phase2_first_post_boundary_epoch =
+        cbs_phase2_pending_first_post_boundary_epoch_;
+    cbs_phase2_pending_first_post_boundary_epoch_ = false;
+    if (cbs_phase2_boundary_transition_this_epoch &&
+        !cbs_phase2_seen_first_boundary_touch_) {
+      cbs_phase2_seen_first_boundary_touch_ = true;
+      cbs_phase2_pending_first_post_boundary_epoch_ = true;
+    }
+
   const auto build_cbs_first_update_params =
         [&](const bool enable_remove_factor_indices) {
+          cbs_phase2_deferred_first_boundary_remove = false;
+          cbs_phase2_deferred_lag_remove_candidate_count = 0u;
+          cbs_phase2_remove_guard_reason = "none";
+          cbs_phase2_lag_remove_slots_raw = 0u;
+          cbs_phase2_lag_remove_slots_filtered_boundary_touch = 0u;
+          cbs_phase2_lag_remove_slots_applied = 0u;
+          cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary = 0u;
+          cbs_phase2_lag_remove_boundary_touch_factor_count = 0u;
+          cbs_phase2_lag_remove_filter_reason = "none";
+          cbs_phase2_lag_remove_deferral_reason = "none";
+          cbs_phase2_lag_remove_factor_type_counts_raw =
+              "imu:0|between:0|prior:0|other:0";
+          cbs_phase2_lag_remove_factor_type_counts_filtered =
+              "imu:0|between:0|prior:0|other:0";
+          cbs_phase2_lag_remove_factor_type_counts_applied =
+              "imu:0|between:0|prior:0|other:0";
+          cbs_phase2_first_post_boundary_factor_class_filter_reason = "none";
+          cbs_phase2_wrapper_remove_packet_label =
+              normalize_wrapper_remove_packet_label(
+                  FLAGS_cbs_diag_phase2_wrapper_remove_packet_label);
+          cbs_phase2_wrapper_remove_source_counts =
+              "deferred:0|fresh_lag:0|delete_slots:0";
+          cbs_phase2_wrapper_remove_deferred_count = 0u;
+          cbs_phase2_wrapper_remove_fresh_lag_count = 0u;
+          cbs_phase2_wrapper_remove_delete_slots_count = 0u;
+          cbs_phase2_wrapper_remove_total_count = 0u;
+          cbs_phase2_wrapper_remove_source_coherence_ok = false;
           cbs::BPSAM::UpdateParams params;
           if (!enable_remove_factor_indices) {
             VLOG(1) << "CBS-heart running current epoch with "
@@ -11575,32 +12555,734 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             cbs_remove_prev_epoch_size = cbs_prev_epoch_remove_factor_indices_.size();
             cbs_remove_curr_epoch_size = 0u;
             cbs_remove_repeated_from_prev_epoch = 0u;
+            cbs_phase2_remove_touched_key_count = 0u;
+            cbs_phase2_emitted_summary_keys_overlap_remove_keys = false;
+            cbs_phase2_emitted_summary_overlap_key_count = 0u;
+            cbs_phase2_remove_guard_reason = "remove_disabled";
+            cbs_phase2_lag_remove_filter_reason = "remove_disabled";
+            cbs_phase2_lag_remove_deferral_reason = "remove_disabled";
+            cbs_phase2_first_post_boundary_factor_class_filter_reason =
+                "remove_disabled";
             cbs_prev_epoch_remove_factor_indices_.clear();
             return params;
           }
 
           const auto remove_discovery_start = std::chrono::steady_clock::now();
+          struct LagRemoveClassCounts {
+            size_t imu = 0u;
+            size_t between = 0u;
+            size_t prior = 0u;
+            size_t other = 0u;
+          };
+          const auto format_lag_remove_class_counts =
+              [](const LagRemoveClassCounts& counts) {
+                std::ostringstream oss;
+                oss << "imu:" << counts.imu << "|between:" << counts.between
+                    << "|prior:" << counts.prior << "|other:" << counts.other;
+                return oss.str();
+              };
+          const auto factor_type_to_lag_remove_class =
+              [&](const gtsam::NonlinearFactor* factor) {
+                const std::string factor_type =
+                    classify_forensic_factor_type(factor);
+                if (factor_type == "imu") {
+                  return std::string("imu");
+                }
+                if (factor_type == "between") {
+                  return std::string("between");
+                }
+                if (factor_type == "prior" || factor_type == "external_prior") {
+                  return std::string("prior");
+                }
+                return std::string("other");
+              };
+          const auto bump_lag_remove_class_count =
+              [](const std::string& cls, LagRemoveClassCounts* counts) {
+                CHECK_NOTNULL(counts);
+                if (cls == "imu") {
+                  ++counts->imu;
+                } else if (cls == "between") {
+                  ++counts->between;
+                } else if (cls == "prior") {
+                  ++counts->prior;
+                } else {
+                  ++counts->other;
+                }
+              };
+          const auto classify_lag_remove_slots =
+              [&](const std::unordered_set<size_t>& slots) {
+                LagRemoveClassCounts counts;
+                const gtsam::NonlinearFactorGraph& factors =
+                    cbs_optimizer_->getFactorsUnsafe();
+                for (const size_t slot : slots) {
+                  if (!factors.exists(slot) || !factors.at(slot)) {
+                    ++counts.other;
+                    continue;
+                  }
+                  bump_lag_remove_class_count(
+                      factor_type_to_lag_remove_class(factors.at(slot).get()),
+                      &counts);
+                }
+                return counts;
+              };
           std::unordered_set<size_t> delete_slot_set(delete_slots.begin(),
                                                      delete_slots.end());
           std::unordered_set<size_t> lag_slot_set(
               lag_window_state.remove_factor_indices.begin(),
               lag_window_state.remove_factor_indices.end());
+          std::unordered_set<size_t> deferred_replay_slot_set;
           if (FLAGS_cbs_diag_disable_lag_eviction_remove_candidates) {
             lag_slot_set.clear();
           }
+          cbs_phase2_lag_remove_slots_raw = lag_slot_set.size();
+          if (cbs_phase2_boundary_transition_this_epoch && !lag_slot_set.empty() &&
+              !cbs_phase2_has_deferred_first_boundary_remove_) {
+            cbs_phase2_deferred_first_boundary_remove = true;
+            cbs_phase2_deferred_lag_remove_candidate_count = lag_slot_set.size();
+            cbs_phase2_remove_guard_reason =
+                "first_boundary_touch_defer_lag_remove";
+            cbs_phase2_lag_remove_filter_reason =
+                "first_boundary_touch_defer_lag_remove";
+            cbs_phase2_has_deferred_first_boundary_remove_ = true;
+            LOG(WARNING)
+                << "CBS-heart deferred lag-eviction removeFactorIndices on first "
+                   "boundary-touch epoch. curr_kf_id="
+                << curr_kf_id_
+                << " prev_oldest_active_frame_id="
+                << lag_window_state.prev_oldest_active_frame_id
+                << " oldest_active_frame_id="
+                << lag_window_state.oldest_active_frame_id
+                << " deferred_lag_remove_candidates="
+                << cbs_phase2_deferred_lag_remove_candidate_count;
+            lag_slot_set.clear();
+          }
+          if (cbs_use_phase2_summary_prior_bridge &&
+              cbs_phase2_first_post_boundary_epoch && !lag_slot_set.empty()) {
+            const gtsam::NonlinearFactorGraph& cbs_factors =
+                cbs_optimizer_->getFactorsUnsafe();
+            std::unordered_set<gtsam::Key> boundary_target_keys(
+                phase2_summary_input.summary_target_keys.begin(),
+                phase2_summary_input.summary_target_keys.end());
+            size_t filtered_slots = 0u;
+            size_t boundary_touch_factor_count = 0u;
+            if (!boundary_target_keys.empty()) {
+              std::vector<size_t> boundary_touch_slots;
+              boundary_touch_slots.reserve(lag_slot_set.size());
+              for (const size_t slot : lag_slot_set) {
+                if (!cbs_factors.exists(slot) || !cbs_factors.at(slot)) {
+                  continue;
+                }
+                bool touches_boundary_target = false;
+                for (const gtsam::Key key : cbs_factors.at(slot)->keys()) {
+                  if (boundary_target_keys.count(key) > 0u) {
+                    touches_boundary_target = true;
+                    break;
+                  }
+                }
+                if (touches_boundary_target) {
+                  ++boundary_touch_factor_count;
+                  boundary_touch_slots.push_back(slot);
+                }
+              }
+              for (const size_t slot : boundary_touch_slots) {
+                if (lag_slot_set.erase(slot) > 0u) {
+                  ++filtered_slots;
+                }
+              }
+            } else {
+              cbs_phase2_lag_remove_filter_reason =
+                  "first_post_boundary_no_boundary_targets";
+            }
+            cbs_phase2_lag_remove_slots_filtered_boundary_touch = filtered_slots;
+            cbs_phase2_lag_remove_boundary_touch_factor_count =
+                boundary_touch_factor_count;
+            if (filtered_slots > 0u) {
+              cbs_phase2_lag_remove_filter_reason =
+                  "first_post_boundary_filter_boundary_touch";
+              if (cbs_phase2_remove_guard_reason == "none") {
+                cbs_phase2_remove_guard_reason = cbs_phase2_lag_remove_filter_reason;
+              }
+              LOG(WARNING)
+                  << "CBS-heart filtered lag-eviction removeFactorIndices on "
+                     "first post-boundary epoch due to boundary-target touch. "
+                     "curr_kf_id="
+                  << curr_kf_id_
+                  << " lag_remove_slots_raw=" << cbs_phase2_lag_remove_slots_raw
+                  << " lag_remove_slots_filtered_boundary_touch="
+                  << filtered_slots
+                  << " lag_remove_slots_applied=" << lag_slot_set.size()
+                << " lag_remove_boundary_touch_factor_count="
+                << boundary_touch_factor_count;
+            }
+          }
+          cbs_phase2_lag_remove_slots_raw = lag_slot_set.size();
+          cbs_phase2_lag_remove_factor_type_counts_raw =
+              format_lag_remove_class_counts(
+                  classify_lag_remove_slots(lag_slot_set));
+          LagRemoveClassCounts lag_remove_filtered_class_counts;
+          if (cbs_phase2_first_post_boundary_epoch && !lag_slot_set.empty() &&
+              cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch) {
+            gtsam::FactorIndices deferred_packet_slots(lag_slot_set.begin(),
+                                                       lag_slot_set.end());
+            std::sort(deferred_packet_slots.begin(), deferred_packet_slots.end());
+            cbs_phase2_deferred_lag_remove_packet_slots_ =
+                deferred_packet_slots;
+            cbs_phase2_deferred_lag_remove_packet_source_kf_id_ = curr_kf_id_;
+            cbs_phase2_deferred_lag_remove_packet_pending_ = true;
+            cbs_phase2_deferred_lag_remove_packet_size =
+                deferred_packet_slots.size();
+            cbs_phase2_deferred_lag_remove_packet_slots_preview =
+                sanitize_forensic_token(
+                    format_factor_slots_preview(deferred_packet_slots, 8));
+            cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary =
+                lag_slot_set.size();
+            cbs_phase2_lag_remove_deferral_reason =
+                "first_post_boundary_defer_all_lag_remove";
+            cbs_phase2_lag_remove_filter_reason =
+                "first_post_boundary_defer_all_lag_remove";
+            if (cbs_phase2_remove_guard_reason == "none") {
+              cbs_phase2_remove_guard_reason =
+                  cbs_phase2_lag_remove_deferral_reason;
+            }
+            LOG(WARNING)
+                << "CBS-heart diagnostic isolation: deferred all lag-derived "
+                   "removeFactorIndices on first post-boundary epoch. "
+                   "curr_kf_id="
+                << curr_kf_id_
+                << " lag_remove_slots_raw=" << cbs_phase2_lag_remove_slots_raw
+                << " deferred_packet_size="
+                << cbs_phase2_deferred_lag_remove_packet_size
+                << " deferred_packet_slots="
+                << cbs_phase2_deferred_lag_remove_packet_slots_preview
+                << " lag_remove_slots_applied=0";
+            lag_slot_set.clear();
+          }
+          if (!cbs_phase2_first_post_boundary_epoch &&
+              cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch &&
+              cbs_phase2_deferred_lag_remove_packet_pending_) {
+            gtsam::FactorIndices deferred_packet_slots =
+                cbs_phase2_deferred_lag_remove_packet_slots_;
+            std::sort(deferred_packet_slots.begin(), deferred_packet_slots.end());
+            cbs_phase2_deferred_lag_remove_packet_size =
+                deferred_packet_slots.size();
+            cbs_phase2_deferred_lag_remove_packet_slots_preview =
+                sanitize_forensic_token(
+                    format_factor_slots_preview(deferred_packet_slots, 8));
+
+            if (cbs_diag_phase2_protect_deferred_anchor_prior_x0 &&
+                !deferred_packet_slots.empty()) {
+              const gtsam::NonlinearFactorGraph& cbs_factors =
+                  cbs_optimizer_->getFactorsUnsafe();
+              gtsam::FactorIndices filtered_packet_slots;
+              filtered_packet_slots.reserve(deferred_packet_slots.size());
+              gtsam::FactorIndices protected_anchor_slots;
+              std::vector<std::string> protected_anchor_keys;
+              protected_anchor_keys.reserve(deferred_packet_slots.size());
+
+              for (const gtsam::FactorIndex slot : deferred_packet_slots) {
+                bool protect_slot = false;
+                std::string slot_anchor_key = "none";
+                if (cbs_factors.exists(slot) && cbs_factors.at(slot)) {
+                  const auto factor = cbs_factors.at(slot);
+                  const bool is_prior_class =
+                      (factor_type_to_lag_remove_class(factor.get()) == "prior");
+                  if (is_prior_class && factor->keys().size() == 1u) {
+                    const gtsam::Key key = factor->keys().front();
+                    const gtsam::Symbol sym(key);
+                    if (sym.chr() == kPoseSymbolChar && sym.index() == 0u) {
+                      protect_slot = true;
+                      slot_anchor_key = gtsam::DefaultKeyFormatter(key);
+                    }
+                  }
+                }
+
+                if (protect_slot) {
+                  protected_anchor_slots.push_back(slot);
+                  protected_anchor_keys.push_back(slot_anchor_key);
+                } else {
+                  filtered_packet_slots.push_back(slot);
+                }
+              }
+
+              if (!protected_anchor_slots.empty()) {
+                cbs_phase2_deferred_lag_remove_anchor_prior_protected_count =
+                    protected_anchor_slots.size();
+                cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids =
+                    sanitize_forensic_token(
+                        format_factor_slots_preview(protected_anchor_slots, 8));
+                std::ostringstream protected_keys_oss;
+                for (size_t i = 0; i < protected_anchor_keys.size(); ++i) {
+                  if (i > 0u) {
+                    protected_keys_oss << "|";
+                  }
+                  protected_keys_oss << protected_anchor_keys[i];
+                }
+                cbs_phase2_deferred_lag_remove_anchor_prior_keys =
+                    sanitize_forensic_token(protected_keys_oss.str());
+                cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason =
+                    "deferred_replay_protect_anchor_prior_x0";
+                deferred_packet_slots = std::move(filtered_packet_slots);
+                cbs_phase2_deferred_lag_remove_packet_size =
+                    deferred_packet_slots.size();
+                cbs_phase2_deferred_lag_remove_packet_slots_preview =
+                    sanitize_forensic_token(
+                        format_factor_slots_preview(deferred_packet_slots, 8));
+                LOG(WARNING)
+                    << "CBS-heart deferred lag-remove anchor-prior protection "
+                       "fired. curr_kf_id="
+                    << curr_kf_id_
+                    << " protected_count="
+                    << cbs_phase2_deferred_lag_remove_anchor_prior_protected_count
+                    << " protected_slots="
+                    << cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids
+                    << " protected_keys="
+                    << cbs_phase2_deferred_lag_remove_anchor_prior_keys
+                    << " replay_packet_size_after_protection="
+                    << cbs_phase2_deferred_lag_remove_packet_size;
+              }
+            }
+
+            const auto run_deferred_packet_probe =
+                [&](const gtsam::FactorIndices& probe_remove_slots,
+                    std::string* reason_out) {
+                  try {
+                    cbs::BaseSAM probe_isam(
+                        static_cast<const cbs::BaseSAM&>(*cbs_optimizer_));
+                    cbs::BPSAM::UpdateParams probe_params;
+                    probe_params.removeFactorIndices = probe_remove_slots;
+                    const gtsam::NonlinearFactorGraph empty_factors;
+                    const gtsam::Values empty_theta;
+                    const gtsam::ISAM2UpdateParams probe_isam_params =
+                        static_cast<gtsam::ISAM2UpdateParams>(probe_params);
+                    (void)probe_isam.update(empty_factors,
+                                            empty_theta,
+                                            probe_isam_params);
+                    if (reason_out) {
+                      *reason_out = "success";
+                    }
+                    return true;
+                  } catch (const std::exception& e) {
+                    if (reason_out) {
+                      *reason_out = std::string("probe_failed:") + e.what();
+                    }
+                    return false;
+                  } catch (...) {
+                    if (reason_out) {
+                      *reason_out = "probe_failed:unknown_exception";
+                    }
+                    return false;
+                  }
+                };
+
+            bool failing_subset_found = false;
+            gtsam::FactorIndices first_failing_subset;
+            std::string replay_probe_reason = "none";
+            for (size_t subset_size = 1u;
+                 subset_size <= deferred_packet_slots.size();
+                 ++subset_size) {
+              gtsam::FactorIndices probe_subset(deferred_packet_slots.begin(),
+                                                deferred_packet_slots.begin() +
+                                                    subset_size);
+              std::string probe_reason = "none";
+              const bool probe_ok =
+                  run_deferred_packet_probe(probe_subset, &probe_reason);
+              if (!probe_ok) {
+                failing_subset_found = true;
+                first_failing_subset = std::move(probe_subset);
+                replay_probe_reason = probe_reason;
+                break;
+              }
+            }
+
+            lag_slot_set.clear();
+            if (failing_subset_found && !first_failing_subset.empty()) {
+              deferred_replay_slot_set.insert(first_failing_subset.begin(),
+                                              first_failing_subset.end());
+              cbs_phase2_deferred_lag_remove_replay_subset_size =
+                  first_failing_subset.size();
+              cbs_phase2_deferred_lag_remove_replay_first_bad_slot =
+                  static_cast<long long>(first_failing_subset.back());
+              const size_t first_bad_slot =
+                  static_cast<size_t>(
+                      cbs_phase2_deferred_lag_remove_replay_first_bad_slot);
+              const gtsam::NonlinearFactorGraph& cbs_factors =
+                  cbs_optimizer_->getFactorsUnsafe();
+              std::string first_bad_type = "missing";
+              if (cbs_factors.exists(first_bad_slot) &&
+                  cbs_factors.at(first_bad_slot)) {
+                first_bad_type =
+                    classify_forensic_factor_type(cbs_factors.at(first_bad_slot).get());
+              }
+              cbs_phase2_deferred_lag_remove_replay_first_bad_factor_type =
+                  sanitize_forensic_token(first_bad_type);
+              cbs_phase2_deferred_lag_remove_replay_first_bad_factor_keys =
+                  sanitize_forensic_token(
+                      format_factor_keys_for_slot(cbs_factors, first_bad_slot));
+              cbs_phase2_deferred_lag_remove_replay_failure_stage =
+                  "probe_update_call";
+              cbs_phase2_deferred_lag_remove_replay_failure_reason =
+                  sanitize_forensic_token(replay_probe_reason);
+              cbs_phase2_lag_remove_filter_reason =
+                  "deferred_lag_remove_replay_known_bad_subset_deferred";
+              cbs_phase2_lag_remove_deferral_reason =
+                  "deferred_lag_remove_replay_known_bad_subset_deferred";
+              if (cbs_phase2_remove_guard_reason == "none") {
+                cbs_phase2_remove_guard_reason =
+                    cbs_phase2_lag_remove_filter_reason;
+              }
+              LOG(WARNING)
+                  << "CBS-heart deferred lag-remove replay found failing prefix "
+                     "subset. curr_kf_id="
+                  << curr_kf_id_
+                  << " deferred_packet_size="
+                  << cbs_phase2_deferred_lag_remove_packet_size
+                  << " replay_subset_size="
+                  << cbs_phase2_deferred_lag_remove_replay_subset_size
+                  << " first_bad_slot="
+                  << cbs_phase2_deferred_lag_remove_replay_first_bad_slot
+                  << " first_bad_factor_type="
+                  << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_type
+                  << " first_bad_factor_keys="
+                  << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_keys
+                  << " replay_failure_reason="
+                  << cbs_phase2_deferred_lag_remove_replay_failure_reason
+                  << " action=defer_known_bad_subset";
+            } else {
+              deferred_replay_slot_set.insert(deferred_packet_slots.begin(),
+                                              deferred_packet_slots.end());
+              lag_slot_set.insert(deferred_packet_slots.begin(),
+                                  deferred_packet_slots.end());
+              cbs_phase2_deferred_lag_remove_replay_subset_size =
+                  deferred_packet_slots.size();
+              cbs_phase2_deferred_lag_remove_replay_failure_stage =
+                  "probe_update_call";
+              cbs_phase2_deferred_lag_remove_replay_failure_reason =
+                  "no_subset_probe_failure";
+              cbs_phase2_lag_remove_filter_reason =
+                  "deferred_lag_remove_replay_no_subset_failure";
+              cbs_phase2_lag_remove_deferral_reason =
+                  "deferred_lag_remove_replay_no_subset_failure";
+              if (cbs_phase2_remove_guard_reason == "none") {
+                cbs_phase2_remove_guard_reason =
+                    cbs_phase2_lag_remove_filter_reason;
+              }
+              LOG(WARNING)
+                  << "CBS-heart deferred lag-remove replay found no failing "
+                     "subset. curr_kf_id="
+                  << curr_kf_id_
+                  << " deferred_packet_size="
+                  << cbs_phase2_deferred_lag_remove_packet_size
+                  << " replay_subset_size="
+                  << cbs_phase2_deferred_lag_remove_replay_subset_size
+                  << " replay_failure_reason="
+                  << cbs_phase2_deferred_lag_remove_replay_failure_reason;
+            }
+            cbs_phase2_deferred_lag_remove_packet_pending_ = false;
+            cbs_phase2_deferred_lag_remove_packet_slots_.clear();
+            cbs_phase2_deferred_lag_remove_packet_source_kf_id_ = 0;
+            cbs_phase2_lag_remove_slots_raw = lag_slot_set.size();
+            cbs_phase2_lag_remove_factor_type_counts_raw =
+                format_lag_remove_class_counts(
+                    classify_lag_remove_slots(lag_slot_set));
+          }
+          const std::string class_filter_spec_raw =
+              FLAGS_cbs_diag_phase2_exclude_lag_remove_factor_classes_first_post_boundary_epoch;
+          if (cbs_phase2_first_post_boundary_epoch && !lag_slot_set.empty() &&
+              !class_filter_spec_raw.empty() &&
+              !cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch) {
+            std::unordered_set<std::string> excluded_classes;
+            std::stringstream class_filter_stream(class_filter_spec_raw);
+            std::string token;
+            while (std::getline(class_filter_stream, token, ',')) {
+              token.erase(std::remove_if(token.begin(),
+                                         token.end(),
+                                         [](unsigned char c) {
+                                           return std::isspace(c);
+                                         }),
+                          token.end());
+              std::transform(token.begin(),
+                             token.end(),
+                             token.begin(),
+                             [](unsigned char c) { return std::tolower(c); });
+              if (token == "imu" || token == "between" || token == "prior" ||
+                  token == "other") {
+                excluded_classes.insert(token);
+              }
+            }
+            if (!excluded_classes.empty()) {
+              const gtsam::NonlinearFactorGraph& cbs_factors =
+                  cbs_optimizer_->getFactorsUnsafe();
+              std::vector<size_t> class_filtered_slots;
+              class_filtered_slots.reserve(lag_slot_set.size());
+              for (const size_t slot : lag_slot_set) {
+                std::string slot_class = "other";
+                if (cbs_factors.exists(slot) && cbs_factors.at(slot)) {
+                  slot_class =
+                      factor_type_to_lag_remove_class(cbs_factors.at(slot).get());
+                }
+                if (excluded_classes.count(slot_class) > 0u) {
+                  class_filtered_slots.push_back(slot);
+                  bump_lag_remove_class_count(slot_class,
+                                              &lag_remove_filtered_class_counts);
+                }
+              }
+              for (const size_t slot : class_filtered_slots) {
+                lag_slot_set.erase(slot);
+              }
+              if (!class_filtered_slots.empty()) {
+                cbs_phase2_first_post_boundary_factor_class_filter_reason =
+                    "first_post_boundary_exclude_lag_remove_factor_classes";
+                if (cbs_phase2_remove_guard_reason == "none") {
+                  cbs_phase2_remove_guard_reason =
+                      cbs_phase2_first_post_boundary_factor_class_filter_reason;
+                }
+                LOG(WARNING)
+                    << "CBS-heart filtered lag-eviction removeFactorIndices by "
+                       "diagnostic factor class on first post-boundary epoch. "
+                       "curr_kf_id="
+                    << curr_kf_id_
+                    << " excluded_classes="
+                    << sanitize_forensic_token(class_filter_spec_raw)
+                    << " lag_remove_slots_filtered_by_class="
+                    << class_filtered_slots.size()
+                    << " lag_remove_slots_applied=" << lag_slot_set.size();
+              }
+            } else {
+              cbs_phase2_first_post_boundary_factor_class_filter_reason =
+                  "first_post_boundary_no_valid_factor_class_tokens";
+            }
+          }
+          cbs_phase2_lag_remove_factor_type_counts_filtered =
+              format_lag_remove_class_counts(lag_remove_filtered_class_counts);
+          cbs_phase2_lag_remove_slots_applied = lag_slot_set.size();
+          cbs_phase2_lag_remove_factor_type_counts_applied =
+              format_lag_remove_class_counts(
+                  classify_lag_remove_slots(lag_slot_set));
+          if (cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch &&
+              cbs_phase2_first_post_boundary_epoch &&
+              !cbs_phase2_delete_slots_suppression_one_shot_used_ &&
+              !delete_slot_set.empty()) {
+            cbs_phase2_delete_slots_suppressed_this_epoch = true;
+            cbs_phase2_delete_slots_suppression_reason =
+                "diag_skip_delete_slots_first_post_boundary_epoch";
+            cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch = true;
+            cbs_diag_delete_slots_suppressed_count = delete_slot_set.size();
+            cbs_phase2_delete_slots_suppression_one_shot_used_ = true;
+            if (cbs_phase2_remove_guard_reason == "none") {
+              cbs_phase2_remove_guard_reason =
+                  cbs_phase2_delete_slots_suppression_reason;
+            }
+            LOG(WARNING)
+                << "CBS-heart diagnostic isolation: skipped delete_slots on first "
+                   "post-boundary epoch. curr_kf_id="
+                << curr_kf_id_
+                << " prev_oldest_active_frame_id="
+                << lag_window_state.prev_oldest_active_frame_id
+                << " oldest_active_frame_id="
+                << lag_window_state.oldest_active_frame_id
+                << " suppressed_delete_slots="
+                << cbs_diag_delete_slots_suppressed_count;
+            delete_slot_set.clear();
+          }
+          cbs_phase2_delete_slots_size_applied = delete_slot_set.size();
           cbs_remove_delete_slots_requested = delete_slot_set.size();
           cbs_remove_lag_slots_requested = lag_slot_set.size();
 
+          const gtsam::NonlinearFactorGraph& cbs_factors =
+              cbs_optimizer_->getFactorsUnsafe();
+          std::unordered_set<size_t> fresh_lag_slot_set = lag_slot_set;
+          for (const size_t slot : deferred_replay_slot_set) {
+            fresh_lag_slot_set.erase(slot);
+          }
+          gtsam::FactorIndices blocked_fresh_anchor_slots;
+          blocked_fresh_anchor_slots.reserve(fresh_lag_slot_set.size());
+          for (const size_t slot : fresh_lag_slot_set) {
+            if (!cbs_factors.exists(slot) || !cbs_factors.at(slot)) {
+              continue;
+            }
+            const auto factor = cbs_factors.at(slot);
+            const bool is_prior_class =
+                (factor_type_to_lag_remove_class(factor.get()) == "prior");
+            if (!is_prior_class || factor->keys().size() != 1u) {
+              continue;
+            }
+            const gtsam::Symbol sym(factor->keys().front());
+            if (sym.chr() == kPoseSymbolChar && sym.index() == 0u) {
+              blocked_fresh_anchor_slots.push_back(slot);
+            }
+          }
+          if (!blocked_fresh_anchor_slots.empty()) {
+            cbs_phase2_fresh_lag_anchor_prior_protection_fired = true;
+            cbs_phase2_fresh_lag_anchor_prior_blocked_count =
+                blocked_fresh_anchor_slots.size();
+            cbs_phase2_fresh_lag_anchor_prior_blocked_slots =
+                sanitize_forensic_token(
+                    format_factor_slots_preview(blocked_fresh_anchor_slots, 8u));
+            for (const size_t slot : blocked_fresh_anchor_slots) {
+              fresh_lag_slot_set.erase(slot);
+            }
+            if (cbs_phase2_remove_guard_reason == "none") {
+              cbs_phase2_remove_guard_reason =
+                  "fresh_lag_protect_anchor_prior_x0";
+            }
+            LOG(WARNING)
+                << "CBS-heart fresh lag-remove anchor-prior protection fired. "
+                   "curr_kf_id="
+                << curr_kf_id_
+                << " blocked_count="
+                << cbs_phase2_fresh_lag_anchor_prior_blocked_count
+                << " blocked_slots="
+                << cbs_phase2_fresh_lag_anchor_prior_blocked_slots;
+          }
+          cbs_phase2_summary_injection_required_for_lag_remove =
+              cbs_use_phase2_summary_prior_bridge &&
+              (!fresh_lag_slot_set.empty() || !deferred_replay_slot_set.empty());
+          if (cbs_phase2_summary_injection_required_for_lag_remove &&
+              !cbs_phase2_summary_injected_this_epoch) {
+            cbs_phase2_fresh_lag_remove_blocked_due_to_no_summary =
+                !fresh_lag_slot_set.empty();
+            cbs_phase2_fresh_lag_remove_blocked_count = fresh_lag_slot_set.size();
+            fresh_lag_slot_set.clear();
+            if (!deferred_replay_slot_set.empty()) {
+              deferred_replay_slot_set.clear();
+            }
+            if (cbs_phase2_lag_remove_filter_reason == "none") {
+              cbs_phase2_lag_remove_filter_reason =
+                  "summary_not_injected_block_lag_remove";
+            }
+            if (cbs_phase2_lag_remove_deferral_reason == "none") {
+              cbs_phase2_lag_remove_deferral_reason =
+                  "summary_not_injected_block_lag_remove";
+            }
+            if (cbs_phase2_remove_guard_reason == "none") {
+              cbs_phase2_remove_guard_reason =
+                  "summary_not_injected_block_lag_remove";
+            }
+            LOG(WARNING)
+                << "CBS-heart blocked lag-derived wrapper removals because "
+                   "phase2 summary was not injected this epoch. curr_kf_id="
+                << curr_kf_id_
+                << " summary_injected_this_epoch="
+                << (cbs_phase2_summary_injected_this_epoch ? 1 : 0)
+                << " build_only_no_inject="
+                << (cbs_phase2_build_only_no_inject ? 1 : 0)
+                << " summary_mode=" << cbs_phase2_summary_mode
+                << " blocked_fresh_lag_count="
+                << cbs_phase2_fresh_lag_remove_blocked_count;
+          }
+          cbs_phase2_fresh_lag_remove_applied_count = fresh_lag_slot_set.size();
+          cbs_phase2_wrapper_remove_deferred_count =
+              deferred_replay_slot_set.size();
+          cbs_phase2_wrapper_remove_fresh_lag_count = fresh_lag_slot_set.size();
+          cbs_phase2_wrapper_remove_delete_slots_count = delete_slot_set.size();
+          cbs_phase2_wrapper_remove_true_source_counts = sanitize_forensic_token(
+              "deferred:" +
+              std::to_string(cbs_phase2_wrapper_remove_deferred_count) +
+              "|fresh_lag:" +
+              std::to_string(cbs_phase2_wrapper_remove_fresh_lag_count) +
+              "|delete_slots:" +
+              std::to_string(cbs_phase2_wrapper_remove_delete_slots_count));
+          cbs_phase2_wrapper_remove_source_counts = sanitize_forensic_token(
+              "deferred:" +
+              std::to_string(cbs_phase2_wrapper_remove_deferred_count) +
+              "|fresh_lag:" +
+              std::to_string(cbs_phase2_wrapper_remove_fresh_lag_count) +
+              "|delete_slots:" +
+              std::to_string(cbs_phase2_wrapper_remove_delete_slots_count));
+          std::unordered_set<size_t> lag_slot_set_gated = fresh_lag_slot_set;
+          lag_slot_set_gated.insert(deferred_replay_slot_set.begin(),
+                                    deferred_replay_slot_set.end());
+
           std::unordered_set<size_t> raw_remove_set;
           const bool use_lag_only_remove =
+              cbs_use_phase2_summary_prior_bridge ||
               cbs_use_marginalization_prior_bridge ||
               FLAGS_cbs_diag_disable_merge_delete_slots_into_remove_factor_indices;
-          if (use_lag_only_remove) {
-            raw_remove_set = lag_slot_set;
+          const std::string wrapper_label_cfg =
+              cbs_phase2_wrapper_remove_packet_label;
+          bool include_deferred = false;
+          bool include_fresh_lag = false;
+          bool include_delete_slots = false;
+          bool use_full_wrapper_baseline = false;
+          if (wrapper_label_cfg == "full_wrapper_packet") {
+            use_full_wrapper_baseline = true;
+          } else if (wrapper_label_cfg == "deferred_only") {
+            include_deferred = true;
+          } else if (wrapper_label_cfg == "fresh_lag_only") {
+            include_fresh_lag = true;
+          } else if (wrapper_label_cfg == "delete_slots_only") {
+            include_delete_slots = true;
+          } else if (wrapper_label_cfg == "deferred_plus_fresh") {
+            include_deferred = true;
+            include_fresh_lag = true;
+          } else if (wrapper_label_cfg == "deferred_plus_delete_slots") {
+            include_deferred = true;
+            include_delete_slots = true;
+          } else if (wrapper_label_cfg == "fresh_lag_plus_delete_slots") {
+            include_fresh_lag = true;
+            include_delete_slots = true;
           } else {
-            raw_remove_set = delete_slot_set;
-            raw_remove_set.insert(lag_slot_set.begin(), lag_slot_set.end());
+            use_full_wrapper_baseline = true;
+            cbs_phase2_wrapper_remove_packet_label =
+                "full_wrapper_packet_invalid_label_fallback";
           }
+
+          if (use_full_wrapper_baseline) {
+            if (use_lag_only_remove) {
+              include_deferred = true;
+              include_fresh_lag = true;
+            } else {
+              include_deferred = true;
+              include_fresh_lag = true;
+              include_delete_slots = true;
+            }
+            cbs_phase2_wrapper_remove_packet_label = "full_wrapper_packet";
+          } else {
+            cbs_phase2_wrapper_remove_packet_label = wrapper_label_cfg;
+          }
+          if (include_deferred) {
+            raw_remove_set.insert(deferred_replay_slot_set.begin(),
+                                  deferred_replay_slot_set.end());
+          }
+          if (include_fresh_lag) {
+            raw_remove_set.insert(fresh_lag_slot_set.begin(),
+                                  fresh_lag_slot_set.end());
+          }
+          if (include_delete_slots) {
+            raw_remove_set.insert(delete_slot_set.begin(), delete_slot_set.end());
+          }
+
+          std::unordered_set<size_t> expected_source_union;
+          if (include_deferred) {
+            expected_source_union.insert(deferred_replay_slot_set.begin(),
+                                         deferred_replay_slot_set.end());
+          }
+          if (include_fresh_lag) {
+            expected_source_union.insert(fresh_lag_slot_set.begin(),
+                                         fresh_lag_slot_set.end());
+          }
+          if (include_delete_slots) {
+            expected_source_union.insert(delete_slot_set.begin(),
+                                         delete_slot_set.end());
+          }
+          cbs_phase2_wrapper_remove_source_coherence_ok =
+              (raw_remove_set == expected_source_union);
+          if (!cbs_phase2_wrapper_remove_source_coherence_ok) {
+            LOG(ERROR)
+                << "CBS-heart wrapper remove source coherence mismatch. "
+                   "curr_kf_id="
+                << curr_kf_id_
+                << " packet_label=" << cbs_phase2_wrapper_remove_packet_label
+                << " raw_remove_count=" << raw_remove_set.size()
+                << " expected_union_count=" << expected_source_union.size()
+                << " deferred_count=" << deferred_replay_slot_set.size()
+                << " fresh_lag_count=" << fresh_lag_slot_set.size()
+                << " delete_slots_count=" << delete_slot_set.size();
+          }
+          cbs_phase2_wrapper_remove_total_count = raw_remove_set.size();
+          cbs_phase2_wrapper_remove_packet_label =
+              sanitize_forensic_token(cbs_phase2_wrapper_remove_packet_label);
+
           cbs_remove_indices_requested = raw_remove_set.size();
 
           cbs_remove_from_delete_only = 0u;
@@ -11608,7 +13290,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           cbs_remove_from_both = 0u;
           for (const size_t slot : raw_remove_set) {
             const bool in_delete = delete_slot_set.count(slot) > 0u;
-            const bool in_lag = lag_slot_set.count(slot) > 0u;
+            const bool in_lag = lag_slot_set_gated.count(slot) > 0u;
             if (in_delete && in_lag) {
               ++cbs_remove_from_both;
             } else if (in_delete) {
@@ -11622,8 +13304,6 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                                                  raw_remove_set.end());
           std::sort(raw_remove_indices.begin(), raw_remove_indices.end());
 
-          const gtsam::NonlinearFactorGraph& cbs_factors =
-              cbs_optimizer_->getFactorsUnsafe();
           size_t dropped_remove_slots = 0u;
           params.removeFactorIndices.reserve(raw_remove_indices.size());
           for (const size_t slot : raw_remove_indices) {
@@ -11663,9 +13343,13 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
 
           cbs_remove_smart_factor_slots = 0u;
           cbs_remove_non_smart_slots = 0u;
+          std::unordered_set<gtsam::Key> remove_touched_keys;
           for (const size_t slot : params.removeFactorIndices) {
             if (!cbs_factors.exists(slot) || !cbs_factors.at(slot)) {
               continue;
+            }
+            for (const gtsam::Key key : cbs_factors.at(slot)->keys()) {
+              remove_touched_keys.insert(key);
             }
             const auto smart_ptr =
                 dynamic_cast<const SmartStereoFactor*>(cbs_factors.at(slot).get());
@@ -11673,6 +13357,19 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               ++cbs_remove_smart_factor_slots;
             } else {
               ++cbs_remove_non_smart_slots;
+            }
+          }
+          cbs_phase2_remove_touched_key_count = remove_touched_keys.size();
+          cbs_phase2_emitted_summary_keys_overlap_remove_keys = false;
+          cbs_phase2_emitted_summary_overlap_key_count = 0u;
+          if (!cbs_phase2_emitted_summary_keys.empty() &&
+              !remove_touched_keys.empty()) {
+            for (const gtsam::Key key : cbs_phase2_emitted_summary_keys) {
+              if (remove_touched_keys.count(key) == 0u) {
+                continue;
+              }
+              cbs_phase2_emitted_summary_keys_overlap_remove_keys = true;
+              ++cbs_phase2_emitted_summary_overlap_key_count;
             }
           }
 
@@ -11706,10 +13403,17 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               << ", eviction_frames=" << lag_window_state.eviction_frames
               << ", stale_state_keys=" << lag_window_state.stale_state_keys
               << ", stale_pose_keys=" << lag_window_state.stale_pose_keys
+              << ", stale_local_factor_slots="
+              << lag_window_state.stale_local_factor_slots
+              << ", stale_belief_factor_slots="
+              << lag_window_state.stale_belief_factor_slots
+              << ", orphan_belief_factor_slots="
+              << lag_window_state.orphan_belief_factor_slots
+              << ", orphan_robot_keys=" << lag_window_state.orphan_robot_keys
+              << ", orphan_gbp_keys=" << lag_window_state.orphan_gbp_keys
               << ", removed_factor_slots="
               << lag_window_state.remove_factor_indices.size();
     }
-
     auto attempt_cbs_recovery =
         [&](const std::optional<size_t>& failed_index_opt,
             const std::string& trigger_reason) -> bool {
@@ -11872,11 +13576,788 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       }
     };
 
+    const auto build_update_packet_forensics =
+        [&](const gtsam::FactorIndices& remove_slots_this_attempt) {
+          UpdatePacketForensics forensic;
+          forensic.input_new_factors_count = cbs_update_factors.size();
+          forensic.input_new_values_count = new_values.size();
+          forensic.input_timestamps_count = timestamps.size();
+          forensic.input_remove_factor_indices_count =
+              remove_slots_this_attempt.size();
+          forensic.input_delete_slots_count = delete_slots_forensic.size();
+          forensic.input_lag_remove_count = lag_window_state.remove_factor_indices.size();
+          forensic.input_smart_replacements_count = cbs_smart_factor_replacements;
+          forensic.input_smart_new_insertions_count =
+              cbs_smart_factor_new_insertions;
+          forensic.input_anchor_prior_factor_count = cbs_anchor_priors_added;
+          forensic.input_summary_factor_count_attempted =
+              cbs_phase2_summary_factor_count_emitted;
+          forensic.input_summary_factor_count_injected =
+              cbs_phase2_summary_injected
+                  ? cbs_phase2_summary_factor_count_emitted
+                  : 0u;
+
+          std::unordered_set<gtsam::Key> new_values_key_set;
+          std::unordered_set<gtsam::Key> new_values_local_state_keys;
+          std::unordered_set<gtsam::Key> current_frame_keys;
+          std::unordered_set<gtsam::Key> prev_frame_keys;
+          std::unordered_set<gtsam::Key> oldest_active_frame_keys;
+          const auto& variable_index = cbs_optimizer_->getVariableIndex();
+
+          for (const auto& kv : new_values) {
+            const gtsam::Key key = kv.key;
+            const gtsam::Symbol sym(key);
+            const bool inserted = new_values_key_set.insert(key).second;
+            if (!inserted) {
+              ++forensic.duplicate_new_values_key_count;
+              if (forensic.first_duplicate_new_values_key < 0) {
+                forensic.first_duplicate_new_values_key =
+                    static_cast<long long>(key);
+              }
+            }
+            if (variable_index.find(key) != variable_index.end()) {
+              ++forensic.duplicate_active_insertion_key_count;
+              if (forensic.first_duplicate_active_insertion_key < 0) {
+                forensic.first_duplicate_active_insertion_key =
+                    static_cast<long long>(key);
+              }
+            }
+
+            if (sym.chr() == kPoseSymbolChar) {
+              ++forensic.new_values_pose_key_count;
+              new_values_local_state_keys.insert(key);
+              if (static_cast<FrameId>(sym.index()) == curr_kf_id_) {
+                current_frame_keys.insert(key);
+              }
+            } else if (sym.chr() == kVelocitySymbolChar) {
+              ++forensic.new_values_velocity_key_count;
+              new_values_local_state_keys.insert(key);
+              if (static_cast<FrameId>(sym.index()) == curr_kf_id_) {
+                current_frame_keys.insert(key);
+              }
+            } else if (sym.chr() == kImuBiasSymbolChar) {
+              ++forensic.new_values_bias_key_count;
+              new_values_local_state_keys.insert(key);
+              if (static_cast<FrameId>(sym.index()) == curr_kf_id_) {
+                current_frame_keys.insert(key);
+              }
+            } else if (sym.chr() == 'r') {
+              ++forensic.new_values_robot_key_count;
+              if (forensic.first_unexpected_key < 0) {
+                forensic.first_unexpected_key = static_cast<long long>(key);
+                forensic.first_unexpected_key_type = "robot";
+              }
+            } else if (sym.chr() == 'p') {
+              ++forensic.new_values_public_key_count;
+              if (forensic.first_unexpected_key < 0) {
+                forensic.first_unexpected_key = static_cast<long long>(key);
+                forensic.first_unexpected_key_type = "public";
+              }
+            } else if (std::isalpha(static_cast<unsigned char>(sym.chr()))) {
+              ++forensic.new_values_belief_key_count;
+              if (forensic.first_unexpected_key < 0) {
+                forensic.first_unexpected_key = static_cast<long long>(key);
+                forensic.first_unexpected_key_type = "belief";
+              }
+            } else {
+              ++forensic.new_values_other_key_count;
+              if (forensic.first_unexpected_key < 0) {
+                forensic.first_unexpected_key = static_cast<long long>(key);
+                forensic.first_unexpected_key_type = "other";
+              }
+            }
+
+            if (sym.chr() == kPoseSymbolChar || sym.chr() == kVelocitySymbolChar ||
+                sym.chr() == kImuBiasSymbolChar) {
+              if (timestamps.find(key) == timestamps.end()) {
+                ++forensic.missing_timestamp_key_count;
+                if (forensic.first_missing_timestamp_key < 0) {
+                  forensic.first_missing_timestamp_key =
+                      static_cast<long long>(key);
+                }
+              }
+            }
+          }
+
+          current_frame_keys.insert(gtsam::Symbol(kPoseSymbolChar, curr_kf_id_).key());
+          current_frame_keys.insert(
+              gtsam::Symbol(kVelocitySymbolChar, curr_kf_id_).key());
+          current_frame_keys.insert(
+              gtsam::Symbol(kImuBiasSymbolChar, curr_kf_id_).key());
+          if (curr_kf_id_ > 0u) {
+            const FrameId prev_kf_id = curr_kf_id_ - 1u;
+            prev_frame_keys.insert(
+                gtsam::Symbol(kPoseSymbolChar, prev_kf_id).key());
+            prev_frame_keys.insert(
+                gtsam::Symbol(kVelocitySymbolChar, prev_kf_id).key());
+            prev_frame_keys.insert(
+                gtsam::Symbol(kImuBiasSymbolChar, prev_kf_id).key());
+          }
+          const FrameId oldest_active_kf_id = lag_window_state.oldest_active_frame_id;
+          oldest_active_frame_keys.insert(
+              gtsam::Symbol(kPoseSymbolChar, oldest_active_kf_id).key());
+          oldest_active_frame_keys.insert(
+              gtsam::Symbol(kVelocitySymbolChar, oldest_active_kf_id).key());
+          oldest_active_frame_keys.insert(
+              gtsam::Symbol(kImuBiasSymbolChar, oldest_active_kf_id).key());
+
+          std::unordered_set<gtsam::Key> boundary_target_keys;
+          boundary_target_keys.insert(phase2_summary_input.summary_target_keys.begin(),
+                                      phase2_summary_input.summary_target_keys.end());
+
+          std::unordered_set<gtsam::Key> new_factor_keys;
+          size_t external_prior_factor_count = 0u;
+          for (size_t idx = 0; idx < cbs_update_factors.size(); ++idx) {
+            const auto& factor = cbs_update_factors.at(idx);
+            if (!factor) {
+              continue;
+            }
+            if (dynamic_cast<const ExternalPosePriorFactor*>(factor.get()) != nullptr) {
+              ++external_prior_factor_count;
+            }
+            bool factor_has_missing_key = false;
+            for (const gtsam::Key key : factor->keys()) {
+              new_factor_keys.insert(key);
+              const bool exists_before_update =
+                  variable_index.find(key) != variable_index.end();
+              const bool supplied_now = new_values_key_set.count(key) > 0u;
+              if (!exists_before_update && !supplied_now) {
+                ++forensic.new_factor_missing_key_count;
+                if (!factor_has_missing_key) {
+                  ++forensic.new_factor_missing_key_factor_count;
+                  factor_has_missing_key = true;
+                }
+                if (forensic.first_missing_factor_key < 0) {
+                  forensic.first_missing_factor_key =
+                      static_cast<long long>(key);
+                  forensic.first_missing_factor_slot =
+                      static_cast<long long>(idx);
+                  forensic.first_missing_factor_type =
+                      classify_forensic_factor_type(factor.get());
+                }
+              }
+            }
+          }
+          forensic.input_external_prior_factor_count = external_prior_factor_count;
+
+          auto analyze_slots = [&](const gtsam::FactorIndices& slots) {
+            ForensicSlotSetAnalysis analysis;
+            const gtsam::NonlinearFactorGraph& factors =
+                cbs_optimizer_->getFactorsUnsafe();
+            for (const gtsam::FactorIndex slot : slots) {
+              if (!factors.exists(slot)) {
+                ++analysis.type_counts.missing_slot;
+                if (analysis.first_slot < 0) {
+                  analysis.first_slot = static_cast<long long>(slot);
+                  analysis.first_type = "missing_slot";
+                }
+                continue;
+              }
+              const auto& factor = factors.at(slot);
+              if (!factor) {
+                ++analysis.type_counts.null_factor;
+                if (analysis.first_slot < 0) {
+                  analysis.first_slot = static_cast<long long>(slot);
+                  analysis.first_type = "null";
+                }
+                continue;
+              }
+              const std::string factor_type =
+                  classify_forensic_factor_type(factor.get());
+              bump_forensic_factor_type(factor_type, &analysis.type_counts);
+              if (analysis.first_slot < 0) {
+                analysis.first_slot = static_cast<long long>(slot);
+                analysis.first_type = factor_type;
+              }
+              bool references_new_values = false;
+              bool references_boundary_targets = false;
+              bool references_current_frame = false;
+              bool references_prev_frame = false;
+              bool references_oldest_active_frame = false;
+              for (const gtsam::Key key : factor->keys()) {
+                analysis.touched_keys.insert(key);
+                if (new_values_key_set.count(key) > 0u) {
+                  references_new_values = true;
+                  analysis.refs_new_values_keys.insert(key);
+                }
+                if (boundary_target_keys.count(key) > 0u) {
+                  references_boundary_targets = true;
+                  analysis.refs_boundary_target_keys.insert(key);
+                }
+                if (current_frame_keys.count(key) > 0u) {
+                  references_current_frame = true;
+                  analysis.refs_current_frame_keys.insert(key);
+                }
+                if (prev_frame_keys.count(key) > 0u) {
+                  references_prev_frame = true;
+                  analysis.refs_prev_frame_keys.insert(key);
+                }
+                if (oldest_active_frame_keys.count(key) > 0u) {
+                  references_oldest_active_frame = true;
+                  analysis.refs_oldest_active_frame_keys.insert(key);
+                }
+              }
+              if (references_new_values) {
+                ++analysis.refs_new_values_factor_count;
+              }
+              if (references_boundary_targets) {
+                ++analysis.refs_boundary_targets_factor_count;
+              }
+              if (references_current_frame) {
+                ++analysis.refs_current_frame_factor_count;
+              }
+              if (references_prev_frame) {
+                ++analysis.refs_prev_frame_factor_count;
+              }
+              if (references_oldest_active_frame) {
+                ++analysis.refs_oldest_active_frame_factor_count;
+              }
+            }
+            return analysis;
+          };
+
+          forensic.remove_analysis = analyze_slots(remove_slots_this_attempt);
+          forensic.delete_analysis = analyze_slots(delete_slots_forensic);
+
+          for (const gtsam::Key key : forensic.remove_analysis.touched_keys) {
+            if (new_factor_keys.count(key) > 0u) {
+              ++forensic.remove_intersects_new_factor_keys_count;
+              if (forensic.first_remove_new_factor_overlap_key < 0) {
+                forensic.first_remove_new_factor_overlap_key =
+                    static_cast<long long>(key);
+              }
+            }
+            if (new_values_key_set.count(key) > 0u) {
+              ++forensic.remove_intersects_new_values_keys_count;
+              if (forensic.first_remove_new_values_overlap_key < 0) {
+                forensic.first_remove_new_values_overlap_key =
+                    static_cast<long long>(key);
+              }
+            }
+            if (boundary_target_keys.count(key) > 0u) {
+              ++forensic.remove_intersects_boundary_target_keys_count;
+              if (forensic.first_remove_boundary_target_overlap_key < 0) {
+                forensic.first_remove_boundary_target_overlap_key =
+                    static_cast<long long>(key);
+              }
+            }
+          }
+
+          if (forensic.duplicate_new_values_key_count > 0u) {
+            forensic.first_inconsistency_reason = "duplicate_new_values_key";
+            forensic.first_inconsistency_key =
+                forensic.first_duplicate_new_values_key;
+          } else if (forensic.duplicate_active_insertion_key_count > 0u) {
+            forensic.first_inconsistency_reason = "duplicate_active_insertion_key";
+            forensic.first_inconsistency_key =
+                forensic.first_duplicate_active_insertion_key;
+          } else if (forensic.missing_timestamp_key_count > 0u) {
+            forensic.first_inconsistency_reason = "missing_timestamp_for_new_key";
+            forensic.first_inconsistency_key = forensic.first_missing_timestamp_key;
+          } else if (forensic.remove_intersects_new_factor_keys_count > 0u) {
+            forensic.first_inconsistency_reason = "remove_touches_new_factor_key";
+            forensic.first_inconsistency_key =
+                forensic.first_remove_new_factor_overlap_key;
+            forensic.first_inconsistency_factor_slot =
+                forensic.remove_analysis.first_slot;
+            forensic.first_inconsistency_factor_type =
+                forensic.remove_analysis.first_type;
+            if (forensic.remove_analysis.first_slot >= 0) {
+              forensic.first_inconsistency_factor_keys = format_factor_keys_for_slot(
+                  cbs_optimizer_->getFactorsUnsafe(),
+                  static_cast<size_t>(forensic.remove_analysis.first_slot));
+            }
+          } else if (forensic.new_factor_missing_key_count > 0u) {
+            forensic.first_inconsistency_reason = "new_factor_references_missing_key";
+            forensic.first_inconsistency_key = forensic.first_missing_factor_key;
+            forensic.first_inconsistency_factor_slot =
+                forensic.first_missing_factor_slot;
+            forensic.first_inconsistency_factor_type =
+                forensic.first_missing_factor_type;
+            if (forensic.first_missing_factor_slot >= 0) {
+              forensic.first_inconsistency_factor_keys = format_factor_keys_for_slot(
+                  cbs_update_factors,
+                  static_cast<size_t>(forensic.first_missing_factor_slot));
+            }
+          }
+
+          return forensic;
+        };
+
+    const auto classify_primary_failure_location =
+        [&](const std::string& phase_label,
+            const bool failure_after_bpsam_update_call) {
+          if (phase_label == "bpsam_update_call") {
+            return std::string("inside_update_call");
+          }
+          if (phase_label == "estimate_readback" ||
+              failure_after_bpsam_update_call) {
+            return std::string("after_readback");
+          }
+          return std::string("before_update_call");
+        };
+
+    const auto format_compact_remove_type_counts =
+        [&](const ForensicFactorTypeCounts& counts) {
+          const size_t other_bucket =
+              counts.smart + counts.external_prior + counts.other +
+              counts.missing_slot + counts.null_factor;
+          std::ostringstream oss;
+          oss << "imu:" << counts.imu << "|between:" << counts.between
+              << "|prior:" << counts.prior << "|other:" << other_bucket;
+          return oss.str();
+        };
+
+    const auto build_primary_update_packet_ab_snapshot =
+        [&](const std::string& snapshot_label,
+            const UpdatePacketForensics& forensic,
+            const std::string& failure_stage,
+            const std::string& failure_reason,
+            const std::string& exception_phase_label,
+            const std::string& exception_message,
+            const bool failure_after_bpsam_update_call,
+            const long long offending_factor_slot_guess,
+            const std::string& offending_factor_type_guess,
+            const std::string& offending_factor_keys_guess) {
+          std::ostringstream oss;
+          oss << std::setprecision(12)
+              << "[CBS][PrimaryUpdatePacketAB] snapshot=" << snapshot_label
+              << " curr_kf_id=" << curr_kf_id_
+              << " lag_oldest_active_frame_id="
+              << lag_window_state.oldest_active_frame_id
+              << " input_new_factors_count=" << forensic.input_new_factors_count
+              << " input_new_values_count=" << forensic.input_new_values_count
+              << " input_timestamps_count=" << forensic.input_timestamps_count
+              << " input_delete_slots_count=" << forensic.input_delete_slots_count
+              << " input_lag_remove_count=" << forensic.input_lag_remove_count
+              << " input_remove_factor_indices_count="
+              << forensic.input_remove_factor_indices_count
+              << " summary_attempted=" << (cbs_phase2_summary_attempted ? 1 : 0)
+              << " summary_injected=" << (cbs_phase2_summary_injected ? 1 : 0)
+              << " summary_injected_this_epoch="
+              << (cbs_phase2_summary_injected_this_epoch ? 1 : 0)
+              << " summary_build_only=" << (cbs_phase2_build_only_no_inject ? 1 : 0)
+              << " new_values_key_types=x:" << forensic.new_values_pose_key_count
+              << "|v:" << forensic.new_values_velocity_key_count
+              << "|b:" << forensic.new_values_bias_key_count
+              << "|other:" << forensic.new_values_other_key_count
+              << " remove_factor_types="
+              << format_compact_remove_type_counts(forensic.remove_analysis.type_counts)
+              << " remove_touch_curr_frame_factors="
+              << forensic.remove_analysis.refs_current_frame_factor_count
+              << " remove_touch_prev_frame_factors="
+              << forensic.remove_analysis.refs_prev_frame_factor_count
+              << " remove_touch_oldest_active_frame_factors="
+              << forensic.remove_analysis.refs_oldest_active_frame_factor_count
+              << " remove_touch_boundary_target_factors="
+              << forensic.remove_analysis.refs_boundary_targets_factor_count
+              << " remove_intersects_new_factor_keys_count="
+              << forensic.remove_intersects_new_factor_keys_count
+              << " remove_intersects_new_values_keys_count="
+              << forensic.remove_intersects_new_values_keys_count
+              << " remove_intersects_boundary_target_keys_count="
+              << forensic.remove_intersects_boundary_target_keys_count
+              << " first_offending_factor_slot="
+              << (forensic.first_inconsistency_factor_slot >= 0
+                      ? forensic.first_inconsistency_factor_slot
+                      : offending_factor_slot_guess)
+              << " first_offending_factor_type="
+              << sanitize_forensic_token(
+                     forensic.first_inconsistency_factor_type != "none"
+                         ? forensic.first_inconsistency_factor_type
+                         : offending_factor_type_guess)
+              << " first_offending_factor_keys="
+              << sanitize_forensic_token(
+                     forensic.first_inconsistency_factor_keys != "none"
+                         ? forensic.first_inconsistency_factor_keys
+                         : offending_factor_keys_guess)
+              << " first_exception_phase_label="
+              << sanitize_forensic_token(exception_phase_label)
+              << " first_exception_message="
+              << sanitize_forensic_token(exception_message)
+              << " failure_stage=" << sanitize_forensic_token(failure_stage)
+              << " failure_location="
+              << classify_primary_failure_location(exception_phase_label,
+                                                  failure_after_bpsam_update_call)
+              << " failure_reason=" << sanitize_forensic_token(failure_reason);
+          return oss.str();
+        };
+
+    const auto log_first_bad_forensic_snapshot =
+        [&](const std::string& snapshot_label,
+            const std::string& failure_stage,
+            const std::string& failure_reason,
+            const bool failure_after_bpsam_update_call,
+            const bool remove_enabled_this_attempt,
+            const gtsam::FactorIndices& remove_slots_this_attempt,
+            const std::string& exception_phase_label,
+            const std::string& exception_message,
+            const long long offending_key_guess,
+            const long long offending_factor_slot_guess,
+            const std::string& offending_factor_type_guess,
+            const std::string& offending_factor_keys_guess) {
+          std::cerr << build_primary_update_packet_ab_snapshot(
+                           snapshot_label,
+                           cbs_update_packet_forensics,
+                           failure_stage,
+                           failure_reason,
+                           exception_phase_label,
+                           exception_message,
+                           failure_after_bpsam_update_call,
+                           offending_factor_slot_guess,
+                           offending_factor_type_guess,
+                           offending_factor_keys_guess)
+                    << std::endl;
+          std::cerr << std::setprecision(12)
+                    << "[CBS][FirstBadEpochForensics] snapshot="
+                    << snapshot_label
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " timestamp_lkf_ns=" << timestamp_lkf_
+                    << " cbs_phase2_summary_attempted="
+                    << (cbs_phase2_summary_attempted ? 1 : 0)
+                    << " cbs_phase2_summary_injected="
+                    << (cbs_phase2_summary_injected ? 1 : 0)
+                    << " cbs_phase2_build_only_no_inject="
+                    << (cbs_phase2_build_only_no_inject ? 1 : 0)
+                    << " remove_factor_indices_enabled_this_attempt="
+                    << (remove_enabled_this_attempt ? 1 : 0)
+                    << " delete_slots_size=" << delete_slots_forensic.size()
+                    << " delete_slots_size_raw="
+                    << cbs_phase2_delete_slots_size_raw
+                    << " delete_slots_size_applied="
+                    << cbs_phase2_delete_slots_size_applied
+                    << " delete_slots_first_slots="
+                    << format_factor_slots_preview(delete_slots_forensic, 8u)
+                    << " lag_remove_factor_indices_size="
+                    << lag_window_state.remove_factor_indices.size()
+                    << " lag_remove_factor_indices_first_slots="
+                    << format_factor_slots_preview(
+                           lag_window_state.remove_factor_indices, 8u)
+                    << " remove_factor_indices_size="
+                    << remove_slots_this_attempt.size()
+                    << " remove_factor_indices_first_slots="
+                    << format_factor_slots_preview(remove_slots_this_attempt, 8u)
+                    << " cbs_phase2_wrapper_remove_source_counts="
+                    << cbs_phase2_wrapper_remove_source_counts
+                    << " cbs_phase2_wrapper_remove_true_source_counts="
+                    << cbs_phase2_wrapper_remove_true_source_counts
+                    << " cbs_phase2_wrapper_remove_packet_label="
+                    << cbs_phase2_wrapper_remove_packet_label
+                    << " cbs_phase2_wrapper_remove_deferred_count="
+                    << cbs_phase2_wrapper_remove_deferred_count
+                    << " cbs_phase2_wrapper_remove_fresh_lag_count="
+                    << cbs_phase2_wrapper_remove_fresh_lag_count
+                    << " cbs_phase2_fresh_lag_remove_applied_count="
+                    << cbs_phase2_fresh_lag_remove_applied_count
+                    << " cbs_phase2_fresh_lag_remove_blocked_due_to_no_summary="
+                    << (cbs_phase2_fresh_lag_remove_blocked_due_to_no_summary ? 1
+                                                                               : 0)
+                    << " cbs_phase2_fresh_lag_remove_blocked_count="
+                    << cbs_phase2_fresh_lag_remove_blocked_count
+                    << " cbs_phase2_summary_injection_required_for_lag_remove="
+                    << (cbs_phase2_summary_injection_required_for_lag_remove ? 1 : 0)
+                    << " cbs_phase2_summary_injected_this_epoch="
+                    << (cbs_phase2_summary_injected_this_epoch ? 1 : 0)
+                    << " cbs_phase2_wrapper_remove_delete_slots_count="
+                    << cbs_phase2_wrapper_remove_delete_slots_count
+                    << " cbs_phase2_wrapper_remove_total_count="
+                    << cbs_phase2_wrapper_remove_total_count
+                    << " cbs_phase2_wrapper_remove_source_coherence_ok="
+                    << (cbs_phase2_wrapper_remove_source_coherence_ok ? 1 : 0)
+                    << " cbs_phase2_fresh_lag_anchor_prior_protection_fired="
+                    << (cbs_phase2_fresh_lag_anchor_prior_protection_fired ? 1 : 0)
+                    << " cbs_phase2_fresh_lag_anchor_prior_blocked_count="
+                    << cbs_phase2_fresh_lag_anchor_prior_blocked_count
+                    << " cbs_phase2_fresh_lag_anchor_prior_blocked_slots="
+                    << cbs_phase2_fresh_lag_anchor_prior_blocked_slots
+                    << " lag_stale_local_keys="
+                    << lag_window_state.stale_state_keys
+                    << " lag_stale_local_factor_slots="
+                    << lag_window_state.stale_local_factor_slots
+                    << " lag_stale_belief_factor_slots="
+                    << lag_window_state.stale_belief_factor_slots
+                    << " lag_orphan_belief_factor_slots="
+                    << lag_window_state.orphan_belief_factor_slots
+                    << " lag_orphan_robot_keys="
+                    << lag_window_state.orphan_robot_keys
+                    << " lag_orphan_gbp_keys="
+                    << lag_window_state.orphan_gbp_keys
+                    << " cbs_phase2_expanded_selected_factor_slots_count="
+                    << cbs_phase2_expanded_selected_factor_slots_count
+                    << " cbs_phase2_expanded_selected_key_count="
+                    << cbs_phase2_expanded_selected_key_count
+                    << " cbs_phase2_expanded_eliminated_key_count="
+                    << cbs_phase2_expanded_eliminated_key_count
+                    << " cbs_phase2_expanded_emitted_factor_count="
+                    << cbs_phase2_expanded_emitted_factor_count
+                    << " cbs_phase2_summary_targets="
+                    << cbs_phase2_summary_targets
+                    << " cbs_phase2_summary_requested_target_count="
+                    << cbs_phase2_summary_requested_targets
+                    << " cbs_phase2_summary_realizable_target_count="
+                    << cbs_phase2_summary_realizable_targets
+                    << " cbs_phase2_summary_dropped_target_count="
+                    << cbs_phase2_summary_dropped_targets
+                    << " cbs_phase2_emitted_summary_key_count="
+                    << cbs_phase2_emitted_summary_key_count
+                    << " cbs_phase2_remove_touched_key_count="
+                    << cbs_phase2_remove_touched_key_count
+                    << " cbs_phase2_emitted_summary_keys_overlap_remove_keys="
+                    << (cbs_phase2_emitted_summary_keys_overlap_remove_keys ? 1 : 0)
+                    << " cbs_phase2_emitted_summary_overlap_key_count="
+                    << cbs_phase2_emitted_summary_overlap_key_count
+                    << " cbs_phase2_boundary_transition_this_epoch="
+                    << (cbs_phase2_boundary_transition_this_epoch ? 1 : 0)
+                    << " first_post_boundary_epoch="
+                    << (cbs_phase2_first_post_boundary_epoch ? 1 : 0)
+                    << " cbs_phase2_lag_plan_cache_changed_this_epoch="
+                    << (cbs_phase2_lag_plan_cache_changed_this_epoch ? 1 : 0)
+                    << " cbs_phase2_incremental_remove_consumed_this_epoch="
+                    << (cbs_phase2_incremental_remove_consumed_this_epoch ? 1 : 0)
+                    << " cbs_phase2_skip_lag_plan_commit_consume_effective="
+                    << (cbs_phase2_skip_lag_plan_commit_consume_effective ? 1 : 0)
+                    << " cbs_phase2_incremental_remove_candidate_count="
+                    << cbs_phase2_incremental_remove_candidate_count
+                    << " cbs_phase2_incremental_remove_candidate_first_slots="
+                    << cbs_phase2_incremental_remove_candidate_preview
+                    << " cbs_diag_phase2_suppress_delete_slots_first_post_boundary="
+                    << (FLAGS_cbs_diag_phase2_suppress_delete_slots_first_post_boundary
+                            ? 1
+                            : 0)
+                    << " cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch="
+                    << (cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch
+                            ? 1
+                            : 0)
+                    << " cbs_diag_delete_slots_suppressed_count="
+                    << cbs_diag_delete_slots_suppressed_count
+                    << " cbs_phase2_delete_slots_suppressed_this_epoch="
+                    << (cbs_phase2_delete_slots_suppressed_this_epoch ? 1 : 0)
+                    << " cbs_phase2_delete_slots_suppression_reason="
+                    << cbs_phase2_delete_slots_suppression_reason
+                    << " cbs_phase2_deferred_first_boundary_remove="
+                    << (cbs_phase2_deferred_first_boundary_remove ? 1 : 0)
+                    << " cbs_phase2_deferred_lag_remove_candidate_count="
+                    << cbs_phase2_deferred_lag_remove_candidate_count
+                    << " cbs_phase2_remove_guard_reason="
+                    << cbs_phase2_remove_guard_reason
+                    << " cbs_phase2_lag_remove_slots_raw="
+                    << cbs_phase2_lag_remove_slots_raw
+                    << " cbs_phase2_lag_remove_slots_filtered_boundary_touch="
+                    << cbs_phase2_lag_remove_slots_filtered_boundary_touch
+                    << " cbs_phase2_lag_remove_slots_applied="
+                    << cbs_phase2_lag_remove_slots_applied
+                    << " cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary="
+                    << cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary
+                    << " cbs_phase2_lag_remove_boundary_touch_factor_count="
+                    << cbs_phase2_lag_remove_boundary_touch_factor_count
+                    << " cbs_phase2_lag_remove_filter_reason="
+                    << cbs_phase2_lag_remove_filter_reason
+                    << " cbs_phase2_lag_remove_deferral_reason="
+                    << cbs_phase2_lag_remove_deferral_reason
+                    << " cbs_phase2_lag_remove_factor_type_counts_raw="
+                    << cbs_phase2_lag_remove_factor_type_counts_raw
+                    << " cbs_phase2_lag_remove_factor_type_counts_filtered="
+                    << cbs_phase2_lag_remove_factor_type_counts_filtered
+                    << " cbs_phase2_lag_remove_factor_type_counts_applied="
+                    << cbs_phase2_lag_remove_factor_type_counts_applied
+                    << " deferred_lag_remove_packet_size="
+                    << cbs_phase2_deferred_lag_remove_packet_size
+                    << " deferred_lag_remove_packet_slots="
+                    << cbs_phase2_deferred_lag_remove_packet_slots_preview
+                    << " deferred_lag_remove_replay_subset_size="
+                    << cbs_phase2_deferred_lag_remove_replay_subset_size
+                    << " deferred_lag_remove_replay_first_bad_slot="
+                    << cbs_phase2_deferred_lag_remove_replay_first_bad_slot
+                    << " deferred_lag_remove_replay_first_bad_factor_type="
+                    << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_type
+                    << " deferred_lag_remove_replay_first_bad_factor_keys="
+                    << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_keys
+                    << " deferred_lag_remove_replay_failure_stage="
+                    << cbs_phase2_deferred_lag_remove_replay_failure_stage
+                    << " deferred_lag_remove_replay_failure_reason="
+                    << cbs_phase2_deferred_lag_remove_replay_failure_reason
+                    << " deferred_lag_remove_anchor_prior_protected_count="
+                    << cbs_phase2_deferred_lag_remove_anchor_prior_protected_count
+                    << " deferred_lag_remove_anchor_prior_slot_ids="
+                    << cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids
+                    << " deferred_lag_remove_anchor_prior_keys="
+                    << cbs_phase2_deferred_lag_remove_anchor_prior_keys
+                    << " deferred_lag_remove_anchor_prior_protection_reason="
+                    << cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason
+                    << " cbs_phase2_first_post_boundary_factor_class_filter_reason="
+                    << cbs_phase2_first_post_boundary_factor_class_filter_reason
+                    << " lag_prev_oldest_active_frame_id="
+                    << lag_window_state.prev_oldest_active_frame_id
+                    << " lag_oldest_active_frame_id="
+                    << lag_window_state.oldest_active_frame_id
+                    << " input_new_factors_count="
+                    << cbs_update_packet_forensics.input_new_factors_count
+                    << " input_new_values_count="
+                    << cbs_update_packet_forensics.input_new_values_count
+                    << " input_timestamps_count="
+                    << cbs_update_packet_forensics.input_timestamps_count
+                    << " input_remove_factor_indices_count="
+                    << cbs_update_packet_forensics.input_remove_factor_indices_count
+                    << " input_delete_slots_count="
+                    << cbs_update_packet_forensics.input_delete_slots_count
+                    << " input_lag_remove_count="
+                    << cbs_update_packet_forensics.input_lag_remove_count
+                    << " input_smart_replacements_count="
+                    << cbs_update_packet_forensics.input_smart_replacements_count
+                    << " input_smart_new_insertions_count="
+                    << cbs_update_packet_forensics.input_smart_new_insertions_count
+                    << " input_anchor_prior_factor_count="
+                    << cbs_update_packet_forensics.input_anchor_prior_factor_count
+                    << " input_summary_factor_count_attempted="
+                    << cbs_update_packet_forensics.input_summary_factor_count_attempted
+                    << " input_summary_factor_count_injected="
+                    << cbs_update_packet_forensics.input_summary_factor_count_injected
+                    << " input_external_prior_factor_count="
+                    << cbs_update_packet_forensics.input_external_prior_factor_count
+                    << " new_values_pose_key_count="
+                    << cbs_update_packet_forensics.new_values_pose_key_count
+                    << " new_values_velocity_key_count="
+                    << cbs_update_packet_forensics.new_values_velocity_key_count
+                    << " new_values_bias_key_count="
+                    << cbs_update_packet_forensics.new_values_bias_key_count
+                    << " new_values_robot_key_count="
+                    << cbs_update_packet_forensics.new_values_robot_key_count
+                    << " new_values_public_key_count="
+                    << cbs_update_packet_forensics.new_values_public_key_count
+                    << " new_values_belief_key_count="
+                    << cbs_update_packet_forensics.new_values_belief_key_count
+                    << " new_values_other_key_count="
+                    << cbs_update_packet_forensics.new_values_other_key_count
+                    << " first_unexpected_new_values_key="
+                    << format_forensic_key_token(
+                           cbs_update_packet_forensics.first_unexpected_key)
+                    << " first_unexpected_new_values_key_type="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics.first_unexpected_key_type)
+                    << " remove_factor_type_counts="
+                    << format_forensic_factor_type_counts(
+                           cbs_update_packet_forensics.remove_analysis.type_counts)
+                    << " delete_factor_type_counts="
+                    << format_forensic_factor_type_counts(
+                           cbs_update_packet_forensics.delete_analysis.type_counts)
+                    << " first_remove_slot="
+                    << cbs_update_packet_forensics.remove_analysis.first_slot
+                    << " first_remove_slot_type="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics.remove_analysis.first_type)
+                    << " first_delete_slot="
+                    << cbs_update_packet_forensics.delete_analysis.first_slot
+                    << " first_delete_slot_type="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics.delete_analysis.first_type)
+                    << " remove_refs_new_values_factor_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_new_values_factor_count
+                    << " remove_refs_new_values_key_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_new_values_keys.size()
+                    << " remove_refs_boundary_targets_factor_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_boundary_targets_factor_count
+                    << " remove_refs_boundary_targets_key_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_boundary_target_keys.size()
+                    << " remove_refs_current_frame_factor_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_current_frame_factor_count
+                    << " remove_refs_current_frame_key_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_current_frame_keys.size()
+                    << " remove_refs_prev_frame_factor_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_prev_frame_factor_count
+                    << " remove_refs_prev_frame_key_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_prev_frame_keys.size()
+                    << " remove_refs_oldest_active_frame_factor_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_oldest_active_frame_factor_count
+                    << " remove_refs_oldest_active_frame_key_count="
+                    << cbs_update_packet_forensics.remove_analysis
+                           .refs_oldest_active_frame_keys.size()
+                    << " delete_refs_new_values_factor_count="
+                    << cbs_update_packet_forensics.delete_analysis
+                           .refs_new_values_factor_count
+                    << " delete_refs_new_values_key_count="
+                    << cbs_update_packet_forensics.delete_analysis
+                           .refs_new_values_keys.size()
+                    << " delete_refs_boundary_targets_factor_count="
+                    << cbs_update_packet_forensics.delete_analysis
+                           .refs_boundary_targets_factor_count
+                    << " delete_refs_boundary_targets_key_count="
+                    << cbs_update_packet_forensics.delete_analysis
+                           .refs_boundary_target_keys.size()
+                    << " delete_refs_current_frame_factor_count="
+                    << cbs_update_packet_forensics.delete_analysis
+                           .refs_current_frame_factor_count
+                    << " delete_refs_current_frame_key_count="
+                    << cbs_update_packet_forensics.delete_analysis
+                           .refs_current_frame_keys.size()
+                    << " precheck_duplicate_new_values_key_count="
+                    << cbs_update_packet_forensics.duplicate_new_values_key_count
+                    << " precheck_duplicate_active_insertion_key_count="
+                    << cbs_update_packet_forensics
+                           .duplicate_active_insertion_key_count
+                    << " precheck_missing_timestamp_key_count="
+                    << cbs_update_packet_forensics.missing_timestamp_key_count
+                    << " precheck_remove_intersects_new_factor_keys_count="
+                    << cbs_update_packet_forensics
+                           .remove_intersects_new_factor_keys_count
+                    << " precheck_remove_intersects_new_values_keys_count="
+                    << cbs_update_packet_forensics
+                           .remove_intersects_new_values_keys_count
+                    << " precheck_remove_intersects_boundary_target_keys_count="
+                    << cbs_update_packet_forensics
+                           .remove_intersects_boundary_target_keys_count
+                    << " precheck_new_factor_missing_key_count="
+                    << cbs_update_packet_forensics.new_factor_missing_key_count
+                    << " precheck_new_factor_missing_key_factor_count="
+                    << cbs_update_packet_forensics
+                           .new_factor_missing_key_factor_count
+                    << " precheck_first_inconsistency_reason="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics.first_inconsistency_reason)
+                    << " precheck_first_inconsistency_key="
+                    << format_forensic_key_token(
+                           cbs_update_packet_forensics.first_inconsistency_key)
+                    << " precheck_first_inconsistency_factor_slot="
+                    << cbs_update_packet_forensics.first_inconsistency_factor_slot
+                    << " precheck_first_inconsistency_factor_type="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics
+                               .first_inconsistency_factor_type)
+                    << " precheck_first_inconsistency_factor_keys="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics
+                               .first_inconsistency_factor_keys)
+                    << " failure_stage=" << failure_stage
+                    << " exception_phase_label=" << exception_phase_label
+                    << " exception_message="
+                    << sanitize_forensic_token(exception_message)
+                    << " offending_key_guess="
+                    << format_forensic_key_token(offending_key_guess)
+                    << " offending_factor_slot_guess="
+                    << offending_factor_slot_guess
+                    << " offending_factor_type_guess="
+                    << sanitize_forensic_token(offending_factor_type_guess)
+                    << " failure_after_bpsam_update_call="
+                    << (failure_after_bpsam_update_call ? 1 : 0)
+                    << " failure_reason=" << failure_reason
+                    << std::endl;
+        };
+
     const auto run_cbs_update_epoch =
         [&](const bool enable_remove_factor_indices,
             bool* should_retry_without_remove) -> bool {
           CHECK_NOTNULL(should_retry_without_remove);
           *should_retry_without_remove = false;
+          std::string exception_phase_label = "start";
+          gtsam::FactorIndices forensic_remove_slots_this_attempt;
 
           try {
             // zy Step 40f
@@ -11918,16 +14399,127 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               return counts;
             };
 
-            const cbs::BPSAM::UpdateParams cbs_first_update_params =
+            exception_phase_label = "remove_index_consumption";
+            cbs::BPSAM::UpdateParams cbs_first_update_params =
                 build_cbs_first_update_params(enable_remove_factor_indices);
-            const size_t removed_factor_indices_applied =
+            size_t removed_factor_indices_applied =
                 cbs_first_update_params.removeFactorIndices.size();
+            forensic_remove_slots_this_attempt =
+                cbs_first_update_params.removeFactorIndices;
+            cbs_update_packet_forensics =
+                build_update_packet_forensics(forensic_remove_slots_this_attempt);
+            std::vector<size_t> invalid_remove_slots;
+            gtsam::FactorIndices valid_remove_slots;
+            valid_remove_slots.reserve(
+                cbs_first_update_params.removeFactorIndices.size());
+            exception_phase_label = "remove_slot_exists_check";
+            {
+              const gtsam::NonlinearFactorGraph& factors =
+                  cbs_optimizer_->getFactorsUnsafe();
+              for (const size_t slot : cbs_first_update_params.removeFactorIndices) {
+                const bool exists = factors.exists(slot) && factors.at(slot);
+                std::cerr << "[CBS][PrimaryRemoveSlotCheck] curr_kf_id="
+                          << curr_kf_id_ << " slot_id=" << slot
+                          << " exists=" << (exists ? 1 : 0) << std::endl;
+                if (exists) {
+                  valid_remove_slots.push_back(slot);
+                } else {
+                  invalid_remove_slots.push_back(slot);
+                }
+              }
+              const long long first_invalid_slot =
+                  invalid_remove_slots.empty()
+                      ? -1
+                      : static_cast<long long>(invalid_remove_slots.front());
+              std::cerr << "[CBS][PrimaryRemoveSlotCheckSummary] curr_kf_id="
+                        << curr_kf_id_
+                        << " invalid_slot_count=" << invalid_remove_slots.size()
+                        << " first_invalid_slot_id=" << first_invalid_slot
+                        << std::endl;
+            }
             const ActiveStateCounts active_pre = count_active_state_keys();
-            const auto first_update_start = std::chrono::steady_clock::now();
-            gtsam::ISAM2Result cbs_result = cbs_optimizer_->update(
-                cbs_update_factors, new_values, cbs_first_update_params);
-            cbs_first_update_ms +=
-                elapsedMs(first_update_start, std::chrono::steady_clock::now());
+            const auto run_primary_update_call =
+                [&](const cbs::BPSAM::UpdateParams& params,
+                    const std::string& phase_label) {
+                  exception_phase_label = phase_label;
+                  const auto call_start = std::chrono::steady_clock::now();
+                  gtsam::ISAM2Result update_result = cbs_optimizer_->update(
+                      cbs_update_factors, new_values, params);
+                  cbs_first_update_ms +=
+                      elapsedMs(call_start, std::chrono::steady_clock::now());
+                  return update_result;
+                };
+
+            bool invalid_slot_retry_attempted = false;
+            bool invalid_slot_retry_succeeded = false;
+            gtsam::ISAM2Result cbs_result;
+            try {
+              cbs_result =
+                  run_primary_update_call(cbs_first_update_params, "bpsam_update_call");
+            } catch (const std::exception& first_update_error) {
+              const std::string first_error_msg =
+                  first_update_error.what() ? std::string(first_update_error.what())
+                                            : std::string();
+              const bool has_map_at =
+                  first_error_msg.find("map::at") != std::string::npos;
+              if (!invalid_remove_slots.empty() && has_map_at) {
+                invalid_slot_retry_attempted = true;
+                cbs::BPSAM::UpdateParams retry_params = cbs_first_update_params;
+                retry_params.removeFactorIndices = valid_remove_slots;
+                forensic_remove_slots_this_attempt = retry_params.removeFactorIndices;
+                cbs_update_packet_forensics = build_update_packet_forensics(
+                    forensic_remove_slots_this_attempt);
+                removed_factor_indices_applied = retry_params.removeFactorIndices.size();
+                cbs_remove_curr_epoch_size = retry_params.removeFactorIndices.size();
+                cbs_remove_indices_applied = retry_params.removeFactorIndices.size();
+                cbs_prev_epoch_remove_factor_indices_.clear();
+                cbs_prev_epoch_remove_factor_indices_.insert(
+                    retry_params.removeFactorIndices.begin(),
+                    retry_params.removeFactorIndices.end());
+                cbs_result = run_primary_update_call(
+                    retry_params,
+                    "bpsam_update_call_retry_skip_invalid_remove_slots");
+                invalid_slot_retry_succeeded = true;
+              } else {
+                throw;
+              }
+            }
+            std::cerr
+                << "[CBS][PrimaryRemoveSlotCheckRetry] curr_kf_id=" << curr_kf_id_
+                << " invalid_slot_count=" << invalid_remove_slots.size()
+                << " retry_attempted=" << (invalid_slot_retry_attempted ? 1 : 0)
+                << " crash_disappeared="
+                << (invalid_slot_retry_attempted && invalid_slot_retry_succeeded ? 1
+                                                                                  : 0)
+                << " remove_slots_before="
+                << cbs_first_update_params.removeFactorIndices.size()
+                << " remove_slots_after="
+                << forensic_remove_slots_this_attempt.size() << std::endl;
+
+            const bool remove_update_succeeded_before_prune_commit =
+                enable_remove_factor_indices &&
+                !forensic_remove_slots_this_attempt.empty();
+            if (cbs_use_phase2_summary_prior_bridge && cbs_phase2_heart_) {
+              cbs_phase2_pending_prune_exists =
+                  cbs_phase2_heart_->hasPendingPrunePlan();
+              if (cbs_phase2_pending_prune_exists &&
+                  remove_update_succeeded_before_prune_commit) {
+                cbs_phase2_remove_update_succeeded_before_prune_commit = true;
+                const bool committed = cbs_phase2_heart_->commitPendingPrunePlan();
+                cbs_phase2_prune_committed_this_epoch =
+                    cbs_phase2_prune_committed_this_epoch || committed;
+                cbs_phase2_pending_prune_exists =
+                    cbs_phase2_heart_->hasPendingPrunePlan();
+                cbs_phase2_prune_commit_reason =
+                    committed ? "primary_remove_update_succeeded"
+                              : "pending_prune_commit_failed";
+              } else if (cbs_phase2_pending_prune_exists) {
+                if (cbs_phase2_prune_commit_reason == "none") {
+                  cbs_phase2_prune_commit_reason =
+                      "pending_prune_waiting_for_remove_update";
+                }
+              }
+            }
             // Only the first round may delete factor slots; belief-only rounds
             // must not re-apply the same removals.
             cbs::BPSAM::UpdateParams cbs_inner_round_params;
@@ -11965,6 +14557,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
 
             // Intuition: keep FixedLagSmoother API contract by populating a
             // compatible summary result in CBS mode.
+            exception_phase_label = "estimate_readback";
             result->iterations = rounds_executed;
             result->intermediateSteps = 0;
             result->nonlinearVariables = cbs_result.variablesRelinearized;
@@ -12002,6 +14595,55 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << cbs_remove_smart_factor_slots
                 << " remove_non_smart_slots="
                 << cbs_remove_non_smart_slots
+                << " cbs_phase2_wrapper_remove_source_counts="
+                << cbs_phase2_wrapper_remove_source_counts
+                << " cbs_phase2_wrapper_remove_true_source_counts="
+                << cbs_phase2_wrapper_remove_true_source_counts
+                << " cbs_phase2_wrapper_remove_packet_label="
+                << cbs_phase2_wrapper_remove_packet_label
+                << " cbs_phase2_wrapper_remove_deferred_count="
+                << cbs_phase2_wrapper_remove_deferred_count
+                << " cbs_phase2_wrapper_remove_fresh_lag_count="
+                << cbs_phase2_wrapper_remove_fresh_lag_count
+                << " cbs_phase2_fresh_lag_remove_applied_count="
+                << cbs_phase2_fresh_lag_remove_applied_count
+                << " cbs_phase2_fresh_lag_remove_blocked_due_to_no_summary="
+                << (cbs_phase2_fresh_lag_remove_blocked_due_to_no_summary ? 1 : 0)
+                << " cbs_phase2_fresh_lag_remove_blocked_count="
+                << cbs_phase2_fresh_lag_remove_blocked_count
+                << " cbs_phase2_summary_injection_required_for_lag_remove="
+                << (cbs_phase2_summary_injection_required_for_lag_remove ? 1 : 0)
+                << " cbs_phase2_summary_injected_this_epoch="
+                << (cbs_phase2_summary_injected_this_epoch ? 1 : 0)
+                << " cbs_phase2_wrapper_remove_delete_slots_count="
+                << cbs_phase2_wrapper_remove_delete_slots_count
+                << " cbs_phase2_wrapper_remove_total_count="
+                << cbs_phase2_wrapper_remove_total_count
+                << " cbs_phase2_wrapper_remove_source_coherence_ok="
+                << (cbs_phase2_wrapper_remove_source_coherence_ok ? 1 : 0)
+                << " cbs_phase2_fresh_lag_anchor_prior_protection_fired="
+                << (cbs_phase2_fresh_lag_anchor_prior_protection_fired ? 1 : 0)
+                << " cbs_phase2_fresh_lag_anchor_prior_blocked_count="
+                << cbs_phase2_fresh_lag_anchor_prior_blocked_count
+                << " cbs_phase2_fresh_lag_anchor_prior_blocked_slots="
+                << cbs_phase2_fresh_lag_anchor_prior_blocked_slots
+                << " delete_slots_size=" << delete_slots_forensic.size()
+                << " delete_slots_size_raw="
+                << cbs_phase2_delete_slots_size_raw
+                << " delete_slots_size_applied="
+                << cbs_phase2_delete_slots_size_applied
+                << " delete_slots_first_slots="
+                << format_factor_slots_preview(delete_slots_forensic, 8u)
+                << " lag_remove_factor_indices_size="
+                << lag_window_state.remove_factor_indices.size()
+                << " lag_remove_factor_indices_first_slots="
+                << format_factor_slots_preview(
+                       lag_window_state.remove_factor_indices, 8u)
+                << " combined_remove_factor_indices_size="
+                << forensic_remove_slots_this_attempt.size()
+                << " combined_remove_factor_indices_first_slots="
+                << format_factor_slots_preview(forensic_remove_slots_this_attempt,
+                                               8u)
                 << " remove_prev_epoch_size="
                 << cbs_remove_prev_epoch_size
                 << " remove_curr_epoch_size="
@@ -12020,6 +14662,146 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                         : 0)
                 << " cbs_use_marginalization_prior_bridge="
                 << (FLAGS_cbs_use_marginalization_prior_bridge ? 1 : 0)
+                << " cbs_experimental_use_new_heart_summary_prior_bridge="
+                << (FLAGS_cbs_experimental_use_new_heart_summary_prior_bridge ? 1
+                                                                              : 0)
+                << " cbs_diag_phase2_build_only_no_inject="
+                << (FLAGS_cbs_diag_phase2_build_only_no_inject ? 1 : 0)
+                << " cbs_phase2_summary_bridge_applied="
+                << (cbs_phase2_summary_bridge_applied ? 1 : 0)
+                << " cbs_phase2_summary_attempted="
+                << (cbs_phase2_summary_attempted ? 1 : 0)
+                << " cbs_phase2_summary_injected="
+                << (cbs_phase2_summary_injected ? 1 : 0)
+                << " cbs_phase2_summary_implemented_this_epoch="
+                << (cbs_phase2_summary_implemented_this_epoch ? 1 : 0)
+                << " cbs_phase2_boundary_candidates="
+                << cbs_phase2_boundary_candidates
+                << " cbs_phase2_summary_targets="
+                << cbs_phase2_summary_targets
+                << " cbs_phase2_summary_requested_target_count="
+                << cbs_phase2_summary_requested_targets
+                << " cbs_phase2_summary_realizable_target_count="
+                << cbs_phase2_summary_realizable_targets
+                << " cbs_phase2_summary_dropped_target_count="
+                << cbs_phase2_summary_dropped_targets
+                << " cbs_phase2_summary_crossing_factor_count="
+                << cbs_phase2_summary_crossing_factor_count
+                << " cbs_phase2_summary_factor_count_emitted="
+                << cbs_phase2_summary_factor_count_emitted
+                << " cbs_phase2_summary_target_coherence_ok="
+                << (cbs_phase2_summary_target_coherence_ok ? 1 : 0)
+                << " cbs_phase2_summary_build_ms="
+                << cbs_phase2_summary_build_ms
+                << " cbs_phase2_summary_mode="
+                << cbs_phase2_summary_mode
+                << " cbs_phase2_expanded_summary_mode="
+                << cbs_phase2_expanded_summary_mode
+                << " cbs_phase2_expanded_summary_requested_target_count="
+                << cbs_phase2_expanded_summary_requested_target_count
+                << " cbs_phase2_expanded_summary_realizable_target_count="
+                << cbs_phase2_expanded_summary_realizable_target_count
+                << " cbs_phase2_expanded_summary_crossing_factor_count="
+                << cbs_phase2_expanded_summary_crossing_factor_count
+                << " cbs_phase2_expanded_summary_factor_count_emitted="
+                << cbs_phase2_expanded_summary_factor_count_emitted
+                << " cbs_phase2_expanded_summary_build_ms="
+                << cbs_phase2_expanded_summary_build_ms
+                << " cbs_phase2_first_expanded_summary_failure_reason="
+                << cbs_phase2_first_expanded_summary_failure_reason
+                << " cbs_phase2_expanded_included_local_nonbelief_factor_count="
+                << cbs_phase2_expanded_included_local_nonbelief_factor_count
+                << " cbs_phase2_expanded_included_mixed_nonbelief_factor_count="
+                << cbs_phase2_expanded_included_mixed_nonbelief_factor_count
+                << " cbs_phase2_expanded_included_belief_factor_count="
+                << cbs_phase2_expanded_included_belief_factor_count
+                << " cbs_phase2_expanded_excluded_local_nonbelief_factor_count="
+                << cbs_phase2_expanded_excluded_local_nonbelief_factor_count
+                << " cbs_phase2_expanded_excluded_mixed_nonbelief_factor_count="
+                << cbs_phase2_expanded_excluded_mixed_nonbelief_factor_count
+                << " cbs_phase2_expanded_excluded_belief_factor_count="
+                << cbs_phase2_expanded_excluded_belief_factor_count
+                << " cbs_phase2_expanded_selected_factor_slots_count="
+                << cbs_phase2_expanded_selected_factor_slots_count
+                << " cbs_phase2_expanded_selected_key_count="
+                << cbs_phase2_expanded_selected_key_count
+                << " cbs_phase2_expanded_eliminated_key_count="
+                << cbs_phase2_expanded_eliminated_key_count
+                << " cbs_phase2_expanded_emitted_factor_count="
+                << cbs_phase2_expanded_emitted_factor_count
+                << " cbs_phase2_expanded_emitted_factor_key_count="
+                << cbs_phase2_expanded_emitted_factor_key_count
+                << " cbs_phase2_expanded_emitted_factor_contains_nonlocal_keys="
+                << (cbs_phase2_expanded_emitted_factor_contains_nonlocal_keys ? 1
+                                                                               : 0)
+                << " cbs_phase2_expanded_emitted_factor_contains_belief_keys="
+                << (cbs_phase2_expanded_emitted_factor_contains_belief_keys ? 1
+                                                                             : 0)
+                << " cbs_phase2_expanded_emitted_factor_references_stale_removed_keys="
+                << (cbs_phase2_expanded_emitted_factor_references_stale_removed_keys
+                        ? 1
+                        : 0)
+                << " cbs_phase2_expanded_emitted_factor_references_orphan_pruned_keys="
+                << (cbs_phase2_expanded_emitted_factor_references_orphan_pruned_keys
+                        ? 1
+                        : 0)
+                << " cbs_phase2_expanded_emitted_factor_missing_estimate_keys="
+                << cbs_phase2_expanded_emitted_factor_missing_estimate_keys
+                << " cbs_phase2_first_expanded_bad_key="
+                << cbs_phase2_first_expanded_bad_key
+                << " cbs_phase2_first_expanded_bad_factor_slot="
+                << cbs_phase2_first_expanded_bad_factor_slot
+                << " cbs_phase2_first_expanded_exception_context="
+                << cbs_phase2_first_expanded_exception_context
+                << " cbs_phase2_expanded_veto_reason="
+                << cbs_phase2_expanded_veto_reason
+                << " cbs_phase2_expanded_veto_count="
+                << cbs_phase2_expanded_veto_count
+                << " cbs_phase2_first_summary_failure_reason="
+                << cbs_phase2_first_summary_failure_reason
+                << " cbs_phase2_first_dropped_target_reason="
+                << cbs_phase2_first_dropped_target_reason
+                << " cbs_phase2_skipped_covariance_failure="
+                << cbs_phase2_skipped_covariance_failure
+                << " cbs_phase2_missing_estimate="
+                << cbs_phase2_missing_estimate
+                << " cbs_phase2_incremental_lag_update_ms="
+                << cbs_phase2_incremental_lag_update_ms
+                << " cbs_phase2_stale_local_keys="
+                << cbs_phase2_stale_local_keys
+                << " cbs_phase2_stale_local_factor_slots="
+                << cbs_phase2_stale_local_factor_slots
+                << " cbs_phase2_stale_belief_factors="
+                << cbs_phase2_stale_belief_factors
+                << " cbs_phase2_orphan_keys="
+                << cbs_phase2_orphan_keys
+                << " cbs_phase2_orphan_factor_slots="
+                << cbs_phase2_orphan_factor_slots
+                << " cbs_phase2_covariance_queries="
+                << cbs_phase2_covariance_queries
+                << " cbs_phase2_temporary_priors_emitted="
+                << cbs_phase2_temporary_priors_emitted
+                << " cbs_phase2_used_full_recompute_fallback="
+                << (cbs_phase2_used_full_recompute_fallback ? 1 : 0)
+                << " cbs_phase2_pending_prune_exists="
+                << (cbs_phase2_pending_prune_exists ? 1 : 0)
+                << " cbs_phase2_prune_committed_this_epoch="
+                << (cbs_phase2_prune_committed_this_epoch ? 1 : 0)
+                << " cbs_phase2_prune_commit_reason="
+                << sanitize_forensic_token(cbs_phase2_prune_commit_reason)
+                << " cbs_phase2_prune_skipped_due_to_failed_remove_update="
+                << (cbs_phase2_prune_skipped_due_to_failed_remove_update ? 1 : 0)
+                << " cbs_phase2_remove_update_succeeded_before_prune_commit="
+                << (cbs_phase2_remove_update_succeeded_before_prune_commit ? 1
+                                                                            : 0)
+                << " cbs_phase2_emitted_summary_key_count="
+                << cbs_phase2_emitted_summary_key_count
+                << " cbs_phase2_remove_touched_key_count="
+                << cbs_phase2_remove_touched_key_count
+                << " cbs_phase2_emitted_summary_keys_overlap_remove_keys="
+                << (cbs_phase2_emitted_summary_keys_overlap_remove_keys ? 1 : 0)
+                << " cbs_phase2_emitted_summary_overlap_key_count="
+                << cbs_phase2_emitted_summary_overlap_key_count
                 << " cbs_b1_refresh_cov_only_on_boundary_change="
                 << (FLAGS_cbs_b1_refresh_cov_only_on_boundary_change ? 1 : 0)
                 << " cbs_b1_pose_only_cov_refresh="
@@ -12030,7 +14812,93 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << (FLAGS_cbs_diag_disable_repeated_remove_from_prev_epoch ? 1 : 0)
                 << " diag_disable_first_attempt_remove_factor_indices="
                 << (FLAGS_cbs_diag_disable_first_attempt_remove_factor_indices ? 1
-                                                                                : 0)
+                                                                               : 0)
+                << " cbs_phase2_boundary_transition_this_epoch="
+                << (cbs_phase2_boundary_transition_this_epoch ? 1 : 0)
+                << " first_post_boundary_epoch="
+                << (cbs_phase2_first_post_boundary_epoch ? 1 : 0)
+                << " cbs_phase2_lag_plan_cache_changed_this_epoch="
+                << (cbs_phase2_lag_plan_cache_changed_this_epoch ? 1 : 0)
+                << " cbs_phase2_incremental_remove_consumed_this_epoch="
+                << (cbs_phase2_incremental_remove_consumed_this_epoch ? 1 : 0)
+                << " cbs_diag_phase2_skip_lag_plan_commit_consume="
+                << (FLAGS_cbs_diag_phase2_skip_lag_plan_commit_consume ? 1 : 0)
+                << " cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch="
+                << (FLAGS_cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch
+                        ? 1
+                        : 0)
+                << " cbs_phase2_skip_lag_plan_commit_consume_effective="
+                << (cbs_phase2_skip_lag_plan_commit_consume_effective ? 1 : 0)
+                << " cbs_phase2_incremental_remove_candidate_count="
+                << cbs_phase2_incremental_remove_candidate_count
+                << " cbs_phase2_incremental_remove_candidate_first_slots="
+                << cbs_phase2_incremental_remove_candidate_preview
+                << " cbs_diag_phase2_suppress_delete_slots_first_post_boundary="
+                << (FLAGS_cbs_diag_phase2_suppress_delete_slots_first_post_boundary
+                        ? 1
+                        : 0)
+                << " cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch="
+                << (cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch
+                        ? 1
+                        : 0)
+                << " cbs_diag_delete_slots_suppressed_count="
+                << cbs_diag_delete_slots_suppressed_count
+                << " cbs_phase2_delete_slots_suppressed_this_epoch="
+                << (cbs_phase2_delete_slots_suppressed_this_epoch ? 1 : 0)
+                << " cbs_phase2_delete_slots_suppression_reason="
+                << cbs_phase2_delete_slots_suppression_reason
+                << " cbs_phase2_deferred_first_boundary_remove="
+                << (cbs_phase2_deferred_first_boundary_remove ? 1 : 0)
+                << " cbs_phase2_deferred_lag_remove_candidate_count="
+                << cbs_phase2_deferred_lag_remove_candidate_count
+                << " cbs_phase2_remove_guard_reason="
+                << cbs_phase2_remove_guard_reason
+                << " cbs_phase2_lag_remove_slots_raw="
+                << cbs_phase2_lag_remove_slots_raw
+                << " cbs_phase2_lag_remove_slots_filtered_boundary_touch="
+                << cbs_phase2_lag_remove_slots_filtered_boundary_touch
+                << " cbs_phase2_lag_remove_slots_applied="
+                << cbs_phase2_lag_remove_slots_applied
+                << " cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary="
+                << cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary
+                << " cbs_phase2_lag_remove_boundary_touch_factor_count="
+                << cbs_phase2_lag_remove_boundary_touch_factor_count
+                << " cbs_phase2_lag_remove_filter_reason="
+                << cbs_phase2_lag_remove_filter_reason
+                << " cbs_phase2_lag_remove_deferral_reason="
+                << cbs_phase2_lag_remove_deferral_reason
+                << " cbs_phase2_lag_remove_factor_type_counts_raw="
+                << cbs_phase2_lag_remove_factor_type_counts_raw
+                << " cbs_phase2_lag_remove_factor_type_counts_filtered="
+                << cbs_phase2_lag_remove_factor_type_counts_filtered
+                << " cbs_phase2_lag_remove_factor_type_counts_applied="
+                << cbs_phase2_lag_remove_factor_type_counts_applied
+                << " deferred_lag_remove_packet_size="
+                << cbs_phase2_deferred_lag_remove_packet_size
+                << " deferred_lag_remove_packet_slots="
+                << cbs_phase2_deferred_lag_remove_packet_slots_preview
+                << " deferred_lag_remove_replay_subset_size="
+                << cbs_phase2_deferred_lag_remove_replay_subset_size
+                << " deferred_lag_remove_replay_first_bad_slot="
+                << cbs_phase2_deferred_lag_remove_replay_first_bad_slot
+                << " deferred_lag_remove_replay_first_bad_factor_type="
+                << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_type
+                << " deferred_lag_remove_replay_first_bad_factor_keys="
+                << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_keys
+                << " deferred_lag_remove_replay_failure_stage="
+                << cbs_phase2_deferred_lag_remove_replay_failure_stage
+                << " deferred_lag_remove_replay_failure_reason="
+                << cbs_phase2_deferred_lag_remove_replay_failure_reason
+                << " deferred_lag_remove_anchor_prior_protected_count="
+                << cbs_phase2_deferred_lag_remove_anchor_prior_protected_count
+                << " deferred_lag_remove_anchor_prior_slot_ids="
+                << cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids
+                << " deferred_lag_remove_anchor_prior_keys="
+                << cbs_phase2_deferred_lag_remove_anchor_prior_keys
+                << " deferred_lag_remove_anchor_prior_protection_reason="
+                << cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason
+                << " cbs_phase2_first_post_boundary_factor_class_filter_reason="
+                << cbs_phase2_first_post_boundary_factor_class_filter_reason
                 << " cbs_allow_heavy_maintenance="
                 << (cbs_allow_heavy_maintenance ? 1 : 0)
                 << " cbs_no_external_fast_path_applied="
@@ -12057,6 +14925,16 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << lag_window_state.stale_state_keys
                 << " lag_stale_pose_keys="
                 << lag_window_state.stale_pose_keys
+                << " lag_stale_local_factor_slots="
+                << lag_window_state.stale_local_factor_slots
+                << " lag_stale_belief_factor_slots="
+                << lag_window_state.stale_belief_factor_slots
+                << " lag_orphan_belief_factor_slots="
+                << lag_window_state.orphan_belief_factor_slots
+                << " lag_orphan_robot_keys="
+                << lag_window_state.orphan_robot_keys
+                << " lag_orphan_gbp_keys="
+                << lag_window_state.orphan_gbp_keys
                 << " rounds_executed=" << rounds_executed
                 << " new_factors_count=" << cbs_new_factors_total
                 << " new_factors_anchor_priors=" << cbs_anchor_priors_added
@@ -12129,6 +15007,364 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << " cbs_replace_fixed_lag_optimizer="
                 << (FLAGS_cbs_replace_fixed_lag_optimizer ? 1 : 0)
                 << std::endl;
+            {
+              std::ostringstream clean_snapshot;
+              clean_snapshot << "curr_kf_id=" << curr_kf_id_
+                             << " timestamp_lkf_ns=" << timestamp_lkf_
+                             << " cbs_phase2_summary_attempted="
+                             << (cbs_phase2_summary_attempted ? 1 : 0)
+                             << " cbs_phase2_summary_injected="
+                             << (cbs_phase2_summary_injected ? 1 : 0)
+                             << " delete_slots_size="
+                             << delete_slots_forensic.size()
+                             << " delete_slots_size_raw="
+                             << cbs_phase2_delete_slots_size_raw
+                             << " delete_slots_size_applied="
+                             << cbs_phase2_delete_slots_size_applied
+                             << " delete_slots_first_slots="
+                             << format_factor_slots_preview(delete_slots_forensic, 8u)
+                             << " lag_remove_factor_indices_size="
+                             << lag_window_state.remove_factor_indices.size()
+                             << " lag_remove_factor_indices_first_slots="
+                             << format_factor_slots_preview(
+                                    lag_window_state.remove_factor_indices, 8u)
+                             << " remove_factor_indices_enabled_this_attempt="
+                             << (enable_remove_factor_indices ? 1 : 0)
+                             << " remove_factor_indices_size="
+                             << forensic_remove_slots_this_attempt.size()
+                             << " remove_factor_indices_first_slots="
+                             << format_factor_slots_preview(
+                                    forensic_remove_slots_this_attempt, 8u)
+                             << " lag_stale_local_keys="
+                             << lag_window_state.stale_state_keys
+                             << " lag_stale_local_factor_slots="
+                             << lag_window_state.stale_local_factor_slots
+                             << " lag_stale_belief_factor_slots="
+                             << lag_window_state.stale_belief_factor_slots
+                             << " lag_orphan_belief_factor_slots="
+                             << lag_window_state.orphan_belief_factor_slots
+                             << " lag_orphan_robot_keys="
+                             << lag_window_state.orphan_robot_keys
+                             << " lag_orphan_gbp_keys="
+                             << lag_window_state.orphan_gbp_keys
+                             << " cbs_phase2_expanded_selected_factor_slots_count="
+                             << cbs_phase2_expanded_selected_factor_slots_count
+                             << " cbs_phase2_expanded_selected_key_count="
+                             << cbs_phase2_expanded_selected_key_count
+                             << " cbs_phase2_expanded_eliminated_key_count="
+                             << cbs_phase2_expanded_eliminated_key_count
+                             << " cbs_phase2_expanded_emitted_factor_count="
+                             << cbs_phase2_expanded_emitted_factor_count
+                             << " cbs_phase2_summary_targets="
+                             << cbs_phase2_summary_targets
+                             << " cbs_phase2_summary_requested_target_count="
+                             << cbs_phase2_summary_requested_targets
+                             << " cbs_phase2_summary_realizable_target_count="
+                             << cbs_phase2_summary_realizable_targets
+                             << " cbs_phase2_summary_dropped_target_count="
+                             << cbs_phase2_summary_dropped_targets
+                             << " cbs_phase2_emitted_summary_key_count="
+                             << cbs_phase2_emitted_summary_key_count
+                             << " cbs_phase2_remove_touched_key_count="
+                             << cbs_phase2_remove_touched_key_count
+                             << " cbs_phase2_emitted_summary_keys_overlap_remove_keys="
+                             << (cbs_phase2_emitted_summary_keys_overlap_remove_keys
+                                     ? 1
+                                     : 0)
+                             << " cbs_phase2_emitted_summary_overlap_key_count="
+                             << cbs_phase2_emitted_summary_overlap_key_count
+                             << " cbs_phase2_boundary_transition_this_epoch="
+                             << (cbs_phase2_boundary_transition_this_epoch ? 1 : 0)
+                             << " first_post_boundary_epoch="
+                             << (cbs_phase2_first_post_boundary_epoch ? 1 : 0)
+                             << " cbs_phase2_lag_plan_cache_changed_this_epoch="
+                             << (cbs_phase2_lag_plan_cache_changed_this_epoch ? 1
+                                                                               : 0)
+                             << " cbs_phase2_incremental_remove_consumed_this_epoch="
+                             << (cbs_phase2_incremental_remove_consumed_this_epoch
+                                     ? 1
+                                     : 0)
+                             << " cbs_diag_phase2_skip_lag_plan_commit_consume="
+                             << (FLAGS_cbs_diag_phase2_skip_lag_plan_commit_consume
+                                     ? 1
+                                     : 0)
+                             << " cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch="
+                             << (FLAGS_cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch
+                                     ? 1
+                                     : 0)
+                             << " cbs_phase2_skip_lag_plan_commit_consume_effective="
+                             << (cbs_phase2_skip_lag_plan_commit_consume_effective
+                                     ? 1
+                                     : 0)
+                             << " cbs_phase2_incremental_remove_candidate_count="
+                             << cbs_phase2_incremental_remove_candidate_count
+                             << " cbs_phase2_incremental_remove_candidate_first_slots="
+                             << cbs_phase2_incremental_remove_candidate_preview
+                             << " cbs_diag_phase2_suppress_delete_slots_first_post_boundary="
+                             << (FLAGS_cbs_diag_phase2_suppress_delete_slots_first_post_boundary
+                                     ? 1
+                                     : 0)
+                             << " cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch="
+                             << (cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch
+                                     ? 1
+                                     : 0)
+                             << " cbs_diag_delete_slots_suppressed_count="
+                             << cbs_diag_delete_slots_suppressed_count
+                             << " cbs_phase2_delete_slots_suppressed_this_epoch="
+                             << (cbs_phase2_delete_slots_suppressed_this_epoch
+                                     ? 1
+                                     : 0)
+                             << " cbs_phase2_delete_slots_suppression_reason="
+                             << cbs_phase2_delete_slots_suppression_reason
+                             << " cbs_phase2_deferred_first_boundary_remove="
+                             << (cbs_phase2_deferred_first_boundary_remove ? 1 : 0)
+                             << " cbs_phase2_deferred_lag_remove_candidate_count="
+                             << cbs_phase2_deferred_lag_remove_candidate_count
+                             << " cbs_phase2_remove_guard_reason="
+                             << cbs_phase2_remove_guard_reason
+                             << " cbs_phase2_lag_remove_slots_raw="
+                             << cbs_phase2_lag_remove_slots_raw
+                             << " cbs_phase2_lag_remove_slots_filtered_boundary_touch="
+                             << cbs_phase2_lag_remove_slots_filtered_boundary_touch
+                             << " cbs_phase2_lag_remove_slots_applied="
+                             << cbs_phase2_lag_remove_slots_applied
+                             << " cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary="
+                             << cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary
+                             << " cbs_phase2_lag_remove_boundary_touch_factor_count="
+                             << cbs_phase2_lag_remove_boundary_touch_factor_count
+                             << " cbs_phase2_lag_remove_filter_reason="
+                             << cbs_phase2_lag_remove_filter_reason
+                             << " cbs_phase2_lag_remove_deferral_reason="
+                             << cbs_phase2_lag_remove_deferral_reason
+                             << " cbs_phase2_lag_remove_factor_type_counts_raw="
+                             << cbs_phase2_lag_remove_factor_type_counts_raw
+                             << " cbs_phase2_lag_remove_factor_type_counts_filtered="
+                             << cbs_phase2_lag_remove_factor_type_counts_filtered
+                             << " cbs_phase2_lag_remove_factor_type_counts_applied="
+                             << cbs_phase2_lag_remove_factor_type_counts_applied
+                             << " deferred_lag_remove_packet_size="
+                             << cbs_phase2_deferred_lag_remove_packet_size
+                             << " deferred_lag_remove_packet_slots="
+                             << cbs_phase2_deferred_lag_remove_packet_slots_preview
+                             << " deferred_lag_remove_replay_subset_size="
+                             << cbs_phase2_deferred_lag_remove_replay_subset_size
+                             << " deferred_lag_remove_replay_first_bad_slot="
+                             << cbs_phase2_deferred_lag_remove_replay_first_bad_slot
+                             << " deferred_lag_remove_replay_first_bad_factor_type="
+                             << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_type
+                             << " deferred_lag_remove_replay_first_bad_factor_keys="
+                             << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_keys
+                             << " deferred_lag_remove_replay_failure_stage="
+                             << cbs_phase2_deferred_lag_remove_replay_failure_stage
+                             << " deferred_lag_remove_replay_failure_reason="
+                             << cbs_phase2_deferred_lag_remove_replay_failure_reason
+                             << " deferred_lag_remove_anchor_prior_protected_count="
+                             << cbs_phase2_deferred_lag_remove_anchor_prior_protected_count
+                             << " deferred_lag_remove_anchor_prior_slot_ids="
+                             << cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids
+                             << " deferred_lag_remove_anchor_prior_keys="
+                             << cbs_phase2_deferred_lag_remove_anchor_prior_keys
+                             << " deferred_lag_remove_anchor_prior_protection_reason="
+                             << cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason
+                             << " cbs_phase2_first_post_boundary_factor_class_filter_reason="
+                             << cbs_phase2_first_post_boundary_factor_class_filter_reason
+                             << " input_new_factors_count="
+                             << cbs_update_packet_forensics.input_new_factors_count
+                             << " input_new_values_count="
+                             << cbs_update_packet_forensics.input_new_values_count
+                             << " input_timestamps_count="
+                             << cbs_update_packet_forensics.input_timestamps_count
+                             << " input_remove_factor_indices_count="
+                             << cbs_update_packet_forensics
+                                    .input_remove_factor_indices_count
+                             << " input_delete_slots_count="
+                             << cbs_update_packet_forensics.input_delete_slots_count
+                             << " input_lag_remove_count="
+                             << cbs_update_packet_forensics.input_lag_remove_count
+                             << " input_smart_replacements_count="
+                             << cbs_update_packet_forensics
+                                    .input_smart_replacements_count
+                             << " input_smart_new_insertions_count="
+                             << cbs_update_packet_forensics
+                                    .input_smart_new_insertions_count
+                             << " input_anchor_prior_factor_count="
+                             << cbs_update_packet_forensics
+                                    .input_anchor_prior_factor_count
+                             << " input_summary_factor_count_attempted="
+                             << cbs_update_packet_forensics
+                                    .input_summary_factor_count_attempted
+                             << " input_summary_factor_count_injected="
+                             << cbs_update_packet_forensics
+                                    .input_summary_factor_count_injected
+                             << " input_external_prior_factor_count="
+                             << cbs_update_packet_forensics
+                                    .input_external_prior_factor_count
+                             << " new_values_pose_key_count="
+                             << cbs_update_packet_forensics
+                                    .new_values_pose_key_count
+                             << " new_values_velocity_key_count="
+                             << cbs_update_packet_forensics
+                                    .new_values_velocity_key_count
+                             << " new_values_bias_key_count="
+                             << cbs_update_packet_forensics
+                                    .new_values_bias_key_count
+                             << " new_values_robot_key_count="
+                             << cbs_update_packet_forensics
+                                    .new_values_robot_key_count
+                             << " new_values_public_key_count="
+                             << cbs_update_packet_forensics
+                                    .new_values_public_key_count
+                             << " new_values_belief_key_count="
+                             << cbs_update_packet_forensics
+                                    .new_values_belief_key_count
+                             << " new_values_other_key_count="
+                             << cbs_update_packet_forensics
+                                    .new_values_other_key_count
+                             << " first_unexpected_new_values_key="
+                             << format_forensic_key_token(
+                                    cbs_update_packet_forensics
+                                        .first_unexpected_key)
+                             << " first_unexpected_new_values_key_type="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .first_unexpected_key_type)
+                             << " remove_factor_type_counts="
+                             << format_forensic_factor_type_counts(
+                                    cbs_update_packet_forensics
+                                        .remove_analysis.type_counts)
+                             << " delete_factor_type_counts="
+                             << format_forensic_factor_type_counts(
+                                    cbs_update_packet_forensics
+                                        .delete_analysis.type_counts)
+                             << " first_remove_slot="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis.first_slot
+                             << " first_remove_slot_type="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .remove_analysis.first_type)
+                             << " first_delete_slot="
+                             << cbs_update_packet_forensics
+                                    .delete_analysis.first_slot
+                             << " first_delete_slot_type="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .delete_analysis.first_type)
+                             << " remove_refs_new_values_factor_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis.refs_new_values_factor_count
+                             << " remove_refs_new_values_key_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis.refs_new_values_keys.size()
+                             << " remove_refs_boundary_targets_factor_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis
+                                    .refs_boundary_targets_factor_count
+                             << " remove_refs_boundary_targets_key_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis
+                                    .refs_boundary_target_keys.size()
+                             << " remove_refs_current_frame_factor_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis
+                                    .refs_current_frame_factor_count
+                             << " remove_refs_current_frame_key_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis.refs_current_frame_keys.size()
+                             << " remove_refs_prev_frame_factor_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis.refs_prev_frame_factor_count
+                             << " remove_refs_prev_frame_key_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis.refs_prev_frame_keys.size()
+                             << " remove_refs_oldest_active_frame_factor_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis
+                                    .refs_oldest_active_frame_factor_count
+                             << " remove_refs_oldest_active_frame_key_count="
+                             << cbs_update_packet_forensics
+                                    .remove_analysis
+                                    .refs_oldest_active_frame_keys.size()
+                             << " delete_refs_new_values_factor_count="
+                             << cbs_update_packet_forensics
+                                    .delete_analysis.refs_new_values_factor_count
+                             << " delete_refs_new_values_key_count="
+                             << cbs_update_packet_forensics
+                                    .delete_analysis.refs_new_values_keys.size()
+                             << " delete_refs_boundary_targets_factor_count="
+                             << cbs_update_packet_forensics
+                                    .delete_analysis
+                                    .refs_boundary_targets_factor_count
+                             << " delete_refs_boundary_targets_key_count="
+                             << cbs_update_packet_forensics
+                                    .delete_analysis
+                                    .refs_boundary_target_keys.size()
+                             << " delete_refs_current_frame_factor_count="
+                             << cbs_update_packet_forensics
+                                    .delete_analysis
+                                    .refs_current_frame_factor_count
+                             << " delete_refs_current_frame_key_count="
+                             << cbs_update_packet_forensics
+                                    .delete_analysis.refs_current_frame_keys.size()
+                             << " precheck_duplicate_new_values_key_count="
+                             << cbs_update_packet_forensics
+                                    .duplicate_new_values_key_count
+                             << " precheck_duplicate_active_insertion_key_count="
+                             << cbs_update_packet_forensics
+                                    .duplicate_active_insertion_key_count
+                             << " precheck_missing_timestamp_key_count="
+                             << cbs_update_packet_forensics
+                                    .missing_timestamp_key_count
+                             << " precheck_remove_intersects_new_factor_keys_count="
+                             << cbs_update_packet_forensics
+                                    .remove_intersects_new_factor_keys_count
+                             << " precheck_remove_intersects_new_values_keys_count="
+                             << cbs_update_packet_forensics
+                                    .remove_intersects_new_values_keys_count
+                             << " precheck_remove_intersects_boundary_target_keys_count="
+                             << cbs_update_packet_forensics
+                                    .remove_intersects_boundary_target_keys_count
+                             << " precheck_new_factor_missing_key_count="
+                             << cbs_update_packet_forensics
+                                    .new_factor_missing_key_count
+                             << " precheck_new_factor_missing_key_factor_count="
+                             << cbs_update_packet_forensics
+                                    .new_factor_missing_key_factor_count
+                             << " precheck_first_inconsistency_reason="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .first_inconsistency_reason)
+                             << " precheck_first_inconsistency_key="
+                             << format_forensic_key_token(
+                                    cbs_update_packet_forensics
+                                        .first_inconsistency_key)
+                             << " precheck_first_inconsistency_factor_slot="
+                             << cbs_update_packet_forensics
+                                    .first_inconsistency_factor_slot
+                             << " precheck_first_inconsistency_factor_type="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .first_inconsistency_factor_type)
+                             << " precheck_first_inconsistency_factor_keys="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .first_inconsistency_factor_keys);
+              cbs_last_clean_primary_packet_ab_snapshot_ =
+                  build_primary_update_packet_ab_snapshot(
+                      "last_clean",
+                      cbs_update_packet_forensics,
+                      "none",
+                      "none",
+                      "none",
+                      "none",
+                      false,
+                      cbs_update_packet_forensics.first_inconsistency_factor_slot,
+                      cbs_update_packet_forensics.first_inconsistency_factor_type,
+                      cbs_update_packet_forensics.first_inconsistency_factor_keys);
+              cbs_last_clean_epoch_snapshot_ = clean_snapshot.str();
+              cbs_last_clean_epoch_kf_id_ = curr_kf_id_;
+              cbs_have_last_clean_epoch_snapshot_ = true;
+            }
             const double cbs_epoch_total_ms =
                 elapsedMs(cbs_epoch_start, std::chrono::steady_clock::now());
             std::cerr << std::setprecision(12)
@@ -12170,6 +15406,18 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << cbs_remove_smart_factor_slots
                       << " remove_non_smart_slots="
                       << cbs_remove_non_smart_slots
+                      << " delete_slots_size=" << delete_slots_forensic.size()
+                      << " delete_slots_size_raw="
+                      << cbs_phase2_delete_slots_size_raw
+                      << " delete_slots_size_applied="
+                      << cbs_phase2_delete_slots_size_applied
+                      << " delete_slots_first_slots="
+                      << format_factor_slots_preview(delete_slots_forensic, 8u)
+                      << " lag_remove_factor_indices_size="
+                      << lag_window_state.remove_factor_indices.size()
+                      << " lag_remove_factor_indices_first_slots="
+                      << format_factor_slots_preview(
+                             lag_window_state.remove_factor_indices, 8u)
                       << " remove_prev_epoch_size="
                       << cbs_remove_prev_epoch_size
                       << " remove_curr_epoch_size="
@@ -12187,6 +15435,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                               : 0)
                       << " cbs_use_marginalization_prior_bridge="
                       << (FLAGS_cbs_use_marginalization_prior_bridge ? 1 : 0)
+                      << " cbs_diag_phase2_build_only_no_inject="
+                      << (FLAGS_cbs_diag_phase2_build_only_no_inject ? 1 : 0)
                       << " cbs_b1_refresh_cov_only_on_boundary_change="
                       << (FLAGS_cbs_b1_refresh_cov_only_on_boundary_change ? 1 : 0)
                       << " cbs_b1_pose_only_cov_refresh="
@@ -12200,6 +15450,94 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << (FLAGS_cbs_diag_disable_first_attempt_remove_factor_indices
                               ? 1
                               : 0)
+                      << " cbs_phase2_boundary_transition_this_epoch="
+                      << (cbs_phase2_boundary_transition_this_epoch ? 1 : 0)
+                      << " first_post_boundary_epoch="
+                      << (cbs_phase2_first_post_boundary_epoch ? 1 : 0)
+                      << " cbs_phase2_lag_plan_cache_changed_this_epoch="
+                      << (cbs_phase2_lag_plan_cache_changed_this_epoch ? 1 : 0)
+                      << " cbs_phase2_incremental_remove_consumed_this_epoch="
+                      << (cbs_phase2_incremental_remove_consumed_this_epoch ? 1 : 0)
+                      << " cbs_diag_phase2_skip_lag_plan_commit_consume="
+                      << (FLAGS_cbs_diag_phase2_skip_lag_plan_commit_consume ? 1
+                                                                              : 0)
+                      << " cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch="
+                      << (FLAGS_cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch
+                              ? 1
+                              : 0)
+                      << " cbs_phase2_skip_lag_plan_commit_consume_effective="
+                      << (cbs_phase2_skip_lag_plan_commit_consume_effective ? 1
+                                                                             : 0)
+                      << " cbs_phase2_incremental_remove_candidate_count="
+                      << cbs_phase2_incremental_remove_candidate_count
+                      << " cbs_phase2_incremental_remove_candidate_first_slots="
+                      << cbs_phase2_incremental_remove_candidate_preview
+                      << " cbs_diag_phase2_suppress_delete_slots_first_post_boundary="
+                      << (FLAGS_cbs_diag_phase2_suppress_delete_slots_first_post_boundary
+                              ? 1
+                              : 0)
+                      << " cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch="
+                      << (cbs_diag_delete_slots_suppressed_first_post_boundary_this_epoch
+                              ? 1
+                              : 0)
+                      << " cbs_diag_delete_slots_suppressed_count="
+                      << cbs_diag_delete_slots_suppressed_count
+                      << " cbs_phase2_delete_slots_suppressed_this_epoch="
+                      << (cbs_phase2_delete_slots_suppressed_this_epoch ? 1 : 0)
+                      << " cbs_phase2_delete_slots_suppression_reason="
+                      << cbs_phase2_delete_slots_suppression_reason
+                      << " cbs_phase2_deferred_first_boundary_remove="
+                      << (cbs_phase2_deferred_first_boundary_remove ? 1 : 0)
+                      << " cbs_phase2_deferred_lag_remove_candidate_count="
+                      << cbs_phase2_deferred_lag_remove_candidate_count
+                      << " cbs_phase2_remove_guard_reason="
+                      << cbs_phase2_remove_guard_reason
+                      << " cbs_phase2_lag_remove_slots_raw="
+                      << cbs_phase2_lag_remove_slots_raw
+                      << " cbs_phase2_lag_remove_slots_filtered_boundary_touch="
+                      << cbs_phase2_lag_remove_slots_filtered_boundary_touch
+                      << " cbs_phase2_lag_remove_slots_applied="
+                      << cbs_phase2_lag_remove_slots_applied
+                      << " cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary="
+                      << cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary
+                      << " cbs_phase2_lag_remove_boundary_touch_factor_count="
+                      << cbs_phase2_lag_remove_boundary_touch_factor_count
+                      << " cbs_phase2_lag_remove_filter_reason="
+                      << cbs_phase2_lag_remove_filter_reason
+                      << " cbs_phase2_lag_remove_deferral_reason="
+                      << cbs_phase2_lag_remove_deferral_reason
+                      << " cbs_phase2_lag_remove_factor_type_counts_raw="
+                      << cbs_phase2_lag_remove_factor_type_counts_raw
+                      << " cbs_phase2_lag_remove_factor_type_counts_filtered="
+                      << cbs_phase2_lag_remove_factor_type_counts_filtered
+                      << " cbs_phase2_lag_remove_factor_type_counts_applied="
+                      << cbs_phase2_lag_remove_factor_type_counts_applied
+                      << " deferred_lag_remove_packet_size="
+                      << cbs_phase2_deferred_lag_remove_packet_size
+                      << " deferred_lag_remove_packet_slots="
+                      << cbs_phase2_deferred_lag_remove_packet_slots_preview
+                      << " deferred_lag_remove_replay_subset_size="
+                      << cbs_phase2_deferred_lag_remove_replay_subset_size
+                      << " deferred_lag_remove_replay_first_bad_slot="
+                      << cbs_phase2_deferred_lag_remove_replay_first_bad_slot
+                      << " deferred_lag_remove_replay_first_bad_factor_type="
+                      << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_type
+                      << " deferred_lag_remove_replay_first_bad_factor_keys="
+                      << cbs_phase2_deferred_lag_remove_replay_first_bad_factor_keys
+                      << " deferred_lag_remove_replay_failure_stage="
+                      << cbs_phase2_deferred_lag_remove_replay_failure_stage
+                      << " deferred_lag_remove_replay_failure_reason="
+                      << cbs_phase2_deferred_lag_remove_replay_failure_reason
+                      << " deferred_lag_remove_anchor_prior_protected_count="
+                      << cbs_phase2_deferred_lag_remove_anchor_prior_protected_count
+                      << " deferred_lag_remove_anchor_prior_slot_ids="
+                      << cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids
+                      << " deferred_lag_remove_anchor_prior_keys="
+                      << cbs_phase2_deferred_lag_remove_anchor_prior_keys
+                      << " deferred_lag_remove_anchor_prior_protection_reason="
+                      << cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason
+                      << " cbs_phase2_first_post_boundary_factor_class_filter_reason="
+                      << cbs_phase2_first_post_boundary_factor_class_filter_reason
                       << " diag_force_no_external_fast_path="
                       << (FLAGS_cbs_diag_force_no_external_fast_path_when_no_external_effect
                               ? 1
@@ -12226,6 +15564,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << lag_window_state.stale_state_keys
                       << " lag_stale_pose_keys="
                       << lag_window_state.stale_pose_keys
+                      << " lag_stale_local_factor_slots="
+                      << lag_window_state.stale_local_factor_slots
                       << " new_factors_count=" << cbs_new_factors_total
                       << " new_factors_anchor_priors="
                       << cbs_anchor_priors_added
@@ -12297,6 +15637,33 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             reason << e.what() << " failed_symbol=" << failed_symbol.chr()
                    << failed_symbol.index();
             LOG(ERROR) << "CBS BPSAM indeterminant system: " << reason.str();
+            if (!cbs_first_bad_epoch_snapshot_logged_) {
+              if (cbs_have_last_clean_epoch_snapshot_) {
+                if (!cbs_last_clean_primary_packet_ab_snapshot_.empty()) {
+                  std::cerr << cbs_last_clean_primary_packet_ab_snapshot_
+                            << " last_clean_kf_id=" << cbs_last_clean_epoch_kf_id_
+                            << std::endl;
+                }
+                std::cerr << "[CBS][FirstBadEpochForensics] snapshot=last_clean "
+                          << cbs_last_clean_epoch_snapshot_
+                          << " last_clean_kf_id=" << cbs_last_clean_epoch_kf_id_
+                          << std::endl;
+              }
+              log_first_bad_forensic_snapshot(
+                  "first_bad",
+                  exception_phase_label,
+                  "IndeterminantLinearSystemException",
+                  true,
+                  enable_remove_factor_indices,
+                  forensic_remove_slots_this_attempt,
+                  exception_phase_label,
+                  reason.str(),
+                  static_cast<long long>(failed_symbol.key()),
+                  cbs_update_packet_forensics.first_inconsistency_factor_slot,
+                  cbs_update_packet_forensics.first_inconsistency_factor_type,
+                  cbs_update_packet_forensics.first_inconsistency_factor_keys);
+              cbs_first_bad_epoch_snapshot_logged_ = true;
+            }
             return attempt_cbs_recovery(failed_symbol.index(), reason.str());
           } catch (const std::exception& e) {
             const std::string err_msg =
@@ -12314,6 +15681,43 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               LOG(ERROR) << "CBS-heart update hit map::at while applying "
                             "removeFactorIndices. Retrying this epoch without "
                             "removeFactorIndices.";
+              if (cbs_use_phase2_summary_prior_bridge && cbs_phase2_heart_) {
+                cbs_phase2_pending_prune_exists =
+                    cbs_phase2_heart_->hasPendingPrunePlan();
+                if (cbs_phase2_pending_prune_exists) {
+                  cbs_phase2_prune_skipped_due_to_failed_remove_update = true;
+                  cbs_phase2_prune_commit_reason =
+                      "remove_update_failed_map_at";
+                }
+              }
+              if (!cbs_first_bad_epoch_snapshot_logged_) {
+                if (cbs_have_last_clean_epoch_snapshot_) {
+                  if (!cbs_last_clean_primary_packet_ab_snapshot_.empty()) {
+                    std::cerr << cbs_last_clean_primary_packet_ab_snapshot_
+                              << " last_clean_kf_id=" << cbs_last_clean_epoch_kf_id_
+                              << std::endl;
+                  }
+                  std::cerr
+                      << "[CBS][FirstBadEpochForensics] snapshot=last_clean "
+                      << cbs_last_clean_epoch_snapshot_
+                      << " last_clean_kf_id=" << cbs_last_clean_epoch_kf_id_
+                      << std::endl;
+                }
+                log_first_bad_forensic_snapshot(
+                    "first_bad",
+                    exception_phase_label,
+                    "map::at_primary_update",
+                    true,
+                    enable_remove_factor_indices,
+                    forensic_remove_slots_this_attempt,
+                    exception_phase_label,
+                    err_msg,
+                    cbs_update_packet_forensics.first_inconsistency_key,
+                    cbs_update_packet_forensics.first_inconsistency_factor_slot,
+                    cbs_update_packet_forensics.first_inconsistency_factor_type,
+                    cbs_update_packet_forensics.first_inconsistency_factor_keys);
+                cbs_first_bad_epoch_snapshot_logged_ = true;
+              }
               *should_retry_without_remove = true;
               return false;
             }
@@ -12326,9 +15730,63 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               }
             }
             LOG(ERROR) << "CBS BPSAM update failed: " << err_msg;
+            if (!cbs_first_bad_epoch_snapshot_logged_) {
+              if (cbs_have_last_clean_epoch_snapshot_) {
+                if (!cbs_last_clean_primary_packet_ab_snapshot_.empty()) {
+                  std::cerr << cbs_last_clean_primary_packet_ab_snapshot_
+                            << " last_clean_kf_id=" << cbs_last_clean_epoch_kf_id_
+                            << std::endl;
+                }
+                std::cerr << "[CBS][FirstBadEpochForensics] snapshot=last_clean "
+                          << cbs_last_clean_epoch_snapshot_
+                          << " last_clean_kf_id=" << cbs_last_clean_epoch_kf_id_
+                          << std::endl;
+              }
+              log_first_bad_forensic_snapshot(
+                  "first_bad",
+                  exception_phase_label,
+                  "std_exception",
+                  (exception_phase_label == "bpsam_update_call" ||
+                   exception_phase_label == "estimate_readback"),
+                  enable_remove_factor_indices,
+                  forensic_remove_slots_this_attempt,
+                  exception_phase_label,
+                  err_msg,
+                  cbs_update_packet_forensics.first_inconsistency_key,
+                  cbs_update_packet_forensics.first_inconsistency_factor_slot,
+                  cbs_update_packet_forensics.first_inconsistency_factor_type,
+                  cbs_update_packet_forensics.first_inconsistency_factor_keys);
+              cbs_first_bad_epoch_snapshot_logged_ = true;
+            }
             return false;
           } catch (...) {
             LOG(ERROR) << "CBS BPSAM update failed with unknown exception.";
+            if (!cbs_first_bad_epoch_snapshot_logged_) {
+              if (cbs_have_last_clean_epoch_snapshot_) {
+                if (!cbs_last_clean_primary_packet_ab_snapshot_.empty()) {
+                  std::cerr << cbs_last_clean_primary_packet_ab_snapshot_
+                            << " last_clean_kf_id=" << cbs_last_clean_epoch_kf_id_
+                            << std::endl;
+                }
+                std::cerr << "[CBS][FirstBadEpochForensics] snapshot=last_clean "
+                          << cbs_last_clean_epoch_snapshot_
+                          << " last_clean_kf_id=" << cbs_last_clean_epoch_kf_id_
+                          << std::endl;
+              }
+              log_first_bad_forensic_snapshot("first_bad",
+                                              exception_phase_label,
+                                              "unknown_exception",
+                                              true,
+                                              enable_remove_factor_indices,
+                                              forensic_remove_slots_this_attempt,
+                                              exception_phase_label,
+                                              "unknown_exception",
+                                              cbs_update_packet_forensics.first_inconsistency_key,
+                                              cbs_update_packet_forensics.first_inconsistency_factor_slot,
+                                              cbs_update_packet_forensics.first_inconsistency_factor_type,
+                                              cbs_update_packet_forensics.first_inconsistency_factor_keys);
+              cbs_first_bad_epoch_snapshot_logged_ = true;
+            }
             return false;
           }
         };
