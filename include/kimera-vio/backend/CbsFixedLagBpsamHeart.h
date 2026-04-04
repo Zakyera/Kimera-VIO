@@ -147,6 +147,19 @@ class CbsFixedLagBpsamHeart {
     size_t summary_realizable_target_count = 0u;
     size_t summary_dropped_target_count = 0u;
     size_t summary_crossing_factor_count = 0u;
+    size_t summary_crossing_candidate_slots_count = 0u;
+    size_t summary_crossing_selected_slots_count = 0u;
+    size_t summary_crossing_dropped_slots_count = 0u;
+    long long summary_first_dropped_crossing_slot = -1;
+    std::string summary_first_dropped_crossing_slot_class = "none";
+    std::string summary_first_dropped_crossing_slot_keys = "none";
+    std::string summary_first_dropped_crossing_slot_reason = "none";
+    long long summary_first_selected_crossing_slot = -1;
+    std::string summary_first_selected_crossing_slot_class = "none";
+    std::string summary_first_selected_crossing_slot_keys = "none";
+    long long summary_first_covered_crossing_slot = -1;
+    std::string summary_first_covered_crossing_slot_class = "none";
+    std::string summary_first_covered_crossing_slot_keys = "none";
     size_t summary_factor_count_emitted = 0u;
     size_t summary_input_factor_count = 0u;
     size_t summary_eliminated_key_count = 0u;
@@ -154,6 +167,116 @@ class CbsFixedLagBpsamHeart {
     std::string summary_mode = "failed";
     std::string first_summary_failure_reason;
     std::string first_dropped_target_reason;
+    size_t summary_required_crossing_slots_count = 0u;
+    std::string summary_required_crossing_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex> summary_required_crossing_slots_exact;
+    size_t summary_covered_crossing_slots_count = 0u;
+    std::string summary_covered_crossing_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex> summary_covered_crossing_slots_exact;
+    size_t augmented_supported_requested_crossing_slots_count = 0u;
+    std::string augmented_supported_requested_crossing_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex>
+        augmented_supported_requested_crossing_slots_exact;
+    std::string augmented_requested_crossing_slots_first_few = "none";
+    bool augmented_requested_supported_coherence_ok = true;
+    std::unordered_set<gtsam::FactorIndex>
+        caller_requested_crossing_slots_exact;
+    size_t caller_requested_crossing_slots_count = 0u;
+    std::string caller_requested_crossing_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex>
+        caller_requested_supported_crossing_slots_exact;
+    size_t caller_requested_supported_crossing_slots_count = 0u;
+    std::string caller_requested_supported_crossing_slots_first_few = "none";
+    bool caller_requested_domain_coherence_ok = true;
+    long long first_caller_requested_slot_missing_from_internal_crossing_domain =
+        -1;
+    std::string
+        first_caller_requested_slot_missing_from_internal_crossing_domain_class =
+            "none";
+    std::string
+        first_caller_requested_slot_missing_from_internal_crossing_domain_keys =
+            "none";
+    size_t caller_requested_missing_from_internal_domain_count = 0u;
+    std::string caller_requested_missing_from_internal_domain_first_few = "none";
+    std::string caller_requested_slot_classification_first_few = "none";
+    std::string first_caller_requested_slot_exclusion_reason = "none";
+    size_t directly_removable_local_internal_candidate_slots_count = 0u;
+    std::string
+        directly_removable_local_internal_candidate_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex>
+        directly_removable_local_internal_candidate_slots_exact;
+    size_t directly_removable_local_internal_slots_count = 0u;
+    std::string directly_removable_local_internal_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex>
+        directly_removable_local_internal_slots_exact;
+    size_t retained_protected_local_support_slots_count = 0u;
+    std::string retained_protected_local_support_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex>
+        retained_protected_local_support_slots_exact;
+    std::string first_retained_protected_local_support_slot_class = "none";
+    std::string first_retained_protected_local_support_slot_keys = "none";
+    size_t
+        direct_local_internal_rejected_due_to_incomplete_component_count = 0u;
+    long long first_direct_local_internal_rejected_slot = -1;
+    std::string first_direct_local_internal_rejected_slot_class = "none";
+    std::string first_direct_local_internal_rejected_slot_keys = "none";
+    std::string first_direct_local_internal_rejected_reason = "none";
+    std::string first_direct_local_internal_rejected_blocking_key = "none";
+    long long first_direct_local_internal_rejected_blocking_slot = -1;
+    std::string first_direct_local_internal_rejected_blocking_slot_class =
+        "none";
+    std::string first_direct_local_internal_rejected_blocking_slot_keys =
+        "none";
+    long long
+        first_direct_local_internal_rejected_due_to_retained_support_slot = -1;
+    std::string
+        first_direct_local_internal_rejected_due_to_retained_support_reason =
+            "none";
+    size_t
+        direct_local_internal_rejected_due_to_retained_support_slots_count = 0u;
+    std::string
+        direct_local_internal_rejected_due_to_retained_support_slots_first_few =
+            "none";
+    std::unordered_set<gtsam::FactorIndex>
+        direct_local_internal_rejected_due_to_retained_support_slots_exact;
+    size_t root_bootstrap_blocked_component_count = 0u;
+    size_t root_bootstrap_blocked_component_member_count = 0u;
+    std::string root_bootstrap_blocked_component_member_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex>
+        root_bootstrap_blocked_component_member_slots_exact;
+    size_t root_bootstrap_component_seed_count = 0u;
+    std::string root_bootstrap_seed_slots_first_few = "none";
+    std::string root_bootstrap_component_closure_mode = "none";
+    std::string root_bootstrap_blocking_key = "none";
+    long long root_bootstrap_blocking_support_slot = -1;
+    std::string root_bootstrap_blocking_support_slot_class = "none";
+    std::string root_bootstrap_blocking_support_slot_keys = "none";
+    std::string root_bootstrap_blocking_incident_id = "none";
+    size_t unsupported_deferred_lag_slots_count = 0u;
+    std::string unsupported_deferred_lag_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex> unsupported_deferred_lag_slots_exact;
+    size_t lag_requested_slot_count = 0u;
+    bool lag_requested_partition_coherence_ok = true;
+    size_t unclassified_requested_lag_slots_count = 0u;
+    std::string unclassified_requested_lag_slots_first_few = "none";
+    long long first_unclassified_requested_lag_slot = -1;
+    std::string first_unclassified_requested_lag_slot_class = "none";
+    std::string first_unclassified_requested_lag_slot_keys = "none";
+    std::string first_unclassified_requested_lag_slot_reason = "none";
+
+    // Backward-compatible aggregate coverage fields (kept while we migrate
+    // all diagnostics/consumers to split semantics).
+    size_t summary_covered_remove_slots_count = 0u;
+    std::string summary_covered_remove_slots_first_few = "none";
+    std::unordered_set<gtsam::FactorIndex> summary_covered_remove_slots_exact;
+    size_t summary_uncovered_requested_remove_slots_count = 0u;
+    std::string summary_uncovered_requested_remove_slots_first_few = "none";
+    std::string summary_remove_coverage_mode = "none";
+    bool summary_remove_coverage_coherence_ok = true;
+    size_t summary_remove_coverage_requested_count = 0u;
+    size_t summary_remove_coverage_covered_count = 0u;
+    size_t summary_remove_coverage_uncovered_count = 0u;
+    std::string summary_remove_coverage_first_inconsistency_reason = "none";
 
     // Expanded-summary diagnostics (PHASE-3 first step).
     std::string expanded_summary_mode = "disabled";
@@ -161,6 +284,11 @@ class CbsFixedLagBpsamHeart {
     size_t expanded_summary_realizable_target_count = 0u;
     size_t expanded_summary_crossing_factor_count = 0u;
     size_t expanded_summary_factor_count_emitted = 0u;
+    size_t expanded_summary_support_factor_count = 0u;
+    std::string expanded_summary_support_slots_first_few = "none";
+    bool expanded_summary_used_bootstrap_support_priors = false;
+    std::string expanded_summary_bootstrap_support_keys = "none";
+    bool expanded_summary_removed_crossing_uses_bootstrap_support = false;
     double expanded_summary_build_ms = 0.0;
     std::string first_expanded_summary_failure_reason;
     size_t expanded_included_local_nonbelief_factor_count = 0u;
@@ -172,6 +300,7 @@ class CbsFixedLagBpsamHeart {
 
     // Expanded-path selection/injection consistency diagnostics.
     size_t expanded_selected_factor_slots_count = 0u;
+    std::unordered_set<gtsam::FactorIndex> expanded_selected_factor_slots;
     size_t expanded_selected_key_count = 0u;
     size_t expanded_eliminated_key_count = 0u;
     size_t expanded_emitted_factor_count = 0u;
@@ -187,6 +316,17 @@ class CbsFixedLagBpsamHeart {
     std::string first_expanded_exception_context;
     std::string expanded_veto_reason;
     size_t expanded_veto_count = 0u;
+  };
+
+  struct RootBootstrapSupportBuildStats {
+    size_t incident_crossing_support_slot_count = 0u;
+    std::string incident_crossing_support_slots_first_few = "none";
+    size_t kept_target_key_count = 0u;
+    std::string kept_target_keys_first_few = "none";
+    size_t selected_graph_factor_count = 0u;
+    size_t eliminate_key_count = 0u;
+    std::string augment_mode = "none";
+    std::string first_failure_reason = "none";
   };
 
   struct LagWindowPlan {
@@ -262,7 +402,21 @@ class CbsFixedLagBpsamHeart {
   // summary first and falls back to validated LOCAL-only summary if needed.
   bool appendLagEdgeSummaryFactors(LagWindowPlan* plan,
                                    gtsam::NonlinearFactorGraph* out_factors,
-                                   SummaryBuildStats* stats) const;
+                                   SummaryBuildStats* stats,
+                                   const std::unordered_set<gtsam::FactorIndex>*
+                                       augmented_required_crossing_slots =
+                                           nullptr) const;
+
+  // Build a root/bootstrap-specific replacement support packet for direct-local
+  // components blocked by retained frame-0 support, and report which blocked
+  // slots are support-realizable for same-epoch remove.
+  bool appendRootBootstrapDirectLocalSupportFactors(
+      const LagWindowPlan& plan,
+      const std::unordered_set<gtsam::FactorIndex>& blocked_component_slots,
+      gtsam::NonlinearFactorGraph* out_factors,
+      std::unordered_set<gtsam::FactorIndex>* out_supported_remove_slots,
+      std::string* failure_reason,
+      RootBootstrapSupportBuildStats* out_stats = nullptr) const;
 
   // Local-only covariance query stays explicitly separated from fused semantics.
   bool queryLocalOnlyCovariance(const Key& key,

@@ -305,6 +305,73 @@ DEFINE_bool(
     "removeFactorIndices while keeping delete_slots and summary logic "
     "unchanged (diagnostic isolation).");
 DEFINE_bool(
+    cbs_diag_defer_direct_local_internal_only,
+    false,
+    "If true, defer only direct_local_internal lag-remove slots while keeping "
+    "summary_covered_crossing lag-remove slots active (diagnostic isolation "
+    "only).");
+DEFINE_bool(
+    cbs_diag_split_summary_covered_crossing_two_stage,
+    false,
+    "If true, when summary-covered-crossing lag-removes are ready, split the "
+    "primary update into two stages: (A) summary-crossing removes + emitted "
+    "summary factors, then (B) current new VIO factors/values with no "
+    "lag-derived remove indices (diagnostic isolation only).");
+DEFINE_bool(
+    cbs_diag_stage_a_summary_only,
+    false,
+    "If true, force two-stage summary-crossing mode with "
+    "direct_local_internal deferred, and in Stage-A inject only emitted "
+    "summary factors (defer summary-covered-crossing removeFactorIndices).");
+DEFINE_bool(
+    cbs_diag_defer_summary_covered_crossing_one_epoch,
+    false,
+    "If true, force two-stage summary mode with direct_local_internal "
+    "deferred, defer all summary-covered-crossing removeFactorIndices by one "
+    "epoch, and replay that deferred packet in an isolated remove-only "
+    "micro-step before current-epoch VIO factors/values.");
+DEFINE_bool(
+    cbs_diag_stage_b_defer_delete_slots,
+    false,
+    "If true, in two-stage CBS-heart mode suppress/defer delete-slot-derived "
+    "removeFactorIndices from Stage-B for that epoch (diagnostic isolation "
+    "only).");
+DEFINE_bool(
+    cbs_diag_stage_b_filter_invalid_smart_factors,
+    false,
+    "If true, in two-stage CBS-heart mode preflight Stage-B smart factors and "
+    "drop smart factors whose keys are not available after Stage-A (diagnostic "
+    "isolation only).");
+DEFINE_bool(
+    cbs_diag_stage_b_skip_smart_updates_one_epoch_after_lag_boundary,
+    false,
+    "If true, in two-stage CBS-heart mode skip Stage-B smart-factor updates "
+    "on the first post-boundary epoch so previous smart factors stay "
+    "unchanged for that epoch (diagnostic isolation only).");
+DEFINE_bool(
+    cbs_diag_stage_b_skip_epoch_on_initial_failure,
+    false,
+    "If true, in two-stage CBS-heart mode, when the initial Stage-B update "
+    "throws at the first bad epoch, skip Stage-B once for that epoch and "
+    "continue next-epoch flow (diagnostic isolation only).");
+DEFINE_bool(
+    cbs_diag_stage_a_skip_epoch_on_initial_failure,
+    false,
+    "If true, in two-stage CBS-heart mode, when the initial Stage-A update "
+    "throws, skip Stage-A once for that epoch without Stage-A retry/recovery "
+    "and continue next-epoch flow (diagnostic isolation only).");
+DEFINE_bool(
+    cbs_diag_stage_a_zero_remove_first_boundary_epoch,
+    false,
+    "If true, for the first boundary Stage-A epoch only, keep Stage-A "
+    "factors/values unchanged but force Stage-A removeFactorIndices empty "
+    "(diagnostic isolation only).");
+DEFINE_bool(
+    cbs_diag_phase2_disable_overlap_guard,
+    false,
+    "If true, disable PHASE-2 overlap guard that defers lag-derived "
+    "removeFactorIndices when they touch current-epoch new/update keys.");
+DEFINE_bool(
     cbs_diag_phase2_protect_deferred_anchor_prior_x0,
     false,
     "If true, when replaying deferred lag-remove slots, protect/exclude "
@@ -316,6 +383,22 @@ DEFINE_string(
     "full_wrapper_packet, deferred_only, fresh_lag_only, delete_slots_only, "
     "deferred_plus_fresh, deferred_plus_delete_slots, "
     "fresh_lag_plus_delete_slots.");
+DEFINE_bool(
+    cbs_strict_wrapper_remove_contract,
+    false,
+    "If true, in Kimera CBS-heart mode keep BPSAM internal-remove diagnostics "
+    "active but send only the Kimera wrapper-approved remove packet to ISAM2.");
+DEFINE_bool(
+    cbs_log_final_remove_contract_only,
+    false,
+    "If true, in Kimera CBS-heart mode log wrapper/internal/merged final remove "
+    "contract packets without changing remove-packet behavior.");
+DEFINE_bool(
+    cbs_diag_phase2_one_epoch_defer_summary_covered_crossing_classes,
+    false,
+    "If true, defer summary-covered-crossing removeFactorIndices classes "
+    "{imu_like,binary} by exactly one update while keeping summary "
+    "selection/build/injection unchanged (diagnostic isolation only).");
 DEFINE_bool(cbs_b1_refresh_cov_only_on_boundary_change,
             false,
             "If true, refresh B1 LOCAL covariance queries only when lag "
@@ -9150,6 +9233,9 @@ bool VioBackend::optimize(
                               &num_timestamp_map_pruned,
                               &oldest_active_pose_timestamp,
                               &newest_active_pose_timestamp);
+  cbs_timestamp_map_pruned_count_last_epoch_ = num_timestamp_map_pruned;
+  cbs_oldest_active_pose_timestamp_last_epoch_ = oldest_active_pose_timestamp;
+  cbs_newest_active_pose_timestamp_last_epoch_ = newest_active_pose_timestamp;
   if (num_timestamp_map_pruned > 0) {
     VLOG(2) << "Pruned " << num_timestamp_map_pruned
             << " marginalized timestamp->key entries. oldest_active_ts[nsec]="
@@ -11582,12 +11668,29 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     bool cbs_phase2_fresh_lag_anchor_prior_protection_fired = false;
     size_t cbs_phase2_fresh_lag_anchor_prior_blocked_count = 0u;
     std::string cbs_phase2_fresh_lag_anchor_prior_blocked_slots = "none";
+    bool cbs_phase2_fresh_lag_structural_prior_protection_fired = false;
+    size_t cbs_phase2_fresh_lag_structural_prior_blocked_count = 0u;
+    std::string cbs_phase2_fresh_lag_structural_prior_blocked_slots = "none";
+    std::string cbs_phase2_fresh_lag_structural_prior_blocked_keys = "none";
     size_t cbs_phase2_boundary_candidates = 0u;
     size_t cbs_phase2_summary_targets = 0u;
     size_t cbs_phase2_summary_requested_targets = 0u;
     size_t cbs_phase2_summary_realizable_targets = 0u;
     size_t cbs_phase2_summary_dropped_targets = 0u;
     size_t cbs_phase2_summary_crossing_factor_count = 0u;
+    size_t cbs_phase2_summary_crossing_candidate_slots_count = 0u;
+    size_t cbs_phase2_summary_crossing_selected_slots_count = 0u;
+    size_t cbs_phase2_summary_crossing_dropped_slots_count = 0u;
+    long long cbs_phase2_summary_first_dropped_crossing_slot = -1;
+    std::string cbs_phase2_summary_first_dropped_crossing_slot_class = "none";
+    std::string cbs_phase2_summary_first_dropped_crossing_slot_keys = "none";
+    std::string cbs_phase2_summary_first_dropped_crossing_slot_reason = "none";
+    long long cbs_phase2_summary_first_selected_crossing_slot = -1;
+    std::string cbs_phase2_summary_first_selected_crossing_slot_class = "none";
+    std::string cbs_phase2_summary_first_selected_crossing_slot_keys = "none";
+    long long cbs_phase2_summary_first_covered_crossing_slot = -1;
+    std::string cbs_phase2_summary_first_covered_crossing_slot_class = "none";
+    std::string cbs_phase2_summary_first_covered_crossing_slot_keys = "none";
     size_t cbs_phase2_summary_factor_count_emitted = 0u;
     bool cbs_phase2_summary_target_coherence_ok = false;
     double cbs_phase2_summary_build_ms = 0.0;
@@ -11599,6 +11702,12 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     size_t cbs_phase2_expanded_summary_factor_count_emitted = 0u;
     double cbs_phase2_expanded_summary_build_ms = 0.0;
     std::string cbs_phase2_first_expanded_summary_failure_reason = "none";
+    size_t cbs_phase2_expanded_summary_support_factor_count = 0u;
+    std::string cbs_phase2_expanded_summary_support_slots_first_few = "none";
+    bool cbs_phase2_expanded_summary_used_bootstrap_support_priors = false;
+    std::string cbs_phase2_expanded_summary_bootstrap_support_keys = "none";
+    bool cbs_phase2_expanded_summary_removed_crossing_uses_bootstrap_support =
+        false;
     size_t cbs_phase2_expanded_included_local_nonbelief_factor_count = 0u;
     size_t cbs_phase2_expanded_included_mixed_nonbelief_factor_count = 0u;
     size_t cbs_phase2_expanded_included_belief_factor_count = 0u;
@@ -11649,9 +11758,145 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     size_t cbs_phase2_lag_remove_slots_filtered_boundary_touch = 0u;
     size_t cbs_phase2_lag_remove_slots_applied = 0u;
     size_t cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary = 0u;
+    size_t cbs_phase2_lag_remove_slots_requested_raw = 0u;
+    size_t cbs_phase2_lag_remove_slots_summary_covered = 0u;
+    size_t cbs_phase2_lag_remove_slots_deferred_uncovered = 0u;
+    size_t cbs_phase2_lag_remove_slots_applied_after_coverage_gate = 0u;
+    size_t cbs_phase2_summary_required_crossing_slots = 0u;
+    size_t cbs_phase2_summary_covered_crossing_slots = 0u;
+    size_t cbs_phase2_directly_removable_local_internal_candidate_slots = 0u;
+    size_t cbs_phase2_directly_removable_local_internal_slots = 0u;
+    size_t cbs_phase2_retained_protected_local_support_slots = 0u;
+    std::string cbs_phase2_retained_protected_local_support_slots_first_few =
+        "none";
+    std::string cbs_phase2_first_retained_protected_local_support_slot_class =
+        "none";
+    std::string cbs_phase2_first_retained_protected_local_support_slot_keys =
+        "none";
+    size_t cbs_phase2_direct_local_internal_rejected_due_to_incomplete_component =
+        0u;
+    long long cbs_phase2_first_direct_local_internal_rejected_slot = -1;
+    std::string cbs_phase2_first_direct_local_internal_rejected_slot_class =
+        "none";
+    std::string cbs_phase2_first_direct_local_internal_rejected_slot_keys =
+        "none";
+    std::string cbs_phase2_first_direct_local_internal_rejected_reason = "none";
+    std::string cbs_phase2_first_direct_local_internal_rejected_blocking_key =
+        "none";
+    long long cbs_phase2_first_direct_local_internal_rejected_blocking_slot =
+        -1;
+    std::string
+        cbs_phase2_first_direct_local_internal_rejected_blocking_slot_class =
+            "none";
+    std::string
+        cbs_phase2_first_direct_local_internal_rejected_blocking_slot_keys =
+            "none";
+    long long
+        cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_slot =
+            -1;
+    std::string
+        cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_reason =
+            "none";
+    size_t cbs_phase2_root_bootstrap_blocked_component_count = 0u;
+    size_t cbs_phase2_root_bootstrap_blocked_component_member_count = 0u;
+    std::string
+        cbs_phase2_root_bootstrap_blocked_component_member_slots_first_few =
+            "none";
+    size_t cbs_phase2_root_bootstrap_component_seed_count = 0u;
+    std::string cbs_phase2_root_bootstrap_seed_slots_first_few = "none";
+    std::string cbs_phase2_root_bootstrap_component_closure_mode = "none";
+    std::string cbs_phase2_root_bootstrap_blocking_key = "none";
+    long long cbs_phase2_root_bootstrap_blocking_support_slot = -1;
+    std::string cbs_phase2_root_bootstrap_blocking_support_slot_class = "none";
+    std::string cbs_phase2_root_bootstrap_blocking_support_slot_keys = "none";
+    std::string cbs_phase2_root_bootstrap_blocking_incident_id = "none";
+    size_t cbs_phase2_unsupported_deferred_lag_slots = 0u;
+    size_t cbs_phase2_lag_requested_slot_count = 0u;
+    bool cbs_phase2_lag_requested_partition_coherence_ok = true;
+    size_t cbs_phase2_unclassified_requested_lag_slots = 0u;
+    std::string cbs_phase2_unclassified_requested_lag_slots_first_few = "none";
+    long long cbs_phase2_first_unclassified_requested_lag_slot = -1;
+    std::string cbs_phase2_first_unclassified_requested_lag_slot_class = "none";
+    std::string cbs_phase2_first_unclassified_requested_lag_slot_keys = "none";
+    std::string cbs_phase2_first_unclassified_requested_lag_slot_reason = "none";
+    size_t
+        cbs_phase2_requested_crossing_intersection_with_heart_covered_count = 0u;
+    size_t cbs_phase2_requested_crossing_minus_heart_covered_count = 0u;
+    size_t cbs_phase2_heart_covered_minus_requested_crossing_count = 0u;
+    long long cbs_phase2_first_requested_crossing_not_in_heart_covered = -1;
+    long long cbs_phase2_first_heart_covered_not_in_requested_crossing = -1;
+    std::string cbs_phase2_heart_summary_required_slots_first_few = "none";
+    std::string cbs_phase2_heart_summary_covered_slots_first_few = "none";
+    std::string cbs_phase2_heart_direct_local_internal_slots_first_few = "none";
+    std::string cbs_phase2_heart_unsupported_deferred_slots_first_few = "none";
+    std::string
+        cbs_phase2_backend_lag_requested_for_packet_slots_first_few = "none";
+    std::string
+        cbs_phase2_backend_lag_requested_crossing_required_slots_first_few =
+            "none";
+    std::string
+        cbs_phase2_backend_lag_requested_direct_local_internal_slots_first_few =
+            "none";
+    std::string cbs_phase2_backend_lag_requested_unsupported_slots_first_few =
+        "none";
+    std::string
+        cbs_phase2_backend_lag_apply_summary_covered_crossing_slots_first_few =
+            "none";
+    std::string
+        cbs_phase2_backend_lag_apply_direct_local_internal_slots_first_few =
+            "none";
+    std::string
+        cbs_phase2_backend_lag_defer_crossing_uncovered_slots_first_few = "none";
+    std::string cbs_phase2_backend_lag_defer_unsupported_slots_first_few =
+        "none";
+    size_t cbs_phase2_lag_remove_slots_applied_direct_local_internal = 0u;
+    size_t cbs_phase2_lag_remove_slots_applied_summary_covered_crossing = 0u;
+    size_t cbs_phase2_lag_remove_slots_deferred_crossing_uncovered = 0u;
+    size_t cbs_phase2_lag_remove_slots_deferred_unsupported = 0u;
+    size_t cbs_phase2_current_epoch_requested_direct_local_internal_count = 0u;
+    size_t cbs_phase2_current_epoch_requested_crossing_required_count = 0u;
+    size_t cbs_phase2_current_epoch_requested_unsupported_count = 0u;
+    size_t cbs_phase2_deferred_queue_requested_count = 0u;
+    size_t cbs_phase2_effective_requested_crossing_required_count = 0u;
+    size_t
+        cbs_phase2_effective_requested_crossing_intersection_with_heart_covered_count =
+            0u;
+    size_t cbs_phase2_effective_heart_covered_minus_requested_crossing_count = 0u;
+    size_t cbs_phase2_crossing_gate_requested_count = 0u;
+    size_t cbs_phase2_crossing_gate_covered_count = 0u;
+    size_t cbs_phase2_crossing_gate_uncovered_count = 0u;
+    bool cbs_phase2_crossing_gate_hard_blocked = false;
+    std::string cbs_phase2_crossing_gate_reason = "none";
+    bool cbs_phase2_crossing_gate_using_split_semantics = false;
+    bool cbs_phase2_crossing_gate_zero_apply_inconsistent = false;
+    bool cbs_phase2_crossing_export_coherence_ok = true;
+    std::string cbs_phase2_phase2_slot_domain_source = "legacy_wrapper_sources";
+    size_t cbs_phase2_real_applied_lag_slots_count = 0u;
+    std::string cbs_phase2_real_applied_lag_slots_first_few = "none";
+    size_t cbs_phase2_real_applied_delete_slots_count = 0u;
+    size_t cbs_phase2_real_applied_total_remove_slots_count = 0u;
+    std::string cbs_phase2_real_applied_lag_slots_source =
+        "split_contract_only";
+    bool cbs_phase2_applied_lag_slot_membership_ok = true;
+    long long cbs_phase2_first_applied_lag_slot_outside_split_contract = -1;
+    std::string
+        cbs_phase2_first_applied_lag_slot_outside_split_contract_class = "none";
+    std::string
+        cbs_phase2_first_applied_lag_slot_outside_split_contract_keys = "none";
+    bool cbs_phase2_summary_remove_coverage_coherence_ok = true;
+    bool cbs_phase2_lag_remove_hard_blocked_due_to_none_mode = false;
+    bool cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export = false;
+    size_t cbs_phase2_lag_remove_hard_blocked_count = 0u;
     size_t cbs_phase2_lag_remove_boundary_touch_factor_count = 0u;
     std::string cbs_phase2_lag_remove_filter_reason = "none";
     std::string cbs_phase2_lag_remove_deferral_reason = "none";
+    std::string cbs_phase2_lag_remove_coverage_gate_reason = "none";
+    std::string cbs_phase2_summary_remove_coverage_mode = "none";
+    std::string cbs_phase2_summary_remove_coverage_first_inconsistency_reason =
+        "none";
+    long long cbs_phase2_first_uncovered_lag_remove_slot = -1;
+    std::string cbs_phase2_first_uncovered_lag_remove_slot_class = "none";
+    std::string cbs_phase2_first_uncovered_lag_remove_slot_keys = "none";
     size_t cbs_phase2_deferred_lag_remove_packet_size = 0u;
     std::string cbs_phase2_deferred_lag_remove_packet_slots_preview = "none";
     size_t cbs_phase2_deferred_lag_remove_replay_subset_size = 0u;
@@ -11667,6 +11912,10 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     std::string cbs_phase2_deferred_lag_remove_anchor_prior_keys = "none";
     std::string cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason =
         "none";
+    bool cbs_phase2_deferred_structural_prior_protection_fired = false;
+    size_t cbs_phase2_deferred_structural_prior_blocked_count = 0u;
+    std::string cbs_phase2_deferred_structural_prior_blocked_slots = "none";
+    std::string cbs_phase2_deferred_structural_prior_blocked_keys = "none";
     std::string cbs_phase2_lag_remove_factor_type_counts_raw =
         "imu:0|between:0|prior:0|other:0";
     std::string cbs_phase2_lag_remove_factor_type_counts_filtered =
@@ -11677,9 +11926,33 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
         "none";
     bool cbs_phase2_lag_plan_cache_changed_this_epoch = false;
     bool cbs_phase2_incremental_remove_consumed_this_epoch = false;
+    bool cbs_phase2_lag_transaction_consumed_this_epoch = false;
     bool cbs_phase2_skip_lag_plan_commit_consume_effective = false;
     size_t cbs_phase2_incremental_remove_candidate_count = 0u;
     std::string cbs_phase2_incremental_remove_candidate_preview = "none";
+    // Compact heart-lag transaction / prune-plan / window diagnostics.
+    size_t heart_lag_requested_slot_count = 0u;
+    std::string heart_lag_requested_slot_ids = "none";
+    std::string heart_lag_requested_factor_classes = "none";
+    std::string heart_lag_requested_factor_keys = "none";
+    size_t heart_approved_direct_local_internal_count = 0u;
+    size_t heart_approved_summary_covered_crossing_count = 0u;
+    size_t heart_approved_deferred_unsupported_count = 0u;
+    size_t heart_approved_total_wrapper_remove_slots_count = 0u;
+    std::string heart_approved_total_wrapper_remove_slots_ids = "none";
+    long long heart_first_deferred_remove_slot = -1;
+    std::string heart_first_deferred_remove_slot_class = "none";
+    std::string heart_first_deferred_remove_slot_keys = "none";
+    bool heart_prune_plan_exists = false;
+    bool heart_prune_plan_commit_attempted = false;
+    bool heart_prune_plan_commit_succeeded = false;
+    bool heart_prune_plan_consumed = false;
+    size_t heart_prune_plan_remove_count = 0u;
+    FrameId heart_prune_plan_oldest_active_frame_before = 0;
+    FrameId heart_prune_plan_oldest_active_frame_after = 0;
+    FrameId heart_prune_plan_newest_frame_id = 0;
+    bool heart_prune_plan_boundary_changed = false;
+    bool heart_prune_plan_window_advanced = false;
     std::string cbs_phase2_wrapper_remove_packet_label = "full_wrapper_packet";
     std::string cbs_phase2_wrapper_remove_source_counts =
         "deferred:0|fresh_lag:0|delete_slots:0";
@@ -11690,6 +11963,169 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     size_t cbs_phase2_wrapper_remove_delete_slots_count = 0u;
     size_t cbs_phase2_wrapper_remove_total_count = 0u;
     bool cbs_phase2_wrapper_remove_source_coherence_ok = false;
+    bool cbs_phase2_remove_touches_new_factor_key = false;
+    bool cbs_phase2_remove_touches_new_value_key = false;
+    bool cbs_phase2_remove_touches_summary_key = false;
+    bool cbs_phase2_overlap_guard_triggered = false;
+    std::string cbs_phase2_overlap_guard_reason = "none";
+    bool cbs_phase2_overlap_guard_post_split_semantics = false;
+    bool cbs_phase2_overlap_guard_summary_key_only_allowed_for_covered_crossing =
+        false;
+    size_t cbs_phase2_overlap_guard_deferred_direct_local_internal_count = 0u;
+    size_t cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count = 0u;
+    size_t cbs_phase2_overlap_guard_summary_key_only_crossing_count = 0u;
+    size_t cbs_phase2_overlap_guard_new_factor_or_value_crossing_count = 0u;
+    bool cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent =
+        false;
+    bool cbs_phase2_diag_defer_direct_local_internal_only = false;
+    bool cbs_phase2_diag_split_summary_covered_crossing_two_stage = false;
+    bool cbs_phase2_diag_stage_a_summary_only = false;
+    bool cbs_phase2_diag_stage_b_defer_delete_slots = false;
+    bool cbs_phase2_diag_stage_b_filter_invalid_smart_factors = false;
+    bool cbs_phase2_diag_stage_b_skip_epoch_on_initial_failure = false;
+    bool cbs_phase2_diag_stage_a_skip_epoch_on_initial_failure = false;
+    bool cbs_phase2_defer_summary_covered_crossing_one_epoch_mode = false;
+    std::string cbs_phase2_diag_exclude_summary_covered_crossing_classes =
+        "none";
+    std::string
+        cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes =
+            "none";
+    size_t cbs_phase2_direct_local_internal_forced_deferred_count = 0u;
+    size_t cbs_phase2_summary_covered_crossing_kept_active_count = 0u;
+    size_t cbs_phase2_summary_covered_crossing_one_epoch_deferred_count = 0u;
+    std::string
+        cbs_phase2_summary_covered_crossing_one_epoch_deferred_first_few =
+            "none";
+    size_t cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count = 0u;
+    std::string
+        cbs_phase2_summary_covered_crossing_one_epoch_reapplied_first_few =
+            "none";
+    std::string cbs_phase2_summary_covered_crossing_factor_type_counts_raw =
+        "imu_like:0|binary:0|prior:0|other:0";
+    std::string cbs_phase2_summary_covered_crossing_factor_type_counts_applied =
+        "imu_like:0|binary:0|prior:0|other:0";
+    std::string
+        cbs_phase2_summary_covered_crossing_factor_type_counts_deferred =
+            "imu_like:0|binary:0|prior:0|other:0";
+    std::string cbs_phase2_first_applied_summary_covered_crossing_slot_class =
+        "none";
+    std::string cbs_phase2_first_applied_summary_covered_crossing_slot_keys =
+        "none";
+    std::string cbs_phase2_first_deferred_summary_covered_crossing_slot_class =
+        "none";
+    std::string cbs_phase2_first_deferred_summary_covered_crossing_slot_keys =
+        "none";
+    size_t cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count =
+        0u;
+    size_t cbs_phase2_summary_covered_crossing_replayed_count = 0u;
+    long long cbs_phase2_summary_covered_crossing_replay_epoch = -1;
+    std::string cbs_phase2_summary_covered_crossing_replay_stage = "none";
+    size_t cbs_phase2_summary_crossing_replay_requested_count = 0u;
+    size_t cbs_phase2_summary_crossing_replay_valid_count = 0u;
+    size_t cbs_phase2_summary_crossing_replay_invalid_count = 0u;
+    bool cbs_phase2_summary_crossing_replay_skipped_due_to_no_valid_slots =
+        false;
+    long long cbs_phase2_summary_crossing_replay_first_invalid_slot = -1;
+    std::string cbs_phase2_summary_crossing_replay_first_invalid_slot_class =
+        "none";
+    std::string cbs_phase2_summary_crossing_replay_first_invalid_slot_keys =
+        "none";
+    std::string cbs_phase2_summary_crossing_replay_first_invalid_reason =
+        "none";
+    long long cbs_phase2_summary_crossing_replay_first_replayed_slot = -1;
+    std::string cbs_phase2_summary_crossing_replay_first_replayed_slot_class =
+        "none";
+    std::string cbs_phase2_summary_crossing_replay_first_replayed_slot_keys =
+        "none";
+    bool cbs_phase2_summary_crossing_replay_stage_executed = false;
+    std::string cbs_phase2_first_bad_epoch_apply_class_mix = "none";
+    size_t cbs_phase2_first_bad_epoch_real_applied_direct_local_internal_count =
+        0u;
+    size_t cbs_phase2_first_bad_epoch_real_applied_summary_covered_crossing_count =
+        0u;
+    std::string cbs_phase2_first_bad_epoch_one_epoch_defer_mode = "none";
+    std::string cbs_phase2_primary_update_mode = "single_packet";
+    bool cbs_phase2_two_stage_summary_crossing_mode = false;
+    bool cbs_phase2_one_epoch_replay_mode_forced_two_stage = false;
+    bool cbs_phase2_single_packet_update_inconsistent_under_replay_mode =
+        false;
+    bool cbs_phase2_two_stage_requested = false;
+    bool cbs_phase2_two_stage_effective = false;
+    size_t cbs_phase2_replay_queue_size = 0u;
+    size_t cbs_phase2_replay_into_stage_a_count = 0u;
+    bool cbs_phase2_two_stage_update_a_executed = false;
+    bool cbs_phase2_two_stage_update_b_executed = false;
+    size_t cbs_phase2_two_stage_update_a_remove_count = 0u;
+    size_t cbs_phase2_two_stage_update_a_summary_factor_count = 0u;
+    size_t cbs_phase2_two_stage_update_b_new_factor_count = 0u;
+    size_t cbs_phase2_two_stage_update_b_new_value_count = 0u;
+    bool cbs_phase2_stage_b_defer_delete_slots_mode = false;
+    bool cbs_phase2_stage_b_filter_invalid_smart_factors_mode = false;
+    bool cbs_phase2_diag_stage_b_skip_smart_updates_one_epoch_after_lag_boundary =
+        false;
+    bool cbs_phase2_stage_b_skip_smart_updates_one_epoch_mode = false;
+    bool cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective = false;
+    bool cbs_phase2_stage_a_skip_epoch_on_initial_failure_mode = false;
+    bool cbs_phase2_diag_stage_a_zero_remove_first_boundary_epoch = false;
+    bool cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure = false;
+    long long cbs_phase2_stage_a_skipped_kf = -1;
+    std::string cbs_phase2_stage_a_skip_reason = "none";
+    bool cbs_phase2_stage_b_skip_epoch_on_initial_failure_mode = false;
+    bool cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure = false;
+    long long cbs_phase2_stage_b_skipped_kf = -1;
+    std::string cbs_phase2_stage_b_skip_reason = "none";
+    size_t cbs_phase2_stage_b_delete_slots_raw_count = 0u;
+    size_t cbs_phase2_stage_b_delete_slots_applied_count = 0u;
+    size_t cbs_phase2_stage_b_delete_slots_deferred_count = 0u;
+    size_t cbs_phase2_stage_b_smart_factor_raw_count = 0u;
+    size_t cbs_phase2_stage_b_smart_factor_kept_count = 0u;
+    size_t cbs_phase2_stage_b_smart_factor_dropped_count = 0u;
+    size_t cbs_phase2_stage_b_smart_factor_skipped_count = 0u;
+    size_t cbs_phase2_stage_b_smart_factor_reused_count = 0u;
+    bool cbs_phase2_stage_b_map_at_thrown = false;
+    std::string cbs_phase2_stage_b_first_dropped_smart_factor_keys = "none";
+    std::string cbs_phase2_stage_b_first_dropped_smart_factor_reason = "none";
+    std::string cbs_phase2_stage_b_first_bad_epoch_stage = "none";
+    bool cbs_phase2_stage_a_summary_only_mode = false;
+    bool cbs_phase2_replay_into_stage_a_mode = false;
+    size_t cbs_phase2_replayed_summary_crossing_count = 0u;
+    size_t cbs_phase2_stage_a_remove_count = 0u;
+    size_t cbs_phase2_stage_a_summary_factor_count = 0u;
+    size_t cbs_phase2_stage_a_summary_crossing_remove_count = 0u;
+    size_t cbs_phase2_stage_a_summary_crossing_remove_deferred_count = 0u;
+    bool cbs_phase2_stage_a_replay_skipped_due_to_failure = false;
+    std::string cbs_phase2_two_stage_first_bad_epoch_stage = "none";
+    size_t cbs_phase2_deferred_due_to_overlap_count = 0u;
+    std::string cbs_phase2_deferred_due_to_overlap_slots_first_few = "none";
+    std::string cbs_phase2_overlap_keys_first_few = "none";
+    size_t cbs_phase2_remove_indices_applied_count = 0u;
+    size_t cbs_phase2_remove_indices_deferred_count = 0u;
+    std::unordered_set<size_t> cbs_phase2_wrapper_source_deferred_slots;
+    std::unordered_set<size_t> cbs_phase2_wrapper_source_fresh_lag_slots;
+    std::unordered_set<size_t> cbs_phase2_wrapper_source_delete_slots;
+    std::unordered_set<size_t> cbs_phase2_stale_local_factor_slots_set;
+    std::unordered_set<size_t> cbs_phase2_stale_belief_factor_slots_set;
+    std::unordered_set<size_t> cbs_phase2_orphan_belief_factor_slots_set;
+    std::unordered_set<size_t> cbs_phase2_expanded_selected_factor_slots_set;
+    std::unordered_set<size_t> cbs_phase2_summary_required_crossing_slots_set;
+    std::unordered_set<size_t> cbs_phase2_summary_covered_crossing_slots_set;
+    std::unordered_set<size_t>
+        cbs_phase2_directly_removable_local_internal_candidate_slots_set;
+    std::unordered_set<size_t>
+        cbs_phase2_directly_removable_local_internal_slots_set;
+    std::unordered_set<size_t>
+        cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set;
+    std::unordered_set<size_t>
+        cbs_phase2_root_bootstrap_blocked_component_slots_set;
+    std::unordered_set<size_t> cbs_phase2_unsupported_deferred_lag_slots_set;
+    std::unordered_set<size_t>
+        cbs_phase2_lag_apply_direct_local_internal_slots_set;
+    std::unordered_set<size_t>
+        cbs_phase2_lag_apply_summary_covered_crossing_slots_set;
+    std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+        cbs_phase2_summary_covered_crossing_replay_metadata_map;
+    std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+        cbs_phase2_direct_local_pending_replay_metadata_map;
     const size_t cbs_phase2_delete_slots_size_raw = delete_slots.size();
     size_t cbs_phase2_delete_slots_size_applied = delete_slots.size();
     bool cbs_phase2_delete_slots_suppressed_this_epoch = false;
@@ -11713,6 +12149,12 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             oss << ",...";
           }
           return oss.str();
+        };
+    const auto format_slot_set_preview =
+        [&](const std::unordered_set<size_t>& slots, const size_t max_items) {
+          gtsam::FactorIndices ordered(slots.begin(), slots.end());
+          std::sort(ordered.begin(), ordered.end());
+          return format_factor_slots_preview(ordered, max_items);
         };
     const auto sanitize_forensic_token = [](std::string token) {
       if (token.empty()) {
@@ -11834,6 +12276,20 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       long long first_inconsistency_factor_slot = -1;
       std::string first_inconsistency_factor_type = "none";
       std::string first_inconsistency_factor_keys = "none";
+
+      // Applied remove slot provenance diagnostics (first bad epoch focus).
+      std::string applied_remove_slots_first_few = "none";
+      long long first_applied_remove_slot = -1;
+      std::string first_applied_remove_slot_source = "none";
+      std::string first_applied_remove_slot_factor_class = "none";
+      std::string first_applied_remove_slot_factor_keys = "none";
+      int first_applied_remove_slot_exists_before_update = -1;
+      int first_applied_remove_slot_in_stale_local_factor_slots = 0;
+      int first_applied_remove_slot_in_stale_belief_factor_slots = 0;
+      int first_applied_remove_slot_in_orphan_belief_factor_slots = 0;
+      int first_applied_remove_slot_in_delete_slots = 0;
+      int first_applied_remove_slot_in_phase2_expanded_selected_factor_slots = 0;
+      int first_applied_remove_slot_touches_root_anchor_x0 = 0;
     };
     const auto classify_forensic_factor_type =
         [](const gtsam::NonlinearFactor* factor) -> std::string {
@@ -11868,6 +12324,83 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       }
       return "other";
     };
+    const auto classify_forensic_remove_factor_class =
+        [&](const gtsam::NonlinearFactor::shared_ptr& factor) -> std::string {
+      if (!factor) {
+        return "other";
+      }
+      const cbs::AgentId self_id = cbs_optimizer_->getParams().robot_id;
+      if (cbs::isPoseBeliefFactor(self_id, factor) ||
+          cbs::isAnchorBeliefFactor(factor)) {
+        return "belief";
+      }
+      if (dynamic_cast<const SmartStereoFactor*>(factor.get()) != nullptr) {
+        return "smart";
+      }
+      const std::string base_type = classify_forensic_factor_type(factor.get());
+      if (base_type == "imu") {
+        return "imu";
+      }
+      if (base_type == "between") {
+        return "between";
+      }
+      if (base_type == "prior" || base_type == "external_prior") {
+        return "prior";
+      }
+      return "other";
+    };
+    const auto sorted_slots_from_set =
+        [](const std::unordered_set<size_t>& slots) {
+          gtsam::FactorIndices ordered(slots.begin(), slots.end());
+          std::sort(ordered.begin(), ordered.end());
+          return ordered;
+        };
+    const auto format_slot_set_csv =
+        [&](const std::unordered_set<size_t>& slots) {
+          const gtsam::FactorIndices ordered = sorted_slots_from_set(slots);
+          return ordered.empty() ? std::string("none")
+                                 : format_factor_slots_preview(
+                                       ordered, ordered.size());
+        };
+    const auto format_slot_set_factor_classes_csv =
+        [&](const gtsam::NonlinearFactorGraph& factors,
+            const std::unordered_set<size_t>& slots) {
+          const gtsam::FactorIndices ordered = sorted_slots_from_set(slots);
+          if (ordered.empty()) {
+            return std::string("none");
+          }
+          std::ostringstream oss;
+          for (size_t i = 0; i < ordered.size(); ++i) {
+            if (i > 0u) {
+              oss << ",";
+            }
+            const size_t slot = ordered[i];
+            if (!factors.exists(slot) || !factors.at(slot)) {
+              oss << slot << ":missing";
+              continue;
+            }
+            oss << slot << ":"
+                << classify_forensic_remove_factor_class(factors.at(slot));
+          }
+          return oss.str();
+        };
+    const auto format_slot_set_factor_keys_csv =
+        [&](const gtsam::NonlinearFactorGraph& factors,
+            const std::unordered_set<size_t>& slots) {
+          const gtsam::FactorIndices ordered = sorted_slots_from_set(slots);
+          if (ordered.empty()) {
+            return std::string("none");
+          }
+          std::ostringstream oss;
+          for (size_t i = 0; i < ordered.size(); ++i) {
+            if (i > 0u) {
+              oss << ",";
+            }
+            const size_t slot = ordered[i];
+            oss << slot << ":" << format_factor_keys_for_slot(factors, slot);
+          }
+          return oss.str();
+        };
     const auto bump_forensic_factor_type =
         [](const std::string& factor_type, ForensicFactorTypeCounts* counts) {
       CHECK_NOTNULL(counts);
@@ -11923,9 +12456,13 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
         FLAGS_cbs_diag_phase2_suppress_delete_slots_first_post_boundary;
     const bool cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch =
         FLAGS_cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch;
-    const bool cbs_diag_phase2_protect_deferred_anchor_prior_x0 =
-        FLAGS_cbs_diag_phase2_protect_deferred_anchor_prior_x0;
 
+    const bool cbs_prev_oldest_active_frame_id_known_before_build =
+        cbs_has_prev_oldest_active_frame_id_;
+    const FrameId cbs_prev_oldest_active_frame_id_before_build =
+        cbs_prev_oldest_active_frame_id_known_before_build
+            ? cbs_prev_oldest_active_frame_id_
+            : computeCbsOldestActiveFrame(curr_kf_id_);
     CbsFixedLagWindowState lag_window_state;
     CbsFixedLagBpsamHeart::LagWindowPlan phase2_incremental_plan;
     CbsFixedLagBpsamHeart::BoundarySummaryInput phase2_summary_input;
@@ -11962,6 +12499,22 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             phase2_incremental_remove_slots.size();
         cbs_phase2_incremental_remove_candidate_preview =
             format_factor_slots_preview(phase2_incremental_remove_slots, 8u);
+        heart_prune_plan_exists = cbs_phase2_pending_prune_exists;
+        heart_prune_plan_remove_count = phase2_incremental_remove_slots.size();
+        heart_prune_plan_newest_frame_id =
+            phase2_incremental_plan.stale_eviction.newest_frame_id;
+        heart_prune_plan_oldest_active_frame_before =
+            cbs_has_prev_oldest_active_frame_id_
+                ? cbs_prev_oldest_active_frame_id_
+                : phase2_incremental_plan.stale_eviction.oldest_active_frame_id;
+        heart_prune_plan_oldest_active_frame_after =
+            phase2_incremental_plan.stale_eviction.oldest_active_frame_id;
+        heart_prune_plan_boundary_changed =
+            heart_prune_plan_oldest_active_frame_after !=
+            heart_prune_plan_oldest_active_frame_before;
+        heart_prune_plan_window_advanced =
+            heart_prune_plan_oldest_active_frame_after >
+            heart_prune_plan_oldest_active_frame_before;
 
         auto hash_combine = [](size_t* seed, const size_t value) {
           *seed ^= value + 0x9e3779b97f4a7c15ULL + ((*seed) << 6) + ((*seed) >> 2);
@@ -12014,6 +12567,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           lag_window_state = buildCbsFixedLagWindowState(timestamps);
           augmentCbsLagWindowWithBeliefOwnershipPruning(&lag_window_state);
           cbs_phase2_incremental_remove_consumed_this_epoch = false;
+          heart_prune_plan_consumed = false;
         } else {
           lag_window_state.newest_frame_id =
               phase2_incremental_plan.stale_eviction.newest_frame_id;
@@ -12038,7 +12592,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                                         lag_window_state.eviction_start_frame_id)
                   : 0u;
           lag_window_state.remove_factor_indices = phase2_incremental_remove_slots;
-          cbs_phase2_incremental_remove_consumed_this_epoch = true;
+          cbs_phase2_incremental_remove_consumed_this_epoch = false;
+          heart_prune_plan_consumed = false;
           lag_window_state.stale_state_keys =
               phase2_incremental_plan.stale_eviction.stale_local_keys.size();
           lag_window_state.stale_pose_keys = 0u;
@@ -12087,11 +12642,53 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     }
     cbs_phase2_stale_local_factor_slots = lag_window_state.stale_local_factor_slots;
     cbs_phase2_orphan_factor_slots = lag_window_state.orphan_belief_factor_slots;
+    const FrameId target_oldest_active_frame_id_after_build =
+        lag_window_state.oldest_active_frame_id;
+    const FrameId cbs_prev_oldest_active_frame_id_after_build =
+        cbs_has_prev_oldest_active_frame_id_
+            ? cbs_prev_oldest_active_frame_id_
+            : target_oldest_active_frame_id_after_build;
+    if (cbs_prev_oldest_active_frame_id_known_before_build) {
+      cbs_prev_oldest_active_frame_id_ =
+          cbs_prev_oldest_active_frame_id_before_build;
+      cbs_has_prev_oldest_active_frame_id_ = true;
+    } else {
+      cbs_has_prev_oldest_active_frame_id_ = false;
+    }
+    const FrameId cbs_prev_oldest_active_frame_id_before_update =
+        cbs_has_prev_oldest_active_frame_id_
+            ? cbs_prev_oldest_active_frame_id_
+            : target_oldest_active_frame_id_after_build;
+    const bool lag_boundary_advanced_target_epoch =
+        target_oldest_active_frame_id_after_build > 0u;
+    const bool lag_boundary_prev_frame_for_diag_exists =
+        target_oldest_active_frame_id_after_build > 0u;
+    const FrameId lag_boundary_prev_frame_for_diag =
+        lag_boundary_prev_frame_for_diag_exists
+            ? (target_oldest_active_frame_id_after_build - 1u)
+            : 0u;
+    const bool x_prev_frame_exists_before_update =
+        lag_boundary_prev_frame_for_diag_exists &&
+        cbs_optimizer_->valueExists(
+            gtsam::Symbol(kPoseSymbolChar, lag_boundary_prev_frame_for_diag));
+    const bool v_prev_frame_exists_before_update =
+        lag_boundary_prev_frame_for_diag_exists &&
+        cbs_optimizer_->valueExists(
+            gtsam::Symbol(kVelocitySymbolChar, lag_boundary_prev_frame_for_diag));
+    const bool b_prev_frame_exists_before_update =
+        lag_boundary_prev_frame_for_diag_exists &&
+        cbs_optimizer_->valueExists(
+            gtsam::Symbol(kImuBiasSymbolChar, lag_boundary_prev_frame_for_diag));
+    bool lag_boundary_remove_update_attempted = false;
+    bool lag_boundary_remove_update_succeeded = false;
 
     // CBS-heart currently approximates fixed-lag factor removal but does not
     // yet implement a full marginalization prior. Add a boundary anchor once
     // per oldest-active frame to reduce gauge drift/underdetermined windows.
     gtsam::NonlinearFactorGraph cbs_update_factors = new_factors;
+    const gtsam::NonlinearFactorGraph cbs_current_epoch_new_vio_factors =
+        new_factors;
+    gtsam::NonlinearFactorGraph cbs_phase2_summary_only_factors;
     const FrameId anchor_frame_id = lag_window_state.oldest_active_frame_id;
     if (cbs_allow_heavy_maintenance &&
         !FLAGS_cbs_diag_disable_lag_boundary_anchor_priors &&
@@ -12150,6 +12747,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             for (const auto& factor_ptr : phase2_summary_factors) {
               if (factor_ptr) {
                 cbs_update_factors.push_back(factor_ptr);
+                cbs_phase2_summary_only_factors.push_back(factor_ptr);
                 ++phase2_summary_factor_count_pushed;
               }
             }
@@ -12169,6 +12767,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           };
           const bool cbs_phase2_summary_mode_success =
               (phase2_stats.summary_mode == "exact_schur") ||
+              (phase2_stats.summary_mode == "exact_local_crossing_schur") ||
               (phase2_stats.summary_mode == "exact_expanded_partial_scope");
           cbs_phase2_summary_injected_this_epoch =
               emitted && phase2_stats.summary_implemented_this_epoch &&
@@ -12194,6 +12793,39 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               phase2_stats.summary_dropped_target_count;
           cbs_phase2_summary_crossing_factor_count =
               phase2_stats.summary_crossing_factor_count;
+          cbs_phase2_summary_crossing_candidate_slots_count =
+              phase2_stats.summary_crossing_candidate_slots_count;
+          cbs_phase2_summary_crossing_selected_slots_count =
+              phase2_stats.summary_crossing_selected_slots_count;
+          cbs_phase2_summary_crossing_dropped_slots_count =
+              phase2_stats.summary_crossing_dropped_slots_count;
+          cbs_phase2_summary_first_dropped_crossing_slot =
+              phase2_stats.summary_first_dropped_crossing_slot;
+          cbs_phase2_summary_first_dropped_crossing_slot_class =
+              sanitize_diag_token(
+                  phase2_stats.summary_first_dropped_crossing_slot_class);
+          cbs_phase2_summary_first_dropped_crossing_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats.summary_first_dropped_crossing_slot_keys);
+          cbs_phase2_summary_first_dropped_crossing_slot_reason =
+              sanitize_diag_token(
+                  phase2_stats.summary_first_dropped_crossing_slot_reason);
+          cbs_phase2_summary_first_selected_crossing_slot =
+              phase2_stats.summary_first_selected_crossing_slot;
+          cbs_phase2_summary_first_selected_crossing_slot_class =
+              sanitize_diag_token(
+                  phase2_stats.summary_first_selected_crossing_slot_class);
+          cbs_phase2_summary_first_selected_crossing_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats.summary_first_selected_crossing_slot_keys);
+          cbs_phase2_summary_first_covered_crossing_slot =
+              phase2_stats.summary_first_covered_crossing_slot;
+          cbs_phase2_summary_first_covered_crossing_slot_class =
+              sanitize_diag_token(
+                  phase2_stats.summary_first_covered_crossing_slot_class);
+          cbs_phase2_summary_first_covered_crossing_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats.summary_first_covered_crossing_slot_keys);
           cbs_phase2_summary_factor_count_emitted =
               phase2_stats.summary_factor_count_emitted;
           cbs_phase2_summary_build_ms = phase2_stats.summary_build_ms;
@@ -12210,6 +12842,16 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               phase2_stats.expanded_summary_factor_count_emitted;
           cbs_phase2_expanded_summary_build_ms =
               phase2_stats.expanded_summary_build_ms;
+          cbs_phase2_expanded_summary_support_factor_count =
+              phase2_stats.expanded_summary_support_factor_count;
+          cbs_phase2_expanded_summary_support_slots_first_few =
+              phase2_stats.expanded_summary_support_slots_first_few;
+          cbs_phase2_expanded_summary_used_bootstrap_support_priors =
+              phase2_stats.expanded_summary_used_bootstrap_support_priors;
+          cbs_phase2_expanded_summary_bootstrap_support_keys =
+              phase2_stats.expanded_summary_bootstrap_support_keys;
+          cbs_phase2_expanded_summary_removed_crossing_uses_bootstrap_support =
+              phase2_stats.expanded_summary_removed_crossing_uses_bootstrap_support;
           cbs_phase2_first_expanded_summary_failure_reason = sanitize_diag_token(
               phase2_stats.first_expanded_summary_failure_reason);
           cbs_phase2_expanded_included_local_nonbelief_factor_count =
@@ -12226,6 +12868,10 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               phase2_stats.expanded_excluded_belief_factor_count;
           cbs_phase2_expanded_selected_factor_slots_count =
               phase2_stats.expanded_selected_factor_slots_count;
+          cbs_phase2_expanded_selected_factor_slots_set.clear();
+          cbs_phase2_expanded_selected_factor_slots_set.insert(
+              phase2_stats.expanded_selected_factor_slots.begin(),
+              phase2_stats.expanded_selected_factor_slots.end());
           cbs_phase2_expanded_selected_key_count =
               phase2_stats.expanded_selected_key_count;
           cbs_phase2_expanded_eliminated_key_count =
@@ -12264,6 +12910,178 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               phase2_stats.first_summary_failure_reason);
           cbs_phase2_first_dropped_target_reason = sanitize_diag_token(
               phase2_stats.first_dropped_target_reason);
+          cbs_phase2_summary_remove_coverage_mode = sanitize_diag_token(
+              phase2_stats.summary_remove_coverage_mode);
+          cbs_phase2_summary_remove_coverage_coherence_ok =
+              phase2_stats.summary_remove_coverage_coherence_ok;
+          cbs_phase2_summary_remove_coverage_first_inconsistency_reason =
+              sanitize_diag_token(
+                  phase2_stats.summary_remove_coverage_first_inconsistency_reason);
+          cbs_phase2_summary_required_crossing_slots =
+              phase2_stats.summary_required_crossing_slots_count;
+          cbs_phase2_summary_covered_crossing_slots =
+              phase2_stats.summary_covered_crossing_slots_count;
+          cbs_phase2_directly_removable_local_internal_candidate_slots =
+              phase2_stats
+                  .directly_removable_local_internal_candidate_slots_count;
+          cbs_phase2_directly_removable_local_internal_slots =
+              phase2_stats.directly_removable_local_internal_slots_count;
+          cbs_phase2_retained_protected_local_support_slots =
+              phase2_stats.retained_protected_local_support_slots_count;
+          cbs_phase2_retained_protected_local_support_slots_first_few =
+              sanitize_diag_token(
+                  phase2_stats
+                      .retained_protected_local_support_slots_first_few);
+          cbs_phase2_first_retained_protected_local_support_slot_class =
+              sanitize_diag_token(
+                  phase2_stats
+                      .first_retained_protected_local_support_slot_class);
+          cbs_phase2_first_retained_protected_local_support_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats
+                      .first_retained_protected_local_support_slot_keys);
+          cbs_phase2_direct_local_internal_rejected_due_to_incomplete_component =
+              phase2_stats
+                  .direct_local_internal_rejected_due_to_incomplete_component_count;
+          cbs_phase2_first_direct_local_internal_rejected_slot =
+              phase2_stats.first_direct_local_internal_rejected_slot;
+          cbs_phase2_first_direct_local_internal_rejected_slot_class =
+              sanitize_diag_token(
+                  phase2_stats
+                      .first_direct_local_internal_rejected_slot_class);
+          cbs_phase2_first_direct_local_internal_rejected_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats
+                      .first_direct_local_internal_rejected_slot_keys);
+          cbs_phase2_first_direct_local_internal_rejected_reason =
+              sanitize_diag_token(
+                  phase2_stats.first_direct_local_internal_rejected_reason);
+          cbs_phase2_first_direct_local_internal_rejected_blocking_key =
+              sanitize_diag_token(
+                  phase2_stats
+                      .first_direct_local_internal_rejected_blocking_key);
+          cbs_phase2_first_direct_local_internal_rejected_blocking_slot =
+              phase2_stats
+                  .first_direct_local_internal_rejected_blocking_slot;
+          cbs_phase2_first_direct_local_internal_rejected_blocking_slot_class =
+              sanitize_diag_token(
+                  phase2_stats
+                      .first_direct_local_internal_rejected_blocking_slot_class);
+          cbs_phase2_first_direct_local_internal_rejected_blocking_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats
+                      .first_direct_local_internal_rejected_blocking_slot_keys);
+          cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_slot =
+              phase2_stats
+                  .first_direct_local_internal_rejected_due_to_retained_support_slot;
+          cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_reason =
+              sanitize_diag_token(
+                  phase2_stats
+                      .first_direct_local_internal_rejected_due_to_retained_support_reason);
+          cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set.clear();
+          for (const auto slot :
+               phase2_stats
+                   .direct_local_internal_rejected_due_to_retained_support_slots_exact) {
+            cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set
+                .insert(static_cast<size_t>(slot));
+          }
+          cbs_phase2_root_bootstrap_blocked_component_count =
+              phase2_stats.root_bootstrap_blocked_component_count;
+          cbs_phase2_root_bootstrap_blocked_component_member_count =
+              phase2_stats.root_bootstrap_blocked_component_member_count;
+          cbs_phase2_root_bootstrap_blocked_component_member_slots_first_few =
+              sanitize_diag_token(
+                  phase2_stats
+                      .root_bootstrap_blocked_component_member_slots_first_few);
+          cbs_phase2_root_bootstrap_component_seed_count =
+              phase2_stats.root_bootstrap_component_seed_count;
+          cbs_phase2_root_bootstrap_seed_slots_first_few = sanitize_diag_token(
+              phase2_stats.root_bootstrap_seed_slots_first_few);
+          cbs_phase2_root_bootstrap_component_closure_mode = sanitize_diag_token(
+              phase2_stats.root_bootstrap_component_closure_mode);
+          cbs_phase2_root_bootstrap_blocking_key = sanitize_diag_token(
+              phase2_stats.root_bootstrap_blocking_key);
+          cbs_phase2_root_bootstrap_blocking_support_slot =
+              phase2_stats.root_bootstrap_blocking_support_slot;
+          cbs_phase2_root_bootstrap_blocking_support_slot_class =
+              sanitize_diag_token(
+                  phase2_stats.root_bootstrap_blocking_support_slot_class);
+          cbs_phase2_root_bootstrap_blocking_support_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats.root_bootstrap_blocking_support_slot_keys);
+          cbs_phase2_root_bootstrap_blocking_incident_id = sanitize_diag_token(
+              phase2_stats.root_bootstrap_blocking_incident_id);
+          cbs_phase2_root_bootstrap_blocked_component_slots_set.clear();
+          for (const auto slot :
+               phase2_stats.root_bootstrap_blocked_component_member_slots_exact) {
+            cbs_phase2_root_bootstrap_blocked_component_slots_set.insert(
+                static_cast<size_t>(slot));
+          }
+          cbs_phase2_unsupported_deferred_lag_slots =
+              phase2_stats.unsupported_deferred_lag_slots_count;
+          cbs_phase2_lag_requested_slot_count =
+              phase2_stats.lag_requested_slot_count;
+          cbs_phase2_lag_requested_partition_coherence_ok =
+              phase2_stats.lag_requested_partition_coherence_ok;
+          cbs_phase2_unclassified_requested_lag_slots =
+              phase2_stats.unclassified_requested_lag_slots_count;
+          cbs_phase2_unclassified_requested_lag_slots_first_few =
+              sanitize_diag_token(
+                  phase2_stats.unclassified_requested_lag_slots_first_few);
+          cbs_phase2_first_unclassified_requested_lag_slot =
+              phase2_stats.first_unclassified_requested_lag_slot;
+          cbs_phase2_first_unclassified_requested_lag_slot_class =
+              sanitize_diag_token(
+                  phase2_stats.first_unclassified_requested_lag_slot_class);
+          cbs_phase2_first_unclassified_requested_lag_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats.first_unclassified_requested_lag_slot_keys);
+          cbs_phase2_first_unclassified_requested_lag_slot_reason =
+              sanitize_diag_token(
+                  phase2_stats.first_unclassified_requested_lag_slot_reason);
+          // Backward-compatible aggregate mirrors the split crossing-covered set.
+          cbs_phase2_lag_remove_slots_summary_covered =
+              cbs_phase2_summary_covered_crossing_slots;
+          cbs_phase2_summary_required_crossing_slots_set.clear();
+          for (const auto slot : phase2_stats.summary_required_crossing_slots_exact) {
+            cbs_phase2_summary_required_crossing_slots_set.insert(
+                static_cast<size_t>(slot));
+          }
+          cbs_phase2_heart_summary_required_slots_first_few =
+              sanitize_forensic_token(format_slot_set_preview(
+                  cbs_phase2_summary_required_crossing_slots_set, 8u));
+          cbs_phase2_summary_covered_crossing_slots_set.clear();
+          for (const auto slot : phase2_stats.summary_covered_crossing_slots_exact) {
+            cbs_phase2_summary_covered_crossing_slots_set.insert(
+                static_cast<size_t>(slot));
+          }
+          cbs_phase2_heart_summary_covered_slots_first_few =
+              sanitize_forensic_token(format_slot_set_preview(
+                  cbs_phase2_summary_covered_crossing_slots_set, 8u));
+          cbs_phase2_directly_removable_local_internal_candidate_slots_set.clear();
+          for (const auto slot :
+               phase2_stats
+                   .directly_removable_local_internal_candidate_slots_exact) {
+            cbs_phase2_directly_removable_local_internal_candidate_slots_set
+                .insert(static_cast<size_t>(slot));
+          }
+          cbs_phase2_directly_removable_local_internal_slots_set.clear();
+          for (const auto slot :
+               phase2_stats.directly_removable_local_internal_slots_exact) {
+            cbs_phase2_directly_removable_local_internal_slots_set.insert(
+                static_cast<size_t>(slot));
+          }
+          cbs_phase2_heart_direct_local_internal_slots_first_few =
+              sanitize_forensic_token(format_slot_set_preview(
+                  cbs_phase2_directly_removable_local_internal_slots_set, 8u));
+          cbs_phase2_unsupported_deferred_lag_slots_set.clear();
+          for (const auto slot : phase2_stats.unsupported_deferred_lag_slots_exact) {
+            cbs_phase2_unsupported_deferred_lag_slots_set.insert(
+                static_cast<size_t>(slot));
+          }
+          cbs_phase2_heart_unsupported_deferred_slots_first_few =
+              sanitize_forensic_token(format_slot_set_preview(
+                  cbs_phase2_unsupported_deferred_lag_slots_set, 8u));
           cbs_phase2_summary_targets = phase2_stats.summary_target_key_count;
           cbs_phase2_skipped_covariance_failure = 0u;
           cbs_phase2_missing_estimate = 0u;
@@ -12509,6 +13327,17 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       cbs_phase2_pending_first_post_boundary_epoch_ = true;
     }
 
+    std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+        cbs_phase2_summary_covered_crossing_one_epoch_reapply_metadata_epoch(
+            cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_.begin(),
+            cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_.end());
+    cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_.clear();
+    std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+        cbs_phase2_direct_local_pending_one_epoch_reapply_metadata_epoch(
+            cbs_phase2_direct_local_pending_one_epoch_replay_queue_.begin(),
+            cbs_phase2_direct_local_pending_one_epoch_replay_queue_.end());
+    cbs_phase2_direct_local_pending_one_epoch_replay_queue_.clear();
+
   const auto build_cbs_first_update_params =
         [&](const bool enable_remove_factor_indices) {
           cbs_phase2_deferred_first_boundary_remove = false;
@@ -12518,9 +13347,31 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           cbs_phase2_lag_remove_slots_filtered_boundary_touch = 0u;
           cbs_phase2_lag_remove_slots_applied = 0u;
           cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary = 0u;
+          cbs_phase2_lag_remove_slots_requested_raw = 0u;
+          cbs_phase2_lag_remove_slots_summary_covered = 0u;
+          cbs_phase2_lag_remove_slots_deferred_uncovered = 0u;
+          cbs_phase2_lag_remove_slots_applied_after_coverage_gate = 0u;
+          // Keep split-lag partition diagnostics from PHASE-2 heart export.
+          // These are populated before this lambda from phase2_stats and must
+          // not be zeroed here, otherwise runtime reporting becomes incoherent.
+          cbs_phase2_lag_remove_slots_applied_direct_local_internal = 0u;
+          cbs_phase2_lag_remove_slots_applied_summary_covered_crossing = 0u;
+          cbs_phase2_lag_remove_slots_deferred_crossing_uncovered = 0u;
+          cbs_phase2_lag_remove_slots_deferred_unsupported = 0u;
+          cbs_phase2_summary_remove_coverage_coherence_ok = true;
+          cbs_phase2_lag_remove_hard_blocked_due_to_none_mode = false;
+          cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export = false;
+          cbs_phase2_lag_remove_hard_blocked_count = 0u;
           cbs_phase2_lag_remove_boundary_touch_factor_count = 0u;
           cbs_phase2_lag_remove_filter_reason = "none";
           cbs_phase2_lag_remove_deferral_reason = "none";
+          cbs_phase2_lag_remove_coverage_gate_reason = "none";
+          cbs_phase2_summary_remove_coverage_mode = "none";
+          cbs_phase2_summary_remove_coverage_first_inconsistency_reason =
+              "none";
+          cbs_phase2_first_uncovered_lag_remove_slot = -1;
+          cbs_phase2_first_uncovered_lag_remove_slot_class = "none";
+          cbs_phase2_first_uncovered_lag_remove_slot_keys = "none";
           cbs_phase2_lag_remove_factor_type_counts_raw =
               "imu:0|between:0|prior:0|other:0";
           cbs_phase2_lag_remove_factor_type_counts_filtered =
@@ -12539,6 +13390,11 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           cbs_phase2_wrapper_remove_total_count = 0u;
           cbs_phase2_wrapper_remove_source_coherence_ok = false;
           cbs::BPSAM::UpdateParams params;
+          params.cbs_wrapper_remove_contract_active = true;
+          params.cbs_strict_wrapper_remove_contract =
+              FLAGS_cbs_strict_wrapper_remove_contract;
+          params.cbs_log_final_remove_contract_only =
+              FLAGS_cbs_log_final_remove_contract_only;
           if (!enable_remove_factor_indices) {
             VLOG(1) << "CBS-heart running current epoch with "
                        "removeFactorIndices disabled.";
@@ -12563,6 +13419,16 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             cbs_phase2_lag_remove_deferral_reason = "remove_disabled";
             cbs_phase2_first_post_boundary_factor_class_filter_reason =
                 "remove_disabled";
+            for (const auto& kv :
+                 cbs_phase2_summary_covered_crossing_one_epoch_reapply_metadata_epoch) {
+              cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_[kv.first] =
+                  kv.second;
+            }
+            for (const auto& kv :
+                 cbs_phase2_direct_local_pending_one_epoch_reapply_metadata_epoch) {
+              cbs_phase2_direct_local_pending_one_epoch_replay_queue_[kv.first] =
+                  kv.second;
+            }
             cbs_prev_epoch_remove_factor_indices_.clear();
             return params;
           }
@@ -12595,6 +13461,37 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   return std::string("prior");
                 }
                 return std::string("other");
+              };
+          const auto is_frame0_structural_prior_slot =
+              [&](const gtsam::NonlinearFactorGraph& factors,
+                  const size_t slot,
+                  std::string* key_token_out) {
+                if (key_token_out) {
+                  *key_token_out = "none";
+                }
+                if (!factors.exists(slot) || !factors.at(slot)) {
+                  return false;
+                }
+                const auto factor = factors.at(slot);
+                const bool is_prior_class =
+                    (factor_type_to_lag_remove_class(factor.get()) == "prior");
+                if (!is_prior_class || factor->keys().size() != 1u) {
+                  return false;
+                }
+                const gtsam::Key key = factor->keys().front();
+                const gtsam::Symbol sym(key);
+                const bool is_frame0_structural_prior =
+                    sym.index() == 0u &&
+                    (sym.chr() == kPoseSymbolChar ||
+                     sym.chr() == kVelocitySymbolChar ||
+                     sym.chr() == kImuBiasSymbolChar);
+                if (!is_frame0_structural_prior) {
+                  return false;
+                }
+                if (key_token_out) {
+                  *key_token_out = gtsam::DefaultKeyFormatter(key);
+                }
+                return true;
               };
           const auto bump_lag_remove_class_count =
               [](const std::string& cls, LagRemoveClassCounts* counts) {
@@ -12630,6 +13527,24 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           std::unordered_set<size_t> lag_slot_set(
               lag_window_state.remove_factor_indices.begin(),
               lag_window_state.remove_factor_indices.end());
+          cbs_phase2_stale_local_factor_slots_set.clear();
+          cbs_phase2_stale_belief_factor_slots_set.clear();
+          cbs_phase2_orphan_belief_factor_slots_set.clear();
+          for (const auto slot :
+               phase2_incremental_plan.stale_eviction.stale_local_factor_slots) {
+            cbs_phase2_stale_local_factor_slots_set.insert(
+                static_cast<size_t>(slot));
+          }
+          for (const auto slot :
+               phase2_incremental_plan.stale_eviction.stale_belief_factor_slots) {
+            cbs_phase2_stale_belief_factor_slots_set.insert(
+                static_cast<size_t>(slot));
+          }
+          for (const auto slot :
+               phase2_incremental_plan.orphan_prune.orphan_belief_factor_slots) {
+            cbs_phase2_orphan_belief_factor_slots_set.insert(
+                static_cast<size_t>(slot));
+          }
           std::unordered_set<size_t> deferred_replay_slot_set;
           if (FLAGS_cbs_diag_disable_lag_eviction_remove_candidates) {
             lag_slot_set.clear();
@@ -12769,58 +13684,54 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 sanitize_forensic_token(
                     format_factor_slots_preview(deferred_packet_slots, 8));
 
-            if (cbs_diag_phase2_protect_deferred_anchor_prior_x0 &&
-                !deferred_packet_slots.empty()) {
+            if (!deferred_packet_slots.empty()) {
               const gtsam::NonlinearFactorGraph& cbs_factors =
                   cbs_optimizer_->getFactorsUnsafe();
               gtsam::FactorIndices filtered_packet_slots;
               filtered_packet_slots.reserve(deferred_packet_slots.size());
-              gtsam::FactorIndices protected_anchor_slots;
-              std::vector<std::string> protected_anchor_keys;
-              protected_anchor_keys.reserve(deferred_packet_slots.size());
+              gtsam::FactorIndices protected_structural_slots;
+              std::vector<std::string> protected_structural_keys;
+              protected_structural_keys.reserve(deferred_packet_slots.size());
 
               for (const gtsam::FactorIndex slot : deferred_packet_slots) {
-                bool protect_slot = false;
-                std::string slot_anchor_key = "none";
-                if (cbs_factors.exists(slot) && cbs_factors.at(slot)) {
-                  const auto factor = cbs_factors.at(slot);
-                  const bool is_prior_class =
-                      (factor_type_to_lag_remove_class(factor.get()) == "prior");
-                  if (is_prior_class && factor->keys().size() == 1u) {
-                    const gtsam::Key key = factor->keys().front();
-                    const gtsam::Symbol sym(key);
-                    if (sym.chr() == kPoseSymbolChar && sym.index() == 0u) {
-                      protect_slot = true;
-                      slot_anchor_key = gtsam::DefaultKeyFormatter(key);
-                    }
-                  }
-                }
+                std::string slot_structural_key = "none";
+                const bool protect_slot = is_frame0_structural_prior_slot(
+                    cbs_factors, slot, &slot_structural_key);
 
                 if (protect_slot) {
-                  protected_anchor_slots.push_back(slot);
-                  protected_anchor_keys.push_back(slot_anchor_key);
+                  protected_structural_slots.push_back(slot);
+                  protected_structural_keys.push_back(slot_structural_key);
                 } else {
                   filtered_packet_slots.push_back(slot);
                 }
               }
 
-              if (!protected_anchor_slots.empty()) {
-                cbs_phase2_deferred_lag_remove_anchor_prior_protected_count =
-                    protected_anchor_slots.size();
-                cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids =
-                    sanitize_forensic_token(
-                        format_factor_slots_preview(protected_anchor_slots, 8));
-                std::ostringstream protected_keys_oss;
-                for (size_t i = 0; i < protected_anchor_keys.size(); ++i) {
+              if (!protected_structural_slots.empty()) {
+                cbs_phase2_deferred_structural_prior_protection_fired = true;
+                cbs_phase2_deferred_structural_prior_blocked_count =
+                    protected_structural_slots.size();
+                cbs_phase2_deferred_structural_prior_blocked_slots =
+                    sanitize_forensic_token(format_factor_slots_preview(
+                        protected_structural_slots, 8));
+                std::ostringstream protected_structural_keys_oss;
+                for (size_t i = 0; i < protected_structural_keys.size(); ++i) {
                   if (i > 0u) {
-                    protected_keys_oss << "|";
+                    protected_structural_keys_oss << "|";
                   }
-                  protected_keys_oss << protected_anchor_keys[i];
+                  protected_structural_keys_oss << protected_structural_keys[i];
                 }
+                cbs_phase2_deferred_structural_prior_blocked_keys =
+                    sanitize_forensic_token(
+                        protected_structural_keys_oss.str());
+
+                cbs_phase2_deferred_lag_remove_anchor_prior_protected_count =
+                    protected_structural_slots.size();
+                cbs_phase2_deferred_lag_remove_anchor_prior_slot_ids =
+                    cbs_phase2_deferred_structural_prior_blocked_slots;
                 cbs_phase2_deferred_lag_remove_anchor_prior_keys =
-                    sanitize_forensic_token(protected_keys_oss.str());
+                    cbs_phase2_deferred_structural_prior_blocked_keys;
                 cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason =
-                    "deferred_replay_protect_anchor_prior_x0";
+                    "deferred_replay_frame0_structural_prior_protection";
                 deferred_packet_slots = std::move(filtered_packet_slots);
                 cbs_phase2_deferred_lag_remove_packet_size =
                     deferred_packet_slots.size();
@@ -12828,8 +13739,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     sanitize_forensic_token(
                         format_factor_slots_preview(deferred_packet_slots, 8));
                 LOG(WARNING)
-                    << "CBS-heart deferred lag-remove anchor-prior protection "
-                       "fired. curr_kf_id="
+                    << "CBS-heart deferred lag-remove frame0 structural-prior "
+                       "protection fired. curr_kf_id="
                     << curr_kf_id_
                     << " protected_count="
                     << cbs_phase2_deferred_lag_remove_anchor_prior_protected_count
@@ -12987,10 +13898,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           }
           const std::string class_filter_spec_raw =
               FLAGS_cbs_diag_phase2_exclude_lag_remove_factor_classes_first_post_boundary_epoch;
-          if (cbs_phase2_first_post_boundary_epoch && !lag_slot_set.empty() &&
-              !class_filter_spec_raw.empty() &&
-              !cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch) {
-            std::unordered_set<std::string> excluded_classes;
+          std::unordered_set<std::string> class_filter_tokens;
+          {
             std::stringstream class_filter_stream(class_filter_spec_raw);
             std::string token;
             while (std::getline(class_filter_stream, token, ',')) {
@@ -13004,6 +13913,151 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                              token.end(),
                              token.begin(),
                              [](unsigned char c) { return std::tolower(c); });
+              if (!token.empty()) {
+                class_filter_tokens.insert(token);
+              }
+            }
+          }
+          std::unordered_set<std::string>
+              diag_exclude_summary_covered_crossing_classes_set;
+          const auto parse_summary_covered_crossing_exclude_class_token =
+              [](const std::string& token) {
+                std::string value = token;
+                const std::string long_prefix = "summary_covered_crossing:";
+                const std::string short_prefix = "summary_crossing:";
+                bool has_summary_prefix = false;
+                if (value.rfind(long_prefix, 0u) == 0u) {
+                  value = value.substr(long_prefix.size());
+                  has_summary_prefix = true;
+                } else if (value.rfind(short_prefix, 0u) == 0u) {
+                  value = value.substr(short_prefix.size());
+                  has_summary_prefix = true;
+                }
+                if (has_summary_prefix) {
+                  if (value == "imu") {
+                    value = "imu_like";
+                  } else if (value == "between") {
+                    value = "binary";
+                  }
+                }
+                if (value == "imu_like" || value == "binary") {
+                  return value;
+                }
+                if (has_summary_prefix &&
+                    (value == "prior" || value == "other")) {
+                  return value;
+                }
+                return std::string();
+              };
+          for (const auto& token : class_filter_tokens) {
+            const std::string parsed =
+                parse_summary_covered_crossing_exclude_class_token(token);
+            if (!parsed.empty()) {
+              diag_exclude_summary_covered_crossing_classes_set.insert(parsed);
+            }
+          }
+          if (!diag_exclude_summary_covered_crossing_classes_set.empty()) {
+            std::vector<std::string> ordered_classes(
+                diag_exclude_summary_covered_crossing_classes_set.begin(),
+                diag_exclude_summary_covered_crossing_classes_set.end());
+            std::sort(ordered_classes.begin(), ordered_classes.end());
+            std::ostringstream classes_oss;
+            for (size_t i = 0u; i < ordered_classes.size(); ++i) {
+              if (i > 0u) {
+                classes_oss << "|";
+              }
+              classes_oss << ordered_classes[i];
+            }
+            cbs_phase2_diag_exclude_summary_covered_crossing_classes =
+                sanitize_forensic_token(classes_oss.str());
+          } else {
+            cbs_phase2_diag_exclude_summary_covered_crossing_classes = "none";
+          }
+          cbs_phase2_diag_defer_direct_local_internal_only =
+              FLAGS_cbs_diag_defer_direct_local_internal_only ||
+              class_filter_tokens.count("direct_local_internal_only") > 0u ||
+              class_filter_tokens.count("defer_direct_local_internal_only") >
+                  0u;
+          cbs_phase2_diag_split_summary_covered_crossing_two_stage =
+              FLAGS_cbs_diag_split_summary_covered_crossing_two_stage ||
+              class_filter_tokens.count(
+                  "split_summary_covered_crossing_two_stage") > 0u ||
+              class_filter_tokens.count(
+                  "two_stage_summary_covered_crossing") > 0u;
+          cbs_phase2_diag_stage_a_summary_only =
+              FLAGS_cbs_diag_stage_a_summary_only ||
+              class_filter_tokens.count("stage_a_summary_only") > 0u ||
+              class_filter_tokens.count("cbs_diag_stage_a_summary_only") > 0u;
+          cbs_phase2_diag_stage_b_defer_delete_slots =
+              FLAGS_cbs_diag_stage_b_defer_delete_slots ||
+              class_filter_tokens.count("stage_b_defer_delete_slots") > 0u ||
+              class_filter_tokens.count(
+                  "cbs_diag_stage_b_defer_delete_slots") > 0u;
+          cbs_phase2_diag_stage_b_filter_invalid_smart_factors =
+              FLAGS_cbs_diag_stage_b_filter_invalid_smart_factors ||
+              class_filter_tokens.count("stage_b_filter_invalid_smart_factors") >
+                  0u ||
+              class_filter_tokens.count(
+                  "cbs_diag_stage_b_filter_invalid_smart_factors") > 0u;
+          cbs_phase2_diag_stage_b_skip_smart_updates_one_epoch_after_lag_boundary =
+              FLAGS_cbs_diag_stage_b_skip_smart_updates_one_epoch_after_lag_boundary ||
+              class_filter_tokens.count(
+                  "stage_b_skip_smart_updates_one_epoch_after_lag_boundary") >
+                  0u ||
+              class_filter_tokens.count(
+                  "stage_b_skip_smart_updates_one_epoch") > 0u ||
+              class_filter_tokens.count(
+                  "cbs_diag_stage_b_skip_smart_updates_one_epoch_after_lag_boundary") >
+                  0u;
+          cbs_phase2_diag_stage_b_skip_epoch_on_initial_failure =
+              FLAGS_cbs_diag_stage_b_skip_epoch_on_initial_failure ||
+              class_filter_tokens.count(
+                  "stage_b_skip_epoch_on_initial_failure") > 0u ||
+              class_filter_tokens.count(
+                  "cbs_diag_stage_b_skip_epoch_on_initial_failure") > 0u;
+          cbs_phase2_diag_stage_a_skip_epoch_on_initial_failure =
+              FLAGS_cbs_diag_stage_a_skip_epoch_on_initial_failure ||
+              class_filter_tokens.count(
+                  "stage_a_skip_epoch_on_initial_failure") > 0u ||
+              class_filter_tokens.count(
+                  "cbs_diag_stage_a_skip_epoch_on_initial_failure") > 0u;
+          cbs_phase2_diag_stage_a_zero_remove_first_boundary_epoch =
+              FLAGS_cbs_diag_stage_a_zero_remove_first_boundary_epoch ||
+              class_filter_tokens.count(
+                  "stage_a_zero_remove_first_boundary_epoch") > 0u ||
+              class_filter_tokens.count(
+                  "cbs_diag_stage_a_zero_remove_first_boundary_epoch") > 0u;
+          cbs_phase2_defer_summary_covered_crossing_one_epoch_mode =
+              FLAGS_cbs_diag_defer_summary_covered_crossing_one_epoch ||
+              class_filter_tokens.count(
+                  "defer_summary_covered_crossing_one_epoch") > 0u ||
+              class_filter_tokens.count(
+                  "cbs_diag_defer_summary_covered_crossing_one_epoch") > 0u;
+          if (cbs_phase2_diag_stage_a_summary_only ||
+              cbs_phase2_defer_summary_covered_crossing_one_epoch_mode) {
+            cbs_phase2_diag_split_summary_covered_crossing_two_stage = true;
+            cbs_phase2_diag_defer_direct_local_internal_only = true;
+          }
+          if (cbs_phase2_defer_summary_covered_crossing_one_epoch_mode) {
+            cbs_phase2_diag_stage_a_summary_only = true;
+          }
+          const bool cbs_phase2_diag_one_epoch_defer_summary_covered_crossing =
+              FLAGS_cbs_diag_phase2_one_epoch_defer_summary_covered_crossing_classes ||
+              class_filter_tokens.count(
+                  "one_epoch_defer_summary_covered_crossing_imu_like_binary") >
+                  0u ||
+              class_filter_tokens.count(
+                  "one_epoch_defer_summary_covered_crossing_classes") > 0u;
+          cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes =
+              (cbs_phase2_diag_one_epoch_defer_summary_covered_crossing &&
+               !cbs_phase2_defer_summary_covered_crossing_one_epoch_mode)
+                  ? "imu_like|binary"
+                  : "none";
+          if (cbs_phase2_first_post_boundary_epoch && !lag_slot_set.empty() &&
+              !class_filter_spec_raw.empty() &&
+              !cbs_diag_phase2_defer_all_lag_remove_first_post_boundary_epoch) {
+            std::unordered_set<std::string> excluded_classes;
+            for (const auto& token : class_filter_tokens) {
               if (token == "imu" || token == "between" || token == "prior" ||
                   token == "other") {
                 excluded_classes.insert(token);
@@ -13094,45 +14148,57 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           for (const size_t slot : deferred_replay_slot_set) {
             fresh_lag_slot_set.erase(slot);
           }
-          gtsam::FactorIndices blocked_fresh_anchor_slots;
-          blocked_fresh_anchor_slots.reserve(fresh_lag_slot_set.size());
+          gtsam::FactorIndices blocked_fresh_structural_slots;
+          blocked_fresh_structural_slots.reserve(fresh_lag_slot_set.size());
+          std::vector<std::string> blocked_fresh_structural_keys;
+          blocked_fresh_structural_keys.reserve(fresh_lag_slot_set.size());
           for (const size_t slot : fresh_lag_slot_set) {
-            if (!cbs_factors.exists(slot) || !cbs_factors.at(slot)) {
-              continue;
-            }
-            const auto factor = cbs_factors.at(slot);
-            const bool is_prior_class =
-                (factor_type_to_lag_remove_class(factor.get()) == "prior");
-            if (!is_prior_class || factor->keys().size() != 1u) {
-              continue;
-            }
-            const gtsam::Symbol sym(factor->keys().front());
-            if (sym.chr() == kPoseSymbolChar && sym.index() == 0u) {
-              blocked_fresh_anchor_slots.push_back(slot);
+            std::string slot_structural_key = "none";
+            if (is_frame0_structural_prior_slot(
+                    cbs_factors, slot, &slot_structural_key)) {
+              blocked_fresh_structural_slots.push_back(slot);
+              blocked_fresh_structural_keys.push_back(slot_structural_key);
             }
           }
-          if (!blocked_fresh_anchor_slots.empty()) {
+          if (!blocked_fresh_structural_slots.empty()) {
+            cbs_phase2_fresh_lag_structural_prior_protection_fired = true;
+            cbs_phase2_fresh_lag_structural_prior_blocked_count =
+                blocked_fresh_structural_slots.size();
+            cbs_phase2_fresh_lag_structural_prior_blocked_slots =
+                sanitize_forensic_token(format_factor_slots_preview(
+                    blocked_fresh_structural_slots, 8u));
+            std::ostringstream blocked_structural_keys_oss;
+            for (size_t i = 0; i < blocked_fresh_structural_keys.size(); ++i) {
+              if (i > 0u) {
+                blocked_structural_keys_oss << "|";
+              }
+              blocked_structural_keys_oss << blocked_fresh_structural_keys[i];
+            }
+            cbs_phase2_fresh_lag_structural_prior_blocked_keys =
+                sanitize_forensic_token(blocked_structural_keys_oss.str());
+
             cbs_phase2_fresh_lag_anchor_prior_protection_fired = true;
             cbs_phase2_fresh_lag_anchor_prior_blocked_count =
-                blocked_fresh_anchor_slots.size();
+                blocked_fresh_structural_slots.size();
             cbs_phase2_fresh_lag_anchor_prior_blocked_slots =
-                sanitize_forensic_token(
-                    format_factor_slots_preview(blocked_fresh_anchor_slots, 8u));
-            for (const size_t slot : blocked_fresh_anchor_slots) {
+                cbs_phase2_fresh_lag_structural_prior_blocked_slots;
+            for (const size_t slot : blocked_fresh_structural_slots) {
               fresh_lag_slot_set.erase(slot);
             }
             if (cbs_phase2_remove_guard_reason == "none") {
               cbs_phase2_remove_guard_reason =
-                  "fresh_lag_protect_anchor_prior_x0";
+                  "fresh_lag_frame0_structural_prior_protection";
             }
             LOG(WARNING)
-                << "CBS-heart fresh lag-remove anchor-prior protection fired. "
-                   "curr_kf_id="
+                << "CBS-heart fresh lag-remove frame0 structural-prior "
+                   "protection fired. curr_kf_id="
                 << curr_kf_id_
                 << " blocked_count="
                 << cbs_phase2_fresh_lag_anchor_prior_blocked_count
                 << " blocked_slots="
-                << cbs_phase2_fresh_lag_anchor_prior_blocked_slots;
+                << cbs_phase2_fresh_lag_anchor_prior_blocked_slots
+                << " blocked_keys="
+                << cbs_phase2_fresh_lag_structural_prior_blocked_keys;
           }
           cbs_phase2_summary_injection_required_for_lag_remove =
               cbs_use_phase2_summary_prior_bridge &&
@@ -13170,30 +14236,10 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << " blocked_fresh_lag_count="
                 << cbs_phase2_fresh_lag_remove_blocked_count;
           }
-          cbs_phase2_fresh_lag_remove_applied_count = fresh_lag_slot_set.size();
-          cbs_phase2_wrapper_remove_deferred_count =
-              deferred_replay_slot_set.size();
-          cbs_phase2_wrapper_remove_fresh_lag_count = fresh_lag_slot_set.size();
-          cbs_phase2_wrapper_remove_delete_slots_count = delete_slot_set.size();
-          cbs_phase2_wrapper_remove_true_source_counts = sanitize_forensic_token(
-              "deferred:" +
-              std::to_string(cbs_phase2_wrapper_remove_deferred_count) +
-              "|fresh_lag:" +
-              std::to_string(cbs_phase2_wrapper_remove_fresh_lag_count) +
-              "|delete_slots:" +
-              std::to_string(cbs_phase2_wrapper_remove_delete_slots_count));
-          cbs_phase2_wrapper_remove_source_counts = sanitize_forensic_token(
-              "deferred:" +
-              std::to_string(cbs_phase2_wrapper_remove_deferred_count) +
-              "|fresh_lag:" +
-              std::to_string(cbs_phase2_wrapper_remove_fresh_lag_count) +
-              "|delete_slots:" +
-              std::to_string(cbs_phase2_wrapper_remove_delete_slots_count));
-          std::unordered_set<size_t> lag_slot_set_gated = fresh_lag_slot_set;
-          lag_slot_set_gated.insert(deferred_replay_slot_set.begin(),
-                                    deferred_replay_slot_set.end());
-
-          std::unordered_set<size_t> raw_remove_set;
+          std::unordered_set<size_t> source_union_remove_set;
+          std::unordered_set<size_t> selected_lag_slots_by_label;
+          std::unordered_set<size_t> split_contract_allowed_lag_slots;
+          std::unordered_set<size_t> real_applied_lag_slots;
           const bool use_lag_only_remove =
               cbs_use_phase2_summary_prior_bridge ||
               cbs_use_marginalization_prior_bridge ||
@@ -13240,22 +14286,1326 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           } else {
             cbs_phase2_wrapper_remove_packet_label = wrapper_label_cfg;
           }
+          cbs_phase2_lag_apply_direct_local_internal_slots_set.clear();
+          cbs_phase2_lag_apply_summary_covered_crossing_slots_set.clear();
+          std::unordered_set<size_t>
+              phase2_current_epoch_requested_direct_local_internal;
+          std::unordered_set<size_t>
+              phase2_current_epoch_requested_crossing_required;
+          std::unordered_set<size_t> phase2_current_epoch_requested_unsupported;
+          std::unordered_set<size_t> phase2_current_epoch_requested_for_packet;
+          std::unordered_set<size_t> phase2_effective_requested_for_packet;
+          std::unordered_set<size_t>
+              lag_reapply_summary_covered_crossing_one_epoch;
+
+          // PHASE-2 split lag-remove contract:
+          // apply only {directly-removable local-internal + summary-covered
+          // crossing}, defer {uncovered crossing + unsupported}.
+          if (cbs_use_phase2_summary_prior_bridge &&
+              (include_deferred || include_fresh_lag)) {
+            phase2_current_epoch_requested_direct_local_internal =
+                cbs_phase2_directly_removable_local_internal_slots_set;
+            phase2_current_epoch_requested_crossing_required =
+                cbs_phase2_summary_required_crossing_slots_set;
+            phase2_current_epoch_requested_unsupported =
+                cbs_phase2_unsupported_deferred_lag_slots_set;
+            phase2_current_epoch_requested_for_packet =
+                phase2_current_epoch_requested_direct_local_internal;
+            phase2_current_epoch_requested_for_packet.insert(
+                phase2_current_epoch_requested_crossing_required.begin(),
+                phase2_current_epoch_requested_crossing_required.end());
+            phase2_current_epoch_requested_for_packet.insert(
+                phase2_current_epoch_requested_unsupported.begin(),
+                phase2_current_epoch_requested_unsupported.end());
+
+            cbs_phase2_current_epoch_requested_direct_local_internal_count =
+                phase2_current_epoch_requested_direct_local_internal.size();
+            cbs_phase2_current_epoch_requested_crossing_required_count =
+                phase2_current_epoch_requested_crossing_required.size();
+            cbs_phase2_current_epoch_requested_unsupported_count =
+                phase2_current_epoch_requested_unsupported.size();
+            cbs_phase2_deferred_queue_requested_count =
+                deferred_replay_slot_set.size();
+            cbs_phase2_phase2_slot_domain_source = "heart_current_epoch_partition";
+
+            std::unordered_set<size_t> lag_requested_crossing_required;
+            std::unordered_set<size_t> lag_requested_direct_local_internal;
+            std::unordered_set<size_t> lag_requested_unsupported;
+            if (include_fresh_lag) {
+              lag_requested_direct_local_internal =
+                  phase2_current_epoch_requested_direct_local_internal;
+              lag_requested_crossing_required =
+                  phase2_current_epoch_requested_crossing_required;
+              lag_requested_unsupported = phase2_current_epoch_requested_unsupported;
+            }
+            if (include_deferred) {
+              lag_requested_unsupported.insert(deferred_replay_slot_set.begin(),
+                                               deferred_replay_slot_set.end());
+            }
+            std::unordered_set<size_t> lag_requested_for_packet =
+                lag_requested_direct_local_internal;
+            lag_requested_for_packet.insert(lag_requested_crossing_required.begin(),
+                                            lag_requested_crossing_required.end());
+            lag_requested_for_packet.insert(lag_requested_unsupported.begin(),
+                                            lag_requested_unsupported.end());
+            phase2_effective_requested_for_packet = lag_requested_for_packet;
+            cbs_phase2_lag_remove_slots_requested_raw =
+                lag_requested_for_packet.size();
+            cbs_phase2_effective_requested_crossing_required_count =
+                lag_requested_crossing_required.size();
+            cbs_phase2_backend_lag_requested_for_packet_slots_first_few =
+                sanitize_forensic_token(
+                    format_slot_set_preview(lag_requested_for_packet, 8u));
+            cbs_phase2_backend_lag_requested_crossing_required_slots_first_few =
+                sanitize_forensic_token(format_slot_set_preview(
+                    lag_requested_crossing_required, 8u));
+            cbs_phase2_backend_lag_requested_direct_local_internal_slots_first_few =
+                sanitize_forensic_token(format_slot_set_preview(
+                    lag_requested_direct_local_internal, 8u));
+            cbs_phase2_backend_lag_requested_unsupported_slots_first_few =
+                sanitize_forensic_token(
+                    format_slot_set_preview(lag_requested_unsupported, 8u));
+            heart_lag_requested_slot_count = lag_requested_for_packet.size();
+            heart_lag_requested_slot_ids =
+                format_slot_set_csv(lag_requested_for_packet);
+            heart_lag_requested_factor_classes = sanitize_forensic_token(
+                format_slot_set_factor_classes_csv(cbs_factors,
+                                                   lag_requested_for_packet));
+            heart_lag_requested_factor_keys = sanitize_forensic_token(
+                format_slot_set_factor_keys_csv(cbs_factors,
+                                                lag_requested_for_packet));
+
+            std::unordered_set<size_t>
+                requested_crossing_intersection_with_heart_covered =
+                    lag_requested_crossing_required;
+            for (auto it =
+                     requested_crossing_intersection_with_heart_covered.begin();
+                 it != requested_crossing_intersection_with_heart_covered.end();) {
+              if (cbs_phase2_summary_covered_crossing_slots_set.count(*it) == 0u) {
+                it = requested_crossing_intersection_with_heart_covered.erase(it);
+              } else {
+                ++it;
+              }
+            }
+            std::unordered_set<size_t> requested_crossing_minus_heart_covered =
+                lag_requested_crossing_required;
+            for (const size_t slot :
+                 requested_crossing_intersection_with_heart_covered) {
+              requested_crossing_minus_heart_covered.erase(slot);
+            }
+            std::unordered_set<size_t> heart_covered_minus_requested_crossing =
+                cbs_phase2_summary_covered_crossing_slots_set;
+            for (const size_t slot : lag_requested_crossing_required) {
+              heart_covered_minus_requested_crossing.erase(slot);
+            }
+            cbs_phase2_requested_crossing_intersection_with_heart_covered_count =
+                requested_crossing_intersection_with_heart_covered.size();
+            cbs_phase2_requested_crossing_minus_heart_covered_count =
+                requested_crossing_minus_heart_covered.size();
+            cbs_phase2_heart_covered_minus_requested_crossing_count =
+                heart_covered_minus_requested_crossing.size();
+            cbs_phase2_effective_requested_crossing_intersection_with_heart_covered_count =
+                requested_crossing_intersection_with_heart_covered.size();
+            cbs_phase2_effective_heart_covered_minus_requested_crossing_count =
+                heart_covered_minus_requested_crossing.size();
+            cbs_phase2_first_requested_crossing_not_in_heart_covered = -1;
+            if (!requested_crossing_minus_heart_covered.empty()) {
+              gtsam::FactorIndices ordered(
+                  requested_crossing_minus_heart_covered.begin(),
+                  requested_crossing_minus_heart_covered.end());
+              std::sort(ordered.begin(), ordered.end());
+              cbs_phase2_first_requested_crossing_not_in_heart_covered =
+                  static_cast<long long>(ordered.front());
+            }
+            cbs_phase2_first_heart_covered_not_in_requested_crossing = -1;
+            if (!heart_covered_minus_requested_crossing.empty()) {
+              gtsam::FactorIndices ordered(
+                  heart_covered_minus_requested_crossing.begin(),
+                  heart_covered_minus_requested_crossing.end());
+              std::sort(ordered.begin(), ordered.end());
+              cbs_phase2_first_heart_covered_not_in_requested_crossing =
+                  static_cast<long long>(ordered.front());
+            }
+
+            std::unordered_set<size_t> lag_apply_direct_local_internal;
+            std::unordered_set<size_t> lag_apply_summary_covered_crossing;
+            std::unordered_set<size_t> lag_defer_crossing_uncovered;
+            std::unordered_set<size_t> lag_defer_unsupported;
+            std::unordered_set<size_t> lag_defer_total;
+            std::unordered_set<size_t>
+                lag_defer_summary_covered_crossing_diag_excluded;
+            std::unordered_set<size_t>
+                lag_defer_summary_covered_crossing_one_epoch;
+            std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+                lag_reapply_summary_covered_crossing_one_epoch_metadata;
+            struct SummaryCoveredCrossingClassCounts {
+              size_t imu_like = 0u;
+              size_t binary = 0u;
+              size_t prior = 0u;
+              size_t other = 0u;
+            };
+            const auto bump_summary_covered_crossing_class_count =
+                [](const std::string& cls,
+                   SummaryCoveredCrossingClassCounts* counts) {
+                  CHECK_NOTNULL(counts);
+                  if (cls == "imu_like") {
+                    ++counts->imu_like;
+                  } else if (cls == "binary") {
+                    ++counts->binary;
+                  } else if (cls == "prior") {
+                    ++counts->prior;
+                  } else {
+                    ++counts->other;
+                  }
+                };
+            const auto format_summary_covered_crossing_class_counts =
+                [](const SummaryCoveredCrossingClassCounts& counts) {
+                  std::ostringstream oss;
+                  oss << "imu_like:" << counts.imu_like
+                      << "|binary:" << counts.binary << "|prior:" << counts.prior
+                      << "|other:" << counts.other;
+                  return oss.str();
+                };
+            const auto classify_summary_covered_crossing_slot_class =
+                [&](const size_t slot) {
+                  if (!cbs_factors.exists(slot) || !cbs_factors.at(slot)) {
+                    return std::string("other");
+                  }
+                  const std::string base_class =
+                      factor_type_to_lag_remove_class(cbs_factors.at(slot).get());
+                  if (base_class == "imu") {
+                    return std::string("imu_like");
+                  }
+                  if (base_class == "between") {
+                    return std::string("binary");
+                  }
+                  if (base_class == "prior") {
+                    return std::string("prior");
+                  }
+                  return std::string("other");
+                };
+            const auto classify_summary_covered_crossing_slots =
+                [&](const std::unordered_set<size_t>& slots) {
+                  SummaryCoveredCrossingClassCounts counts;
+                  for (const size_t slot : slots) {
+                    bump_summary_covered_crossing_class_count(
+                        classify_summary_covered_crossing_slot_class(slot),
+                        &counts);
+                  }
+                  return counts;
+                };
+            const auto build_summary_crossing_replay_metadata =
+                [&](const size_t slot, const FrameId defer_epoch) {
+                  CbsSummaryCoveredCrossingReplayMetadata metadata;
+                  metadata.slot_id = slot;
+                  metadata.defer_epoch = defer_epoch;
+                  metadata.factor_class =
+                      classify_summary_covered_crossing_slot_class(slot);
+                  metadata.factor_keys =
+                      format_factor_keys_for_slot(cbs_factors, slot);
+                  return metadata;
+                };
+            if (!cbs_phase2_summary_covered_crossing_one_epoch_reapply_metadata_epoch
+                     .empty()) {
+              if (cbs_phase2_defer_summary_covered_crossing_one_epoch_mode) {
+                for (const auto& kv :
+                     cbs_phase2_summary_covered_crossing_one_epoch_reapply_metadata_epoch) {
+                  const size_t slot = kv.first;
+                  if (!cbs_factors.exists(slot) || !cbs_factors.at(slot)) {
+                    continue;
+                  }
+                  lag_reapply_summary_covered_crossing_one_epoch.insert(slot);
+                  lag_reapply_summary_covered_crossing_one_epoch_metadata[slot] =
+                      kv.second;
+                }
+              } else if (cbs_phase2_diag_one_epoch_defer_summary_covered_crossing &&
+                         include_deferred) {
+                for (const auto& kv :
+                     cbs_phase2_summary_covered_crossing_one_epoch_reapply_metadata_epoch) {
+                  const size_t slot = kv.first;
+                  if (!cbs_factors.exists(slot) || !cbs_factors.at(slot)) {
+                    continue;
+                  }
+                  const std::string slot_class =
+                      classify_summary_covered_crossing_slot_class(slot);
+                  if (slot_class == "imu_like" || slot_class == "binary") {
+                    lag_reapply_summary_covered_crossing_one_epoch.insert(slot);
+                    lag_reapply_summary_covered_crossing_one_epoch_metadata[slot] =
+                        kv.second;
+                  }
+                }
+              } else {
+                for (const auto& kv :
+                     cbs_phase2_summary_covered_crossing_one_epoch_reapply_metadata_epoch) {
+                  cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_[kv.first] =
+                      kv.second;
+                }
+              }
+            }
+            for (const size_t slot : lag_reapply_summary_covered_crossing_one_epoch) {
+              if (lag_reapply_summary_covered_crossing_one_epoch_metadata.count(
+                      slot) == 0u) {
+                const FrameId fallback_defer_epoch =
+                    curr_kf_id_ > 0 ? curr_kf_id_ - 1 : 0;
+                lag_reapply_summary_covered_crossing_one_epoch_metadata[slot] =
+                    build_summary_crossing_replay_metadata(
+                        slot, fallback_defer_epoch);
+              }
+            }
+            cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count =
+                lag_reapply_summary_covered_crossing_one_epoch.size();
+            cbs_phase2_summary_covered_crossing_one_epoch_reapplied_first_few =
+                lag_reapply_summary_covered_crossing_one_epoch.empty()
+                    ? "none"
+                    : sanitize_forensic_token(format_slot_set_preview(
+                          lag_reapply_summary_covered_crossing_one_epoch, 8u));
+
+            const bool hard_block_due_to_none_mode =
+                !lag_requested_crossing_required.empty() &&
+                cbs_phase2_summary_remove_coverage_mode == "none";
+            const size_t crossing_requested_count =
+                lag_requested_crossing_required.size();
+            const size_t crossing_covered_count =
+                requested_crossing_intersection_with_heart_covered.size();
+            const size_t crossing_uncovered_count =
+                requested_crossing_minus_heart_covered.size();
+            const bool crossing_export_coherence_ok =
+                cbs_phase2_summary_remove_coverage_coherence_ok &&
+                (crossing_covered_count + crossing_uncovered_count ==
+                 crossing_requested_count);
+            const bool hard_block_due_to_incoherent_export =
+                !crossing_export_coherence_ok;
+            const bool hard_block_due_to_zero_covered =
+                crossing_requested_count > 0u && crossing_covered_count == 0u;
+            const bool crossing_hard_blocked =
+                hard_block_due_to_incoherent_export ||
+                hard_block_due_to_zero_covered;
+            cbs_phase2_lag_remove_hard_blocked_due_to_none_mode =
+                hard_block_due_to_none_mode;
+            cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export =
+                hard_block_due_to_incoherent_export;
+            cbs_phase2_crossing_gate_requested_count = crossing_requested_count;
+            cbs_phase2_crossing_gate_covered_count = crossing_covered_count;
+            cbs_phase2_crossing_gate_uncovered_count = crossing_uncovered_count;
+            cbs_phase2_crossing_gate_hard_blocked = crossing_hard_blocked;
+            cbs_phase2_crossing_gate_using_split_semantics = true;
+            cbs_phase2_crossing_export_coherence_ok =
+                crossing_export_coherence_ok;
+            cbs_phase2_crossing_gate_zero_apply_inconsistent = false;
+
+            if (hard_block_due_to_incoherent_export) {
+              cbs_phase2_crossing_gate_reason =
+                  "crossing_export_incoherent_block_crossing";
+            } else if (hard_block_due_to_zero_covered) {
+              cbs_phase2_crossing_gate_reason =
+                  "crossing_requested_but_zero_covered_block_crossing";
+            } else if (crossing_requested_count == 0u) {
+              cbs_phase2_crossing_gate_reason = "no_crossing_requested";
+            } else if (crossing_uncovered_count == 0u) {
+              cbs_phase2_crossing_gate_reason =
+                  "all_crossing_requested_covered_apply_all";
+            } else {
+              cbs_phase2_crossing_gate_reason =
+                  "partial_crossing_covered_apply_partial";
+            }
+
+            lag_apply_direct_local_internal = lag_requested_direct_local_internal;
+            if (crossing_hard_blocked) {
+              lag_defer_crossing_uncovered = lag_requested_crossing_required;
+            } else {
+              lag_apply_summary_covered_crossing =
+                  requested_crossing_intersection_with_heart_covered;
+              lag_defer_crossing_uncovered =
+                  requested_crossing_minus_heart_covered;
+            }
+            cbs_phase2_summary_covered_crossing_factor_type_counts_raw =
+                format_summary_covered_crossing_class_counts(
+                    classify_summary_covered_crossing_slots(
+                        lag_apply_summary_covered_crossing));
+            cbs_phase2_summary_covered_crossing_factor_type_counts_applied =
+                "imu_like:0|binary:0|prior:0|other:0";
+            cbs_phase2_summary_covered_crossing_factor_type_counts_deferred =
+                "imu_like:0|binary:0|prior:0|other:0";
+            cbs_phase2_first_applied_summary_covered_crossing_slot_class = "none";
+            cbs_phase2_first_applied_summary_covered_crossing_slot_keys = "none";
+            cbs_phase2_first_deferred_summary_covered_crossing_slot_class =
+                "none";
+            cbs_phase2_first_deferred_summary_covered_crossing_slot_keys =
+                "none";
+            if (!diag_exclude_summary_covered_crossing_classes_set.empty() &&
+                !lag_apply_summary_covered_crossing.empty()) {
+              for (const size_t slot : lag_apply_summary_covered_crossing) {
+                const std::string slot_class =
+                    classify_summary_covered_crossing_slot_class(slot);
+                if (diag_exclude_summary_covered_crossing_classes_set.count(
+                        slot_class) > 0u) {
+                  lag_defer_summary_covered_crossing_diag_excluded.insert(slot);
+                }
+              }
+              for (const size_t slot :
+                   lag_defer_summary_covered_crossing_diag_excluded) {
+                lag_apply_summary_covered_crossing.erase(slot);
+              }
+            }
+            if (cbs_phase2_defer_summary_covered_crossing_one_epoch_mode &&
+                !lag_apply_summary_covered_crossing.empty()) {
+              lag_defer_summary_covered_crossing_one_epoch =
+                  lag_apply_summary_covered_crossing;
+              lag_apply_summary_covered_crossing.clear();
+            } else if (cbs_phase2_diag_one_epoch_defer_summary_covered_crossing &&
+                       !lag_apply_summary_covered_crossing.empty()) {
+              for (const size_t slot : lag_apply_summary_covered_crossing) {
+                const std::string slot_class =
+                    classify_summary_covered_crossing_slot_class(slot);
+                if (slot_class == "imu_like" || slot_class == "binary") {
+                  lag_defer_summary_covered_crossing_one_epoch.insert(slot);
+                }
+              }
+              for (const size_t slot :
+                   lag_defer_summary_covered_crossing_one_epoch) {
+                lag_apply_summary_covered_crossing.erase(slot);
+              }
+            }
+            cbs_phase2_summary_covered_crossing_replay_metadata_map =
+                lag_reapply_summary_covered_crossing_one_epoch_metadata;
+            cbs_phase2_direct_local_pending_replay_metadata_map =
+                cbs_phase2_direct_local_pending_one_epoch_reapply_metadata_epoch;
+            if (!cbs_phase2_defer_summary_covered_crossing_one_epoch_mode &&
+                !lag_reapply_summary_covered_crossing_one_epoch.empty()) {
+              lag_apply_summary_covered_crossing.insert(
+                  lag_reapply_summary_covered_crossing_one_epoch.begin(),
+                  lag_reapply_summary_covered_crossing_one_epoch.end());
+            }
+            if (!lag_defer_summary_covered_crossing_one_epoch.empty()) {
+              for (const size_t slot :
+                   lag_defer_summary_covered_crossing_one_epoch) {
+                cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_[slot] =
+                    build_summary_crossing_replay_metadata(slot, curr_kf_id_);
+              }
+              cbs_phase2_remove_indices_deferred_count +=
+                  lag_defer_summary_covered_crossing_one_epoch.size();
+              if (cbs_phase2_lag_remove_deferral_reason == "none") {
+                cbs_phase2_lag_remove_deferral_reason =
+                    cbs_phase2_defer_summary_covered_crossing_one_epoch_mode
+                        ? "defer_summary_covered_crossing_one_epoch"
+                        : "diag_one_epoch_defer_summary_covered_crossing";
+              }
+              if (cbs_phase2_primary_update_mode == "single_packet") {
+                cbs_phase2_primary_update_mode =
+                    cbs_phase2_defer_summary_covered_crossing_one_epoch_mode
+                        ? "defer_summary_covered_crossing_one_epoch"
+                        : "diag_one_epoch_defer_summary_covered_crossing";
+              }
+            }
+            cbs_phase2_summary_covered_crossing_one_epoch_deferred_count =
+                lag_defer_summary_covered_crossing_one_epoch.size();
+            cbs_phase2_summary_covered_crossing_one_epoch_deferred_first_few =
+                lag_defer_summary_covered_crossing_one_epoch.empty()
+                    ? "none"
+                    : sanitize_forensic_token(format_slot_set_preview(
+                          lag_defer_summary_covered_crossing_one_epoch, 8u));
+            std::unordered_set<size_t>
+                lag_defer_summary_covered_crossing_total =
+                    lag_defer_summary_covered_crossing_diag_excluded;
+            lag_defer_summary_covered_crossing_total.insert(
+                lag_defer_summary_covered_crossing_one_epoch.begin(),
+                lag_defer_summary_covered_crossing_one_epoch.end());
+            cbs_phase2_summary_covered_crossing_factor_type_counts_applied =
+                format_summary_covered_crossing_class_counts(
+                    classify_summary_covered_crossing_slots(
+                        lag_apply_summary_covered_crossing));
+            cbs_phase2_summary_covered_crossing_factor_type_counts_deferred =
+                format_summary_covered_crossing_class_counts(
+                    classify_summary_covered_crossing_slots(
+                        lag_defer_summary_covered_crossing_total));
+            if (!lag_apply_summary_covered_crossing.empty()) {
+              gtsam::FactorIndices applied_sorted(
+                  lag_apply_summary_covered_crossing.begin(),
+                  lag_apply_summary_covered_crossing.end());
+              std::sort(applied_sorted.begin(), applied_sorted.end());
+              const size_t first_applied_slot = applied_sorted.front();
+              cbs_phase2_first_applied_summary_covered_crossing_slot_class =
+                  sanitize_forensic_token(
+                      classify_summary_covered_crossing_slot_class(
+                          first_applied_slot));
+              cbs_phase2_first_applied_summary_covered_crossing_slot_keys =
+                  sanitize_forensic_token(
+                      format_factor_keys_for_slot(cbs_factors, first_applied_slot));
+            }
+            if (!lag_defer_summary_covered_crossing_total.empty()) {
+              gtsam::FactorIndices deferred_sorted(
+                  lag_defer_summary_covered_crossing_total.begin(),
+                  lag_defer_summary_covered_crossing_total.end());
+              std::sort(deferred_sorted.begin(), deferred_sorted.end());
+              const size_t first_deferred_slot = deferred_sorted.front();
+              cbs_phase2_first_deferred_summary_covered_crossing_slot_class =
+                  sanitize_forensic_token(
+                      classify_summary_covered_crossing_slot_class(
+                          first_deferred_slot));
+              cbs_phase2_first_deferred_summary_covered_crossing_slot_keys =
+                  sanitize_forensic_token(format_factor_keys_for_slot(
+                      cbs_factors, first_deferred_slot));
+            }
+            lag_defer_unsupported = lag_requested_unsupported;
+            cbs_phase2_direct_local_internal_forced_deferred_count = 0u;
+            if (cbs_phase2_diag_defer_direct_local_internal_only &&
+                !lag_apply_direct_local_internal.empty()) {
+              cbs_phase2_direct_local_internal_forced_deferred_count =
+                  lag_apply_direct_local_internal.size();
+              lag_defer_unsupported.insert(lag_apply_direct_local_internal.begin(),
+                                           lag_apply_direct_local_internal.end());
+              lag_apply_direct_local_internal.clear();
+              if (cbs_phase2_lag_remove_deferral_reason == "none") {
+                cbs_phase2_lag_remove_deferral_reason =
+                    "diag_defer_direct_local_internal_only";
+              }
+              if (cbs_phase2_primary_update_mode == "single_packet") {
+                cbs_phase2_primary_update_mode =
+                    "diag_defer_direct_local_internal_only";
+              }
+            }
+            cbs_phase2_summary_covered_crossing_kept_active_count =
+                lag_apply_summary_covered_crossing.size();
+            cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count =
+                lag_defer_summary_covered_crossing_one_epoch.size();
+            lag_defer_total = lag_defer_crossing_uncovered;
+            lag_defer_total.insert(lag_defer_unsupported.begin(),
+                                   lag_defer_unsupported.end());
+            heart_first_deferred_remove_slot = -1;
+            heart_first_deferred_remove_slot_class = "none";
+            heart_first_deferred_remove_slot_keys = "none";
+            if (!lag_defer_total.empty()) {
+              gtsam::FactorIndices deferred_sorted(lag_defer_total.begin(),
+                                                   lag_defer_total.end());
+              std::sort(deferred_sorted.begin(), deferred_sorted.end());
+              const size_t first_deferred_slot = deferred_sorted.front();
+              heart_first_deferred_remove_slot =
+                  static_cast<long long>(first_deferred_slot);
+              if (cbs_factors.exists(first_deferred_slot) &&
+                  cbs_factors.at(first_deferred_slot)) {
+                heart_first_deferred_remove_slot_class = sanitize_forensic_token(
+                    classify_forensic_remove_factor_class(
+                        cbs_factors.at(first_deferred_slot)));
+                heart_first_deferred_remove_slot_keys = sanitize_forensic_token(
+                    format_factor_keys_for_slot(cbs_factors, first_deferred_slot));
+              } else {
+                heart_first_deferred_remove_slot_class = "missing_slot";
+                heart_first_deferred_remove_slot_keys = "none";
+              }
+            }
+            cbs_phase2_lag_remove_hard_blocked_count =
+                crossing_hard_blocked ? crossing_requested_count : 0u;
+            if (crossing_hard_blocked &&
+                cbs_phase2_primary_update_mode == "single_packet") {
+              cbs_phase2_primary_update_mode = "coverage_hard_blocked";
+            }
+
+            cbs_phase2_lag_remove_slots_applied_direct_local_internal =
+                lag_apply_direct_local_internal.size();
+            cbs_phase2_lag_remove_slots_applied_summary_covered_crossing =
+                lag_apply_summary_covered_crossing.size();
+            cbs_phase2_lag_remove_slots_deferred_crossing_uncovered =
+                lag_defer_crossing_uncovered.size();
+            cbs_phase2_lag_remove_slots_deferred_unsupported =
+                lag_defer_unsupported.size();
+
+            cbs_phase2_lag_remove_slots_summary_covered =
+                lag_apply_summary_covered_crossing.size();
+            cbs_phase2_lag_remove_slots_deferred_uncovered =
+                lag_defer_total.size();
+            cbs_phase2_lag_remove_slots_applied_after_coverage_gate =
+                lag_apply_direct_local_internal.size() +
+                lag_apply_summary_covered_crossing.size();
+            cbs_phase2_lag_apply_direct_local_internal_slots_set =
+                lag_apply_direct_local_internal;
+            cbs_phase2_lag_apply_summary_covered_crossing_slots_set =
+                lag_apply_summary_covered_crossing;
+            cbs_phase2_real_applied_lag_slots_source = "split_contract_only";
+            cbs_phase2_backend_lag_apply_summary_covered_crossing_slots_first_few =
+                sanitize_forensic_token(format_slot_set_preview(
+                    lag_apply_summary_covered_crossing, 8u));
+            cbs_phase2_backend_lag_apply_direct_local_internal_slots_first_few =
+                sanitize_forensic_token(format_slot_set_preview(
+                    lag_apply_direct_local_internal, 8u));
+            cbs_phase2_backend_lag_defer_crossing_uncovered_slots_first_few =
+                sanitize_forensic_token(format_slot_set_preview(
+                    lag_defer_crossing_uncovered, 8u));
+            cbs_phase2_backend_lag_defer_unsupported_slots_first_few =
+                sanitize_forensic_token(format_slot_set_preview(
+                    lag_defer_unsupported, 8u));
+
+            const bool summary_covered_nonzero_but_zero_applied =
+                cbs_phase2_summary_covered_crossing_slots > 0u &&
+                lag_apply_summary_covered_crossing.empty();
+            const bool crossing_gate_zero_apply_inconsistent =
+                crossing_requested_count > 0u && crossing_covered_count > 0u &&
+                lag_apply_summary_covered_crossing.empty();
+            cbs_phase2_crossing_gate_zero_apply_inconsistent =
+                crossing_gate_zero_apply_inconsistent;
+            const bool first_lag_requested_epoch_fresh =
+                !cbs_phase2_first_lag_set_recon_logged_ &&
+                include_fresh_lag && !include_deferred &&
+                cbs_phase2_lag_remove_slots_requested_raw > 0u;
+            if (first_lag_requested_epoch_fresh) {
+              std::cerr
+                  << "[CBS][Phase2SetReconDiag] curr_kf_id=" << curr_kf_id_
+                  << " include_fresh_lag=" << (include_fresh_lag ? 1 : 0)
+                  << " include_deferred=" << (include_deferred ? 1 : 0)
+                  << " include_delete_slots=" << (include_delete_slots ? 1 : 0)
+                  << " build_only_no_inject="
+                  << (cbs_phase2_build_only_no_inject ? 1 : 0)
+                  << " summary_remove_coverage_mode="
+                  << cbs_phase2_summary_remove_coverage_mode
+                  << " summary_remove_coverage_coherence_ok="
+                  << (cbs_phase2_summary_remove_coverage_coherence_ok ? 1 : 0)
+                  << " hard_block_due_to_none_mode="
+                  << (hard_block_due_to_none_mode ? 1 : 0)
+                  << " hard_block_due_to_incoherent_export="
+                  << (hard_block_due_to_incoherent_export ? 1 : 0)
+                  << " crossing_gate_requested_count="
+                  << cbs_phase2_crossing_gate_requested_count
+                  << " crossing_gate_covered_count="
+                  << cbs_phase2_crossing_gate_covered_count
+                  << " crossing_gate_uncovered_count="
+                  << cbs_phase2_crossing_gate_uncovered_count
+                  << " crossing_gate_hard_blocked="
+                  << (cbs_phase2_crossing_gate_hard_blocked ? 1 : 0)
+                  << " crossing_gate_reason="
+                  << cbs_phase2_crossing_gate_reason
+                  << " crossing_gate_using_split_semantics="
+                  << (cbs_phase2_crossing_gate_using_split_semantics ? 1 : 0)
+                  << " crossing_gate_zero_apply_inconsistent="
+                  << (cbs_phase2_crossing_gate_zero_apply_inconsistent ? 1 : 0)
+                  << " crossing_export_coherence_ok="
+                  << (cbs_phase2_crossing_export_coherence_ok ? 1 : 0)
+                  << " summary_covered_nonzero_but_zero_applied="
+                  << (summary_covered_nonzero_but_zero_applied ? 1 : 0)
+                  << " heart_summary_required_crossing_slots_count="
+                  << cbs_phase2_summary_required_crossing_slots_set.size()
+                  << " heart_summary_required_crossing_slots_first_few="
+                  << cbs_phase2_heart_summary_required_slots_first_few
+                  << " heart_summary_covered_crossing_slots_count="
+                  << cbs_phase2_summary_covered_crossing_slots_set.size()
+                  << " heart_summary_covered_crossing_slots_first_few="
+                  << cbs_phase2_heart_summary_covered_slots_first_few
+                  << " heart_directly_removable_local_internal_slots_count="
+                  << cbs_phase2_directly_removable_local_internal_slots_set.size()
+                  << " heart_directly_removable_local_internal_slots_first_few="
+                  << cbs_phase2_heart_direct_local_internal_slots_first_few
+                  << " heart_unsupported_deferred_lag_slots_count="
+                  << cbs_phase2_unsupported_deferred_lag_slots_set.size()
+                  << " heart_unsupported_deferred_lag_slots_first_few="
+                  << cbs_phase2_heart_unsupported_deferred_slots_first_few
+                  << " current_epoch_requested_direct_local_internal_count="
+                  << cbs_phase2_current_epoch_requested_direct_local_internal_count
+                  << " current_epoch_requested_crossing_required_count="
+                  << cbs_phase2_current_epoch_requested_crossing_required_count
+                  << " current_epoch_requested_unsupported_count="
+                  << cbs_phase2_current_epoch_requested_unsupported_count
+                  << " deferred_queue_requested_count="
+                  << cbs_phase2_deferred_queue_requested_count
+                  << " cbs_phase2_phase2_slot_domain_source="
+                  << cbs_phase2_phase2_slot_domain_source
+                  << " lag_requested_for_packet_count="
+                  << lag_requested_for_packet.size()
+                  << " lag_requested_for_packet_first_few="
+                  << cbs_phase2_backend_lag_requested_for_packet_slots_first_few
+                  << " lag_requested_crossing_required_count="
+                  << lag_requested_crossing_required.size()
+                  << " lag_requested_crossing_required_first_few="
+                  << cbs_phase2_backend_lag_requested_crossing_required_slots_first_few
+                  << " lag_requested_direct_local_internal_count="
+                  << lag_requested_direct_local_internal.size()
+                  << " lag_requested_direct_local_internal_first_few="
+                  << cbs_phase2_backend_lag_requested_direct_local_internal_slots_first_few
+                  << " lag_requested_unsupported_count="
+                  << lag_requested_unsupported.size()
+                  << " lag_requested_unsupported_first_few="
+                  << cbs_phase2_backend_lag_requested_unsupported_slots_first_few
+                  << " lag_apply_summary_covered_crossing_count="
+                  << lag_apply_summary_covered_crossing.size()
+                  << " lag_apply_summary_covered_crossing_first_few="
+                  << cbs_phase2_backend_lag_apply_summary_covered_crossing_slots_first_few
+                  << " lag_apply_direct_local_internal_count="
+                  << lag_apply_direct_local_internal.size()
+                  << " lag_apply_direct_local_internal_first_few="
+                  << cbs_phase2_backend_lag_apply_direct_local_internal_slots_first_few
+                  << " lag_defer_crossing_uncovered_count="
+                  << lag_defer_crossing_uncovered.size()
+                  << " lag_defer_crossing_uncovered_first_few="
+                  << cbs_phase2_backend_lag_defer_crossing_uncovered_slots_first_few
+                  << " lag_defer_unsupported_count="
+                  << lag_defer_unsupported.size()
+                  << " lag_defer_unsupported_first_few="
+                  << cbs_phase2_backend_lag_defer_unsupported_slots_first_few
+                  << " requested_crossing_intersection_with_heart_covered_count="
+                  << cbs_phase2_requested_crossing_intersection_with_heart_covered_count
+                  << " requested_crossing_minus_heart_covered_count="
+                  << cbs_phase2_requested_crossing_minus_heart_covered_count
+                  << " heart_covered_minus_requested_crossing_count="
+                  << cbs_phase2_heart_covered_minus_requested_crossing_count
+                  << " first_requested_crossing_not_in_heart_covered="
+                  << cbs_phase2_first_requested_crossing_not_in_heart_covered
+                  << " first_heart_covered_not_in_requested_crossing="
+                  << cbs_phase2_first_heart_covered_not_in_requested_crossing
+                  << std::endl;
+              cbs_phase2_first_lag_set_recon_logged_ = true;
+            }
+            if (crossing_gate_zero_apply_inconsistent &&
+                !cbs_phase2_zero_apply_forensic_logged_) {
+              std::cerr
+                  << "[CBS][Phase2SetReconHardTruth] curr_kf_id=" << curr_kf_id_
+                  << " summary_remove_coverage_mode="
+                  << cbs_phase2_summary_remove_coverage_mode
+                  << " summary_remove_coverage_coherence_ok="
+                  << (cbs_phase2_summary_remove_coverage_coherence_ok ? 1 : 0)
+                  << " hard_block_due_to_none_mode="
+                  << (hard_block_due_to_none_mode ? 1 : 0)
+                  << " hard_block_due_to_incoherent_export="
+                  << (hard_block_due_to_incoherent_export ? 1 : 0)
+                  << " crossing_gate_requested_count="
+                  << cbs_phase2_crossing_gate_requested_count
+                  << " crossing_gate_covered_count="
+                  << cbs_phase2_crossing_gate_covered_count
+                  << " crossing_gate_uncovered_count="
+                  << cbs_phase2_crossing_gate_uncovered_count
+                  << " crossing_gate_hard_blocked="
+                  << (cbs_phase2_crossing_gate_hard_blocked ? 1 : 0)
+                  << " crossing_gate_reason="
+                  << cbs_phase2_crossing_gate_reason
+                  << " crossing_gate_using_split_semantics="
+                  << (cbs_phase2_crossing_gate_using_split_semantics ? 1 : 0)
+                  << " crossing_gate_zero_apply_inconsistent="
+                  << (cbs_phase2_crossing_gate_zero_apply_inconsistent ? 1 : 0)
+                  << " crossing_export_coherence_ok="
+                  << (cbs_phase2_crossing_export_coherence_ok ? 1 : 0)
+                  << " build_only_no_inject="
+                  << (cbs_phase2_build_only_no_inject ? 1 : 0)
+                  << " include_fresh_lag=" << (include_fresh_lag ? 1 : 0)
+                  << " include_deferred=" << (include_deferred ? 1 : 0)
+                  << " heart_summary_covered_crossing_slots_first_few="
+                  << cbs_phase2_heart_summary_covered_slots_first_few
+                  << " lag_requested_crossing_required_first_few="
+                  << cbs_phase2_backend_lag_requested_crossing_required_slots_first_few
+                  << " lag_apply_summary_covered_crossing_first_few="
+                  << cbs_phase2_backend_lag_apply_summary_covered_crossing_slots_first_few
+                  << std::endl;
+              cbs_phase2_zero_apply_forensic_logged_ = true;
+            }
+            if (include_fresh_lag && !include_deferred &&
+                cbs_phase2_summary_covered_crossing_slots > 0u &&
+                lag_requested_crossing_required.empty()) {
+              LOG(ERROR)
+                  << "[CBS][Phase2SlotDomainDiag] "
+                  << "heart_backend_slot_domain_mismatch_persisting"
+                  << " curr_kf_id=" << curr_kf_id_
+                  << " summary_covered_crossing_slots_count="
+                  << cbs_phase2_summary_covered_crossing_slots
+                  << " effective_requested_crossing_required_count="
+                  << lag_requested_crossing_required.size()
+                  << " include_fresh_lag=" << (include_fresh_lag ? 1 : 0)
+                  << " include_deferred=" << (include_deferred ? 1 : 0)
+                  << " slot_domain_source="
+                  << cbs_phase2_phase2_slot_domain_source
+                  << " heart_summary_covered_first_few="
+                  << cbs_phase2_heart_summary_covered_slots_first_few
+                  << " effective_requested_crossing_first_few="
+                  << cbs_phase2_backend_lag_requested_crossing_required_slots_first_few;
+            }
+
+            // In PHASE-2 modes, the fresh-lag source is heart-current-epoch
+            // partition, not legacy lag_slot_set bookkeeping.
+            if (include_fresh_lag) {
+              fresh_lag_slot_set = phase2_current_epoch_requested_for_packet;
+            } else {
+              fresh_lag_slot_set.clear();
+            }
+
+            if (!lag_defer_total.empty()) {
+              std::vector<size_t> uncovered_sorted(lag_defer_total.begin(),
+                                                   lag_defer_total.end());
+              std::sort(uncovered_sorted.begin(), uncovered_sorted.end());
+              const size_t first_uncovered_slot = uncovered_sorted.front();
+              cbs_phase2_first_uncovered_lag_remove_slot =
+                  static_cast<long long>(first_uncovered_slot);
+              if (cbs_factors.exists(first_uncovered_slot) &&
+                  cbs_factors.at(first_uncovered_slot)) {
+                cbs_phase2_first_uncovered_lag_remove_slot_class =
+                    sanitize_forensic_token(classify_forensic_remove_factor_class(
+                        cbs_factors.at(first_uncovered_slot)));
+                cbs_phase2_first_uncovered_lag_remove_slot_keys =
+                    sanitize_forensic_token(
+                        format_factor_keys_for_slot(cbs_factors,
+                                                    first_uncovered_slot));
+              } else {
+                cbs_phase2_first_uncovered_lag_remove_slot_class = "missing_slot";
+                cbs_phase2_first_uncovered_lag_remove_slot_keys = "none";
+              }
+
+              for (const size_t slot : lag_defer_total) {
+                deferred_replay_slot_set.erase(slot);
+                fresh_lag_slot_set.erase(slot);
+              }
+
+              std::unordered_set<size_t> pending_uncovered_slots(
+                  cbs_phase2_deferred_lag_remove_packet_slots_.begin(),
+                  cbs_phase2_deferred_lag_remove_packet_slots_.end());
+              pending_uncovered_slots.insert(lag_defer_total.begin(),
+                                             lag_defer_total.end());
+              cbs_phase2_deferred_lag_remove_packet_slots_.assign(
+                  pending_uncovered_slots.begin(), pending_uncovered_slots.end());
+              std::sort(cbs_phase2_deferred_lag_remove_packet_slots_.begin(),
+                        cbs_phase2_deferred_lag_remove_packet_slots_.end());
+              cbs_phase2_deferred_lag_remove_packet_pending_ =
+                  !cbs_phase2_deferred_lag_remove_packet_slots_.empty();
+              cbs_phase2_deferred_lag_remove_packet_source_kf_id_ = curr_kf_id_;
+              cbs_phase2_deferred_lag_remove_packet_size =
+                  cbs_phase2_deferred_lag_remove_packet_slots_.size();
+              cbs_phase2_deferred_lag_remove_packet_slots_preview =
+                  sanitize_forensic_token(format_factor_slots_preview(
+                      cbs_phase2_deferred_lag_remove_packet_slots_, 8u));
+
+              cbs_phase2_remove_indices_deferred_count +=
+                  lag_defer_total.size();
+              if (cbs_phase2_primary_update_mode == "single_packet") {
+                cbs_phase2_primary_update_mode = "coverage_deferred";
+              }
+              if (cbs_phase2_lag_remove_deferral_reason == "none") {
+                if (cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export) {
+                  cbs_phase2_lag_remove_deferral_reason =
+                      "crossing_export_incoherent_block_crossing";
+                } else if (cbs_phase2_crossing_gate_hard_blocked) {
+                  cbs_phase2_lag_remove_deferral_reason =
+                      "crossing_requested_but_zero_covered_block_crossing";
+                } else {
+                  cbs_phase2_lag_remove_deferral_reason =
+                      "split_coverage_gate_deferred_uncovered_or_unsupported";
+                }
+              }
+              if (cbs_phase2_remove_guard_reason == "none") {
+                cbs_phase2_remove_guard_reason =
+                    cbs_phase2_lag_remove_deferral_reason;
+              }
+            }
+
+            if (cbs_phase2_lag_remove_slots_requested_raw == 0u) {
+              cbs_phase2_lag_remove_coverage_gate_reason =
+                  "no_lag_slots_requested";
+            } else if (cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export) {
+              cbs_phase2_lag_remove_coverage_gate_reason =
+                  "crossing_export_incoherent_block_crossing";
+            } else if (cbs_phase2_crossing_gate_hard_blocked) {
+              cbs_phase2_lag_remove_coverage_gate_reason = (
+                  cbs_phase2_lag_remove_slots_applied_direct_local_internal > 0u)
+                  ? "crossing_zero_covered_block_crossing_apply_direct_internal"
+                  : "crossing_zero_covered_block_crossing";
+            } else if (cbs_phase2_lag_remove_slots_applied_after_coverage_gate ==
+                       0u) {
+              cbs_phase2_lag_remove_coverage_gate_reason =
+                  "no_safe_lag_slots_after_split_gate";
+            } else if (cbs_phase2_lag_remove_slots_deferred_uncovered == 0u) {
+              cbs_phase2_lag_remove_coverage_gate_reason =
+                  "all_requested_lag_slots_safe_after_split_gate";
+            } else {
+              cbs_phase2_lag_remove_coverage_gate_reason =
+                  "partial_requested_lag_slots_safe_after_split_gate";
+            }
+
+            if (cbs_phase2_lag_remove_slots_deferred_uncovered > 0u) {
+              LOG(WARNING)
+                  << "CBS-heart split lag-remove gate deferred lag slots. "
+                     "curr_kf_id="
+                  << curr_kf_id_
+                  << " requested="
+                  << cbs_phase2_lag_remove_slots_requested_raw
+                  << " applied_direct_local_internal="
+                  << cbs_phase2_lag_remove_slots_applied_direct_local_internal
+                  << " applied_summary_covered_crossing="
+                  << cbs_phase2_lag_remove_slots_applied_summary_covered_crossing
+                  << " covered_crossing="
+                  << cbs_phase2_lag_remove_slots_summary_covered
+                  << " deferred_uncovered="
+                  << cbs_phase2_lag_remove_slots_deferred_uncovered
+                  << " deferred_crossing_uncovered="
+                  << cbs_phase2_lag_remove_slots_deferred_crossing_uncovered
+                  << " deferred_unsupported="
+                  << cbs_phase2_lag_remove_slots_deferred_unsupported
+                  << " crossing_gate_requested_count="
+                  << cbs_phase2_crossing_gate_requested_count
+                  << " crossing_gate_covered_count="
+                  << cbs_phase2_crossing_gate_covered_count
+                  << " crossing_gate_uncovered_count="
+                  << cbs_phase2_crossing_gate_uncovered_count
+                  << " crossing_gate_hard_blocked="
+                  << (cbs_phase2_crossing_gate_hard_blocked ? 1 : 0)
+                  << " crossing_gate_reason="
+                  << cbs_phase2_crossing_gate_reason
+                  << " crossing_gate_using_split_semantics="
+                  << (cbs_phase2_crossing_gate_using_split_semantics ? 1 : 0)
+                  << " crossing_gate_zero_apply_inconsistent="
+                  << (cbs_phase2_crossing_gate_zero_apply_inconsistent ? 1 : 0)
+                  << " crossing_export_coherence_ok="
+                  << (cbs_phase2_crossing_export_coherence_ok ? 1 : 0)
+                  << " summary_remove_coverage_mode="
+                  << cbs_phase2_summary_remove_coverage_mode
+                  << " summary_remove_coverage_coherence_ok="
+                  << (cbs_phase2_summary_remove_coverage_coherence_ok ? 1 : 0);
+            }
+          } else {
+            cbs_phase2_lag_remove_slots_requested_raw = 0u;
+            cbs_phase2_lag_remove_slots_summary_covered = 0u;
+            cbs_phase2_lag_remove_slots_deferred_uncovered = 0u;
+            cbs_phase2_lag_remove_slots_applied_after_coverage_gate = 0u;
+            cbs_phase2_lag_remove_slots_applied_direct_local_internal = 0u;
+            cbs_phase2_lag_remove_slots_applied_summary_covered_crossing = 0u;
+            cbs_phase2_lag_remove_slots_deferred_crossing_uncovered = 0u;
+            cbs_phase2_lag_remove_slots_deferred_unsupported = 0u;
+            cbs_phase2_summary_remove_coverage_coherence_ok = true;
+            cbs_phase2_lag_remove_hard_blocked_due_to_none_mode = false;
+            cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export = false;
+            cbs_phase2_lag_remove_hard_blocked_count = 0u;
+            cbs_phase2_lag_remove_coverage_gate_reason = "coverage_gate_not_active";
+            cbs_phase2_lag_apply_direct_local_internal_slots_set.clear();
+            cbs_phase2_lag_apply_summary_covered_crossing_slots_set.clear();
+            cbs_phase2_requested_crossing_intersection_with_heart_covered_count =
+                0u;
+            cbs_phase2_requested_crossing_minus_heart_covered_count = 0u;
+            cbs_phase2_heart_covered_minus_requested_crossing_count = 0u;
+            cbs_phase2_first_requested_crossing_not_in_heart_covered = -1;
+            cbs_phase2_first_heart_covered_not_in_requested_crossing = -1;
+            cbs_phase2_backend_lag_requested_for_packet_slots_first_few = "none";
+            cbs_phase2_backend_lag_requested_crossing_required_slots_first_few =
+                "none";
+            cbs_phase2_backend_lag_requested_direct_local_internal_slots_first_few =
+                "none";
+            cbs_phase2_backend_lag_requested_unsupported_slots_first_few =
+                "none";
+            cbs_phase2_backend_lag_apply_summary_covered_crossing_slots_first_few =
+                "none";
+            cbs_phase2_backend_lag_apply_direct_local_internal_slots_first_few =
+                "none";
+            cbs_phase2_backend_lag_defer_crossing_uncovered_slots_first_few =
+                "none";
+            cbs_phase2_backend_lag_defer_unsupported_slots_first_few = "none";
+            cbs_phase2_current_epoch_requested_direct_local_internal_count = 0u;
+            cbs_phase2_current_epoch_requested_crossing_required_count = 0u;
+            cbs_phase2_current_epoch_requested_unsupported_count = 0u;
+            cbs_phase2_deferred_queue_requested_count = 0u;
+            cbs_phase2_effective_requested_crossing_required_count = 0u;
+            cbs_phase2_effective_requested_crossing_intersection_with_heart_covered_count =
+                0u;
+            cbs_phase2_effective_heart_covered_minus_requested_crossing_count =
+                0u;
+            cbs_phase2_crossing_gate_requested_count = 0u;
+            cbs_phase2_crossing_gate_covered_count = 0u;
+            cbs_phase2_crossing_gate_uncovered_count = 0u;
+            cbs_phase2_crossing_gate_hard_blocked = false;
+            cbs_phase2_crossing_gate_reason = "coverage_gate_not_active";
+            cbs_phase2_crossing_gate_using_split_semantics = false;
+            cbs_phase2_crossing_gate_zero_apply_inconsistent = false;
+            cbs_phase2_crossing_export_coherence_ok = true;
+            cbs_phase2_phase2_slot_domain_source = "legacy_wrapper_sources";
+            cbs_phase2_real_applied_lag_slots_source = "legacy_wrapper_passthrough";
+          }
+
+          // Strict PHASE-2 overlap guard: if lag-derived remove slots touch
+          // current-epoch new VIO factor keys / new values / injected summary
+          // keys, defer those lag slots and do not apply them in this epoch's
+          // primary update packet.
+          if (!FLAGS_cbs_diag_phase2_disable_overlap_guard &&
+              (include_deferred || include_fresh_lag)) {
+            std::unordered_set<gtsam::Key> current_new_vio_factor_keys;
+            current_new_vio_factor_keys.reserve(new_factors.size() * 4u);
+            for (const auto& factor_ptr : new_factors) {
+              if (!factor_ptr) {
+                continue;
+              }
+              for (const gtsam::Key key : factor_ptr->keys()) {
+                current_new_vio_factor_keys.insert(key);
+              }
+            }
+
+            std::unordered_set<gtsam::Key> current_new_value_keys;
+            current_new_value_keys.reserve(new_values.size());
+            for (const auto& kv : new_values) {
+              current_new_value_keys.insert(kv.key);
+            }
+
+            std::unordered_set<gtsam::Key> current_summary_keys;
+            if (cbs_phase2_summary_injected_this_epoch) {
+              current_summary_keys = cbs_phase2_emitted_summary_keys;
+            }
+
+            bool touches_new_factor_key = false;
+            bool touches_new_value_key = false;
+            bool touches_summary_key = false;
+            std::unordered_set<size_t> overlap_slots_to_defer;
+            std::unordered_set<gtsam::Key> overlap_keys;
+            cbs_phase2_overlap_guard_post_split_semantics = false;
+            cbs_phase2_overlap_guard_summary_key_only_allowed_for_covered_crossing =
+                false;
+            cbs_phase2_overlap_guard_deferred_direct_local_internal_count = 0u;
+            cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count = 0u;
+            cbs_phase2_overlap_guard_summary_key_only_crossing_count = 0u;
+            cbs_phase2_overlap_guard_new_factor_or_value_crossing_count = 0u;
+            cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent =
+                false;
+
+            auto analyze_overlap =
+                [&](const size_t slot, bool* has_new_factor, bool* has_new_value,
+                    bool* has_summary, std::unordered_set<gtsam::Key>* keys_out) {
+                  *has_new_factor = false;
+                  *has_new_value = false;
+                  *has_summary = false;
+                  if (!cbs_factors.exists(slot) || !cbs_factors.at(slot)) {
+                    return;
+                  }
+                  const auto factor = cbs_factors.at(slot);
+                  for (const gtsam::Key key : factor->keys()) {
+                    if (current_new_vio_factor_keys.count(key) > 0u) {
+                      *has_new_factor = true;
+                      keys_out->insert(key);
+                    }
+                    if (current_new_value_keys.count(key) > 0u) {
+                      *has_new_value = true;
+                      keys_out->insert(key);
+                    }
+                    if (!current_summary_keys.empty() &&
+                        current_summary_keys.count(key) > 0u) {
+                      *has_summary = true;
+                      keys_out->insert(key);
+                    }
+                  }
+                };
+
+            if (cbs_use_phase2_summary_prior_bridge) {
+              cbs_phase2_overlap_guard_post_split_semantics = true;
+              cbs_phase2_overlap_guard_summary_key_only_allowed_for_covered_crossing =
+                  true;
+
+              std::vector<size_t> direct_apply_slots(
+                  cbs_phase2_lag_apply_direct_local_internal_slots_set.begin(),
+                  cbs_phase2_lag_apply_direct_local_internal_slots_set.end());
+              std::vector<size_t> crossing_apply_slots(
+                  cbs_phase2_lag_apply_summary_covered_crossing_slots_set.begin(),
+                  cbs_phase2_lag_apply_summary_covered_crossing_slots_set.end());
+
+              const size_t crossing_apply_slots_before = crossing_apply_slots.size();
+
+              for (const size_t slot : direct_apply_slots) {
+                bool has_new_factor = false;
+                bool has_new_value = false;
+                bool has_summary = false;
+                analyze_overlap(slot,
+                                &has_new_factor,
+                                &has_new_value,
+                                &has_summary,
+                                &overlap_keys);
+                const bool should_defer =
+                    has_new_factor || has_new_value || has_summary;
+                touches_new_factor_key = touches_new_factor_key || has_new_factor;
+                touches_new_value_key = touches_new_value_key || has_new_value;
+                touches_summary_key = touches_summary_key || has_summary;
+                if (should_defer) {
+                  overlap_slots_to_defer.insert(slot);
+                }
+              }
+
+              for (const size_t slot : crossing_apply_slots) {
+                bool has_new_factor = false;
+                bool has_new_value = false;
+                bool has_summary = false;
+                analyze_overlap(slot,
+                                &has_new_factor,
+                                &has_new_value,
+                                &has_summary,
+                                &overlap_keys);
+                touches_new_factor_key = touches_new_factor_key || has_new_factor;
+                touches_new_value_key = touches_new_value_key || has_new_value;
+                touches_summary_key = touches_summary_key || has_summary;
+                const bool has_new_factor_or_value = has_new_factor || has_new_value;
+                if (has_summary && !has_new_factor_or_value) {
+                  ++cbs_phase2_overlap_guard_summary_key_only_crossing_count;
+                }
+                if (has_new_factor_or_value) {
+                  ++cbs_phase2_overlap_guard_new_factor_or_value_crossing_count;
+                  overlap_slots_to_defer.insert(slot);
+                }
+              }
+
+              for (const size_t slot : overlap_slots_to_defer) {
+                if (cbs_phase2_lag_apply_direct_local_internal_slots_set.erase(slot) >
+                    0u) {
+                  ++cbs_phase2_overlap_guard_deferred_direct_local_internal_count;
+                }
+                if (cbs_phase2_lag_apply_summary_covered_crossing_slots_set.erase(
+                        slot) > 0u) {
+                  ++cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count;
+                }
+              }
+
+              if (crossing_apply_slots_before > 0u &&
+                  cbs_phase2_overlap_guard_summary_key_only_crossing_count ==
+                      crossing_apply_slots_before &&
+                  cbs_phase2_overlap_guard_new_factor_or_value_crossing_count ==
+                      0u &&
+                  cbs_phase2_lag_apply_summary_covered_crossing_slots_set.empty()) {
+                cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent =
+                    true;
+                LOG(ERROR)
+                    << "[CBS][Phase2OverlapGuardDiag] "
+                    << "cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent=1 "
+                    << "curr_kf_id=" << curr_kf_id_
+                    << " crossing_apply_before=" << crossing_apply_slots_before
+                    << " deferred_crossing_count="
+                    << cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count
+                    << " summary_key_only_crossing_count="
+                    << cbs_phase2_overlap_guard_summary_key_only_crossing_count
+                    << " new_factor_or_value_crossing_count="
+                    << cbs_phase2_overlap_guard_new_factor_or_value_crossing_count;
+              }
+            } else {
+              std::unordered_set<size_t> lag_slots_in_packet;
+              if (include_deferred) {
+                lag_slots_in_packet.insert(deferred_replay_slot_set.begin(),
+                                           deferred_replay_slot_set.end());
+              }
+              if (include_fresh_lag) {
+                lag_slots_in_packet.insert(fresh_lag_slot_set.begin(),
+                                           fresh_lag_slot_set.end());
+              }
+
+              for (const size_t slot : lag_slots_in_packet) {
+                bool has_new_factor = false;
+                bool has_new_value = false;
+                bool has_summary = false;
+                analyze_overlap(slot,
+                                &has_new_factor,
+                                &has_new_value,
+                                &has_summary,
+                                &overlap_keys);
+                const bool slot_overlaps =
+                    has_new_factor || has_new_value || has_summary;
+                touches_new_factor_key = touches_new_factor_key || has_new_factor;
+                touches_new_value_key = touches_new_value_key || has_new_value;
+                touches_summary_key = touches_summary_key || has_summary;
+                if (slot_overlaps) {
+                  overlap_slots_to_defer.insert(slot);
+                }
+              }
+            }
+
+            cbs_phase2_remove_touches_new_factor_key = touches_new_factor_key;
+            cbs_phase2_remove_touches_new_value_key = touches_new_value_key;
+            cbs_phase2_remove_touches_summary_key = touches_summary_key;
+            if (!overlap_slots_to_defer.empty()) {
+              cbs_phase2_overlap_guard_triggered = true;
+              cbs_phase2_primary_update_mode = "overlap_deferred";
+
+              std::vector<size_t> overlap_slots_sorted(overlap_slots_to_defer.begin(),
+                                                       overlap_slots_to_defer.end());
+              std::sort(overlap_slots_sorted.begin(), overlap_slots_sorted.end());
+              gtsam::FactorIndices overlap_slots_diag(overlap_slots_sorted.begin(),
+                                                      overlap_slots_sorted.end());
+              cbs_phase2_deferred_due_to_overlap_count =
+                  overlap_slots_to_defer.size();
+              cbs_phase2_remove_indices_deferred_count =
+                  cbs_phase2_deferred_due_to_overlap_count;
+              cbs_phase2_deferred_due_to_overlap_slots_first_few =
+                  sanitize_forensic_token(
+                      format_factor_slots_preview(overlap_slots_diag, 8u));
+
+              std::vector<gtsam::Key> overlap_keys_sorted(overlap_keys.begin(),
+                                                          overlap_keys.end());
+              std::sort(overlap_keys_sorted.begin(), overlap_keys_sorted.end());
+              std::ostringstream overlap_keys_oss;
+              const size_t overlap_key_limit = std::min<size_t>(8u, overlap_keys_sorted.size());
+              for (size_t i = 0u; i < overlap_key_limit; ++i) {
+                if (i > 0u) {
+                  overlap_keys_oss << "|";
+                }
+                overlap_keys_oss << gtsam::DefaultKeyFormatter(overlap_keys_sorted[i]);
+              }
+              if (overlap_keys_sorted.size() > overlap_key_limit) {
+                overlap_keys_oss << "|...";
+              }
+              cbs_phase2_overlap_keys_first_few =
+                  sanitize_forensic_token(overlap_keys_oss.str());
+
+              std::vector<std::string> overlap_reason_tokens;
+              if (touches_new_factor_key) {
+                overlap_reason_tokens.emplace_back("remove_touches_new_factor_key");
+              }
+              if (touches_new_value_key) {
+                overlap_reason_tokens.emplace_back("remove_touches_new_value_key");
+              }
+              if (touches_summary_key) {
+                overlap_reason_tokens.emplace_back("remove_touches_summary_key");
+              }
+              if (cbs_use_phase2_summary_prior_bridge) {
+                overlap_reason_tokens.emplace_back(
+                    "post_split_overlap_guard_semantics");
+              }
+              std::ostringstream overlap_reason_oss;
+              for (size_t i = 0u; i < overlap_reason_tokens.size(); ++i) {
+                if (i > 0u) {
+                  overlap_reason_oss << "|";
+                }
+                overlap_reason_oss << overlap_reason_tokens[i];
+              }
+              cbs_phase2_overlap_guard_reason =
+                  sanitize_forensic_token(overlap_reason_oss.str());
+
+              for (const size_t slot : overlap_slots_to_defer) {
+                deferred_replay_slot_set.erase(slot);
+                fresh_lag_slot_set.erase(slot);
+                // Keep delete_slots behavior unchanged except for slots that are
+                // part of the overlapping lag-derived subset.
+                delete_slot_set.erase(slot);
+              }
+
+              std::unordered_set<size_t> pending_overlap_slots(
+                  cbs_phase2_deferred_lag_remove_packet_slots_.begin(),
+                  cbs_phase2_deferred_lag_remove_packet_slots_.end());
+              pending_overlap_slots.insert(overlap_slots_to_defer.begin(),
+                                           overlap_slots_to_defer.end());
+              cbs_phase2_deferred_lag_remove_packet_slots_.assign(
+                  pending_overlap_slots.begin(), pending_overlap_slots.end());
+              std::sort(cbs_phase2_deferred_lag_remove_packet_slots_.begin(),
+                        cbs_phase2_deferred_lag_remove_packet_slots_.end());
+              cbs_phase2_deferred_lag_remove_packet_pending_ =
+                  !cbs_phase2_deferred_lag_remove_packet_slots_.empty();
+              cbs_phase2_deferred_lag_remove_packet_source_kf_id_ = curr_kf_id_;
+              cbs_phase2_deferred_lag_remove_packet_size =
+                  cbs_phase2_deferred_lag_remove_packet_slots_.size();
+              cbs_phase2_deferred_lag_remove_packet_slots_preview =
+                  sanitize_forensic_token(format_factor_slots_preview(
+                      cbs_phase2_deferred_lag_remove_packet_slots_, 8u));
+
+              if (cbs_phase2_remove_guard_reason == "none") {
+                cbs_phase2_remove_guard_reason = "overlap_guard_defer_lag_remove";
+              }
+              if (cbs_phase2_lag_remove_deferral_reason == "none") {
+                cbs_phase2_lag_remove_deferral_reason =
+                    "overlap_guard_defer_lag_remove";
+              }
+              LOG(WARNING)
+                  << "CBS-heart overlap guard deferred lag-derived removals. "
+                     "curr_kf_id="
+                  << curr_kf_id_
+                  << " deferred_count=" << cbs_phase2_deferred_due_to_overlap_count
+                  << " deferred_slots="
+                  << cbs_phase2_deferred_due_to_overlap_slots_first_few
+                  << " overlap_keys=" << cbs_phase2_overlap_keys_first_few
+                  << " overlap_reason=" << cbs_phase2_overlap_guard_reason;
+            }
+          }
+          cbs_phase2_fresh_lag_remove_applied_count = fresh_lag_slot_set.size();
+          cbs_phase2_wrapper_source_deferred_slots = deferred_replay_slot_set;
+          if (cbs_phase2_diag_one_epoch_defer_summary_covered_crossing &&
+              include_deferred &&
+              !lag_reapply_summary_covered_crossing_one_epoch.empty()) {
+            cbs_phase2_wrapper_source_deferred_slots.insert(
+                lag_reapply_summary_covered_crossing_one_epoch.begin(),
+                lag_reapply_summary_covered_crossing_one_epoch.end());
+          }
+          cbs_phase2_wrapper_source_fresh_lag_slots = fresh_lag_slot_set;
+          cbs_phase2_wrapper_source_delete_slots = delete_slot_set;
+          cbs_phase2_wrapper_remove_deferred_count =
+              cbs_phase2_wrapper_source_deferred_slots.size();
+          cbs_phase2_wrapper_remove_fresh_lag_count = fresh_lag_slot_set.size();
+          cbs_phase2_wrapper_remove_delete_slots_count = delete_slot_set.size();
+          cbs_phase2_wrapper_remove_true_source_counts = sanitize_forensic_token(
+              "deferred:" +
+              std::to_string(cbs_phase2_wrapper_remove_deferred_count) +
+              "|fresh_lag:" +
+              std::to_string(cbs_phase2_wrapper_remove_fresh_lag_count) +
+              "|delete_slots:" +
+              std::to_string(cbs_phase2_wrapper_remove_delete_slots_count));
+          cbs_phase2_wrapper_remove_source_counts = sanitize_forensic_token(
+              "deferred:" +
+              std::to_string(cbs_phase2_wrapper_remove_deferred_count) +
+              "|fresh_lag:" +
+              std::to_string(cbs_phase2_wrapper_remove_fresh_lag_count) +
+              "|delete_slots:" +
+              std::to_string(cbs_phase2_wrapper_remove_delete_slots_count));
+          std::unordered_set<size_t> lag_slot_set_gated = fresh_lag_slot_set;
+          lag_slot_set_gated.insert(
+              cbs_phase2_wrapper_source_deferred_slots.begin(),
+              cbs_phase2_wrapper_source_deferred_slots.end());
+          cbs_phase2_lag_remove_slots_applied = lag_slot_set_gated.size();
+
           if (include_deferred) {
-            raw_remove_set.insert(deferred_replay_slot_set.begin(),
-                                  deferred_replay_slot_set.end());
+            source_union_remove_set.insert(
+                cbs_phase2_wrapper_source_deferred_slots.begin(),
+                cbs_phase2_wrapper_source_deferred_slots.end());
+            selected_lag_slots_by_label.insert(
+                cbs_phase2_wrapper_source_deferred_slots.begin(),
+                cbs_phase2_wrapper_source_deferred_slots.end());
           }
           if (include_fresh_lag) {
-            raw_remove_set.insert(fresh_lag_slot_set.begin(),
-                                  fresh_lag_slot_set.end());
+            source_union_remove_set.insert(fresh_lag_slot_set.begin(),
+                                           fresh_lag_slot_set.end());
+            selected_lag_slots_by_label.insert(fresh_lag_slot_set.begin(),
+                                               fresh_lag_slot_set.end());
           }
           if (include_delete_slots) {
-            raw_remove_set.insert(delete_slot_set.begin(), delete_slot_set.end());
+            source_union_remove_set.insert(delete_slot_set.begin(),
+                                           delete_slot_set.end());
+          }
+
+          if (cbs_use_phase2_summary_prior_bridge) {
+            split_contract_allowed_lag_slots =
+                cbs_phase2_lag_apply_direct_local_internal_slots_set;
+            split_contract_allowed_lag_slots.insert(
+                cbs_phase2_lag_apply_summary_covered_crossing_slots_set.begin(),
+                cbs_phase2_lag_apply_summary_covered_crossing_slots_set.end());
+            for (const size_t slot : selected_lag_slots_by_label) {
+              if (split_contract_allowed_lag_slots.count(slot) > 0u) {
+                real_applied_lag_slots.insert(slot);
+              }
+            }
+            std::unordered_set<size_t> lag_slots_outside_split_contract;
+            for (const size_t slot : selected_lag_slots_by_label) {
+              if (real_applied_lag_slots.count(slot) == 0u) {
+                lag_slots_outside_split_contract.insert(slot);
+              }
+            }
+            if (!lag_slots_outside_split_contract.empty()) {
+              std::unordered_set<size_t> pending_slots(
+                  cbs_phase2_deferred_lag_remove_packet_slots_.begin(),
+                  cbs_phase2_deferred_lag_remove_packet_slots_.end());
+              pending_slots.insert(lag_slots_outside_split_contract.begin(),
+                                   lag_slots_outside_split_contract.end());
+              cbs_phase2_deferred_lag_remove_packet_slots_.assign(
+                  pending_slots.begin(), pending_slots.end());
+              std::sort(cbs_phase2_deferred_lag_remove_packet_slots_.begin(),
+                        cbs_phase2_deferred_lag_remove_packet_slots_.end());
+              cbs_phase2_deferred_lag_remove_packet_pending_ =
+                  !cbs_phase2_deferred_lag_remove_packet_slots_.empty();
+              cbs_phase2_deferred_lag_remove_packet_source_kf_id_ = curr_kf_id_;
+              cbs_phase2_deferred_lag_remove_packet_size =
+                  cbs_phase2_deferred_lag_remove_packet_slots_.size();
+              cbs_phase2_deferred_lag_remove_packet_slots_preview =
+                  sanitize_forensic_token(format_factor_slots_preview(
+                      cbs_phase2_deferred_lag_remove_packet_slots_, 8u));
+              cbs_phase2_remove_indices_deferred_count +=
+                  lag_slots_outside_split_contract.size();
+              if (cbs_phase2_lag_remove_deferral_reason == "none") {
+                cbs_phase2_lag_remove_deferral_reason =
+                    "enforce_split_contract_defer_nonmember_lag_slot";
+              }
+            }
+          } else {
+            split_contract_allowed_lag_slots = selected_lag_slots_by_label;
+            real_applied_lag_slots = selected_lag_slots_by_label;
           }
 
           std::unordered_set<size_t> expected_source_union;
           if (include_deferred) {
-            expected_source_union.insert(deferred_replay_slot_set.begin(),
-                                         deferred_replay_slot_set.end());
+            expected_source_union.insert(
+                cbs_phase2_wrapper_source_deferred_slots.begin(),
+                cbs_phase2_wrapper_source_deferred_slots.end());
           }
           if (include_fresh_lag) {
             expected_source_union.insert(fresh_lag_slot_set.begin(),
@@ -13266,31 +15616,49 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                                          delete_slot_set.end());
           }
           cbs_phase2_wrapper_remove_source_coherence_ok =
-              (raw_remove_set == expected_source_union);
+              (source_union_remove_set == expected_source_union);
           if (!cbs_phase2_wrapper_remove_source_coherence_ok) {
             LOG(ERROR)
                 << "CBS-heart wrapper remove source coherence mismatch. "
                    "curr_kf_id="
                 << curr_kf_id_
                 << " packet_label=" << cbs_phase2_wrapper_remove_packet_label
-                << " raw_remove_count=" << raw_remove_set.size()
+                << " raw_remove_count=" << source_union_remove_set.size()
                 << " expected_union_count=" << expected_source_union.size()
                 << " deferred_count=" << deferred_replay_slot_set.size()
                 << " fresh_lag_count=" << fresh_lag_slot_set.size()
                 << " delete_slots_count=" << delete_slot_set.size();
           }
-          cbs_phase2_wrapper_remove_total_count = raw_remove_set.size();
+          cbs_phase2_wrapper_remove_total_count = source_union_remove_set.size();
           cbs_phase2_wrapper_remove_packet_label =
               sanitize_forensic_token(cbs_phase2_wrapper_remove_packet_label);
 
-          cbs_remove_indices_requested = raw_remove_set.size();
+          std::unordered_set<size_t> real_applied_remove_set = real_applied_lag_slots;
+          if (include_delete_slots) {
+            real_applied_remove_set.insert(delete_slot_set.begin(),
+                                           delete_slot_set.end());
+          }
+
+          cbs_phase2_real_applied_lag_slots_count = real_applied_lag_slots.size();
+          gtsam::FactorIndices real_applied_lag_sorted(
+              real_applied_lag_slots.begin(), real_applied_lag_slots.end());
+          std::sort(real_applied_lag_sorted.begin(), real_applied_lag_sorted.end());
+          cbs_phase2_real_applied_lag_slots_first_few =
+              sanitize_forensic_token(
+                  format_factor_slots_preview(real_applied_lag_sorted, 8u));
+          cbs_phase2_real_applied_delete_slots_count =
+              include_delete_slots ? delete_slot_set.size() : 0u;
+          cbs_phase2_real_applied_total_remove_slots_count =
+              real_applied_remove_set.size();
+
+          cbs_remove_indices_requested = real_applied_remove_set.size();
 
           cbs_remove_from_delete_only = 0u;
           cbs_remove_from_lag_only = 0u;
           cbs_remove_from_both = 0u;
-          for (const size_t slot : raw_remove_set) {
+          for (const size_t slot : real_applied_remove_set) {
             const bool in_delete = delete_slot_set.count(slot) > 0u;
-            const bool in_lag = lag_slot_set_gated.count(slot) > 0u;
+            const bool in_lag = real_applied_lag_slots.count(slot) > 0u;
             if (in_delete && in_lag) {
               ++cbs_remove_from_both;
             } else if (in_delete) {
@@ -13300,8 +15668,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             }
           }
 
-          std::vector<size_t> raw_remove_indices(raw_remove_set.begin(),
-                                                 raw_remove_set.end());
+          std::vector<size_t> raw_remove_indices(real_applied_remove_set.begin(),
+                                                 real_applied_remove_set.end());
           std::sort(raw_remove_indices.begin(), raw_remove_indices.end());
 
           size_t dropped_remove_slots = 0u;
@@ -13340,6 +15708,70 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           }
           cbs_remove_curr_epoch_size = params.removeFactorIndices.size();
           cbs_remove_indices_applied = params.removeFactorIndices.size();
+          cbs_phase2_remove_indices_applied_count =
+              params.removeFactorIndices.size();
+          cbs_phase2_real_applied_total_remove_slots_count =
+              params.removeFactorIndices.size();
+
+          cbs_phase2_applied_lag_slot_membership_ok = true;
+          cbs_phase2_first_applied_lag_slot_outside_split_contract = -1;
+          cbs_phase2_first_applied_lag_slot_outside_split_contract_class = "none";
+          cbs_phase2_first_applied_lag_slot_outside_split_contract_keys = "none";
+          cbs_phase2_real_applied_lag_slots_count = 0u;
+          cbs_phase2_real_applied_delete_slots_count = 0u;
+          cbs_phase2_lag_remove_slots_applied_direct_local_internal = 0u;
+          cbs_phase2_lag_remove_slots_applied_summary_covered_crossing = 0u;
+          gtsam::FactorIndices final_applied_lag_slots;
+          final_applied_lag_slots.reserve(params.removeFactorIndices.size());
+          for (const size_t slot : params.removeFactorIndices) {
+            const bool slot_is_lag_derived =
+                selected_lag_slots_by_label.count(slot) > 0u;
+            if (include_delete_slots && delete_slot_set.count(slot) > 0u) {
+              ++cbs_phase2_real_applied_delete_slots_count;
+            }
+            if (!slot_is_lag_derived) {
+              continue;
+            }
+            ++cbs_phase2_real_applied_lag_slots_count;
+            final_applied_lag_slots.push_back(slot);
+            if (cbs_phase2_lag_apply_direct_local_internal_slots_set.count(slot) >
+                0u) {
+              ++cbs_phase2_lag_remove_slots_applied_direct_local_internal;
+            } else if (cbs_phase2_lag_apply_summary_covered_crossing_slots_set.count(
+                           slot) > 0u) {
+              ++cbs_phase2_lag_remove_slots_applied_summary_covered_crossing;
+            } else if (cbs_use_phase2_summary_prior_bridge &&
+                       cbs_phase2_applied_lag_slot_membership_ok) {
+              cbs_phase2_applied_lag_slot_membership_ok = false;
+              cbs_phase2_first_applied_lag_slot_outside_split_contract =
+                  static_cast<long long>(slot);
+              if (cbs_factors.exists(slot) && cbs_factors.at(slot)) {
+                cbs_phase2_first_applied_lag_slot_outside_split_contract_class =
+                    sanitize_forensic_token(classify_forensic_remove_factor_class(
+                        cbs_factors.at(slot)));
+                cbs_phase2_first_applied_lag_slot_outside_split_contract_keys =
+                    sanitize_forensic_token(
+                        format_factor_keys_for_slot(cbs_factors, slot));
+              } else {
+                cbs_phase2_first_applied_lag_slot_outside_split_contract_class =
+                    "missing_slot";
+                cbs_phase2_first_applied_lag_slot_outside_split_contract_keys =
+                    "none";
+              }
+            }
+          }
+          std::sort(final_applied_lag_slots.begin(), final_applied_lag_slots.end());
+          cbs_phase2_real_applied_lag_slots_first_few = sanitize_forensic_token(
+              format_factor_slots_preview(final_applied_lag_slots, 8u));
+          cbs_phase2_lag_remove_slots_applied_after_coverage_gate =
+              cbs_phase2_real_applied_lag_slots_count;
+          cbs_phase2_lag_remove_slots_applied =
+              cbs_phase2_real_applied_lag_slots_count;
+          if (!cbs_phase2_applied_lag_slot_membership_ok &&
+              cbs_phase2_remove_guard_reason == "none") {
+            cbs_phase2_remove_guard_reason =
+                "applied_lag_slot_outside_split_contract";
+          }
 
           cbs_remove_smart_factor_slots = 0u;
           cbs_remove_non_smart_slots = 0u;
@@ -13372,6 +15804,69 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               ++cbs_phase2_emitted_summary_overlap_key_count;
             }
           }
+
+          const std::unordered_set<size_t>
+              approved_direct_local_internal_slots =
+                  cbs_phase2_lag_apply_direct_local_internal_slots_set;
+          const std::unordered_set<size_t>
+              approved_summary_covered_crossing_slots =
+                  cbs_phase2_lag_apply_summary_covered_crossing_slots_set;
+          const std::unordered_set<size_t> approved_deferred_unsupported_slots =
+              cbs_phase2_wrapper_source_deferred_slots;
+          const std::unordered_set<size_t> approved_total_wrapper_remove_slots(
+              params.removeFactorIndices.begin(), params.removeFactorIndices.end());
+          heart_approved_direct_local_internal_count =
+              approved_direct_local_internal_slots.size();
+          heart_approved_summary_covered_crossing_count =
+              approved_summary_covered_crossing_slots.size();
+          heart_approved_deferred_unsupported_count =
+              approved_deferred_unsupported_slots.size();
+          heart_approved_total_wrapper_remove_slots_count =
+              approved_total_wrapper_remove_slots.size();
+          heart_approved_total_wrapper_remove_slots_ids =
+              format_slot_set_csv(approved_total_wrapper_remove_slots);
+
+          params.cbs_wrapper_remove_contract_active = true;
+          params.approved_direct_local_internal_slots =
+              sorted_slots_from_set(approved_direct_local_internal_slots);
+          params.approved_summary_covered_crossing_slots =
+              sorted_slots_from_set(approved_summary_covered_crossing_slots);
+          params.approved_deferred_unsupported_slots =
+              sorted_slots_from_set(approved_deferred_unsupported_slots);
+          params.approved_total_wrapper_remove_slots =
+              sorted_slots_from_set(approved_total_wrapper_remove_slots);
+
+          const auto emit_approved_wrapper_contract_set_log =
+              [&](const std::string& set_name,
+                  const std::unordered_set<size_t>& slot_set) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][KimeraFinalRemoveContractApprovedSet]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " set_name=" << set_name
+                          << " count=" << slot_set.size()
+                          << " slot_ids=" << format_slot_set_csv(slot_set)
+                          << " factor_classes="
+                          << sanitize_forensic_token(
+                                 format_slot_set_factor_classes_csv(cbs_factors,
+                                                                    slot_set))
+                          << " factor_keys="
+                          << sanitize_forensic_token(
+                                 format_slot_set_factor_keys_csv(cbs_factors,
+                                                                 slot_set))
+                          << std::endl;
+              };
+          emit_approved_wrapper_contract_set_log(
+              "approved_direct_local_internal_slots",
+              approved_direct_local_internal_slots);
+          emit_approved_wrapper_contract_set_log(
+              "approved_summary_covered_crossing_slots",
+              approved_summary_covered_crossing_slots);
+          emit_approved_wrapper_contract_set_log(
+              "approved_deferred_unsupported_slots",
+              approved_deferred_unsupported_slots);
+          emit_approved_wrapper_contract_set_log(
+              "approved_total_wrapper_remove_slots",
+              approved_total_wrapper_remove_slots);
 
           cbs_prev_epoch_remove_factor_indices_.clear();
           cbs_prev_epoch_remove_factor_indices_.insert(
@@ -13546,6 +16041,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             recovery_result.errorAfter ? *recovery_result.errorAfter : 0.0;
         cbs_last_update_result_ = recovery_result;
         cbs_has_last_update_result_ = true;
+        ++cbs_recovery_count_so_far_;
         LOG(ERROR) << "CBS recovery update succeeded.";
         return true;
       } catch (const std::exception& recovery_e) {
@@ -13564,6 +16060,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               recovery_result.errorAfter ? *recovery_result.errorAfter : 0.0;
           cbs_last_update_result_ = recovery_result;
           cbs_has_last_update_result_ = true;
+          ++cbs_recovery_count_so_far_;
           LOG(ERROR) << "CBS priors-only recovery update succeeded.";
           return true;
         } catch (const std::exception& priors_only_e) {
@@ -13819,6 +16316,133 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           forensic.remove_analysis = analyze_slots(remove_slots_this_attempt);
           forensic.delete_analysis = analyze_slots(delete_slots_forensic);
 
+          {
+            const gtsam::NonlinearFactorGraph& factors =
+                cbs_optimizer_->getFactorsUnsafe();
+            std::ostringstream first_few_oss;
+            size_t preview_count = 0u;
+            const size_t kPreviewLimit = 8u;
+            for (const gtsam::FactorIndex slot : remove_slots_this_attempt) {
+              const bool in_deferred =
+                  cbs_phase2_wrapper_source_deferred_slots.count(slot) > 0u;
+              const bool in_fresh =
+                  cbs_phase2_wrapper_source_fresh_lag_slots.count(slot) > 0u;
+              const bool in_delete =
+                  cbs_phase2_wrapper_source_delete_slots.count(slot) > 0u;
+              size_t source_count = 0u;
+              source_count += in_deferred ? 1u : 0u;
+              source_count += in_fresh ? 1u : 0u;
+              source_count += in_delete ? 1u : 0u;
+              std::string source = "none";
+              if (source_count > 1u) {
+                std::ostringstream src;
+                src << "intersection(";
+                bool first = true;
+                if (in_deferred) {
+                  src << "deferred_replay";
+                  first = false;
+                }
+                if (in_fresh) {
+                  if (!first) src << "|";
+                  src << "fresh_lag";
+                  first = false;
+                }
+                if (in_delete) {
+                  if (!first) src << "|";
+                  src << "delete_slots";
+                }
+                src << ")";
+                source = src.str();
+              } else if (in_deferred) {
+                source = "deferred_replay";
+              } else if (in_fresh) {
+                source = "fresh_lag";
+              } else if (in_delete) {
+                source = "delete_slots";
+              }
+
+              const bool exists_before_update =
+                  factors.exists(slot) && static_cast<bool>(factors.at(slot));
+              std::string factor_class = "other";
+              std::string factor_keys = "none";
+              bool touches_root_anchor_x0 = false;
+              if (exists_before_update) {
+                const auto factor = factors.at(slot);
+                factor_class = classify_forensic_remove_factor_class(factor);
+                factor_keys = format_factor_keys_for_slot(factors, slot);
+                for (const gtsam::Key key : factor->keys()) {
+                  const gtsam::Symbol sym(key);
+                  if (sym.chr() == kPoseSymbolChar && sym.index() == 0u) {
+                    touches_root_anchor_x0 = true;
+                    break;
+                  }
+                }
+              }
+
+              const bool in_stale_local =
+                  cbs_phase2_stale_local_factor_slots_set.count(slot) > 0u;
+              const bool in_stale_belief =
+                  cbs_phase2_stale_belief_factor_slots_set.count(slot) > 0u;
+              const bool in_orphan_belief =
+                  cbs_phase2_orphan_belief_factor_slots_set.count(slot) > 0u;
+              const bool in_expanded_selected =
+                  cbs_phase2_expanded_selected_factor_slots_set.count(slot) > 0u;
+
+              if (forensic.first_applied_remove_slot < 0) {
+                forensic.first_applied_remove_slot =
+                    static_cast<long long>(slot);
+                forensic.first_applied_remove_slot_source = source;
+                forensic.first_applied_remove_slot_factor_class = factor_class;
+                forensic.first_applied_remove_slot_factor_keys = factor_keys;
+                forensic.first_applied_remove_slot_exists_before_update =
+                    exists_before_update ? 1 : 0;
+                forensic.first_applied_remove_slot_in_stale_local_factor_slots =
+                    in_stale_local ? 1 : 0;
+                forensic.first_applied_remove_slot_in_stale_belief_factor_slots =
+                    in_stale_belief ? 1 : 0;
+                forensic.first_applied_remove_slot_in_orphan_belief_factor_slots =
+                    in_orphan_belief ? 1 : 0;
+                forensic.first_applied_remove_slot_in_delete_slots =
+                    in_delete ? 1 : 0;
+                forensic.first_applied_remove_slot_in_phase2_expanded_selected_factor_slots =
+                    in_expanded_selected ? 1 : 0;
+                forensic.first_applied_remove_slot_touches_root_anchor_x0 =
+                    touches_root_anchor_x0 ? 1 : 0;
+              }
+
+              if (preview_count < kPreviewLimit) {
+                if (preview_count > 0u) {
+                  first_few_oss << ";";
+                }
+                first_few_oss << "slot=" << slot
+                              << "|src=" << sanitize_forensic_token(source)
+                              << "|class="
+                              << sanitize_forensic_token(factor_class)
+                              << "|keys="
+                              << sanitize_forensic_token(factor_keys)
+                              << "|exists="
+                              << (exists_before_update ? 1 : 0)
+                              << "|stale_local=" << (in_stale_local ? 1 : 0)
+                              << "|stale_belief=" << (in_stale_belief ? 1 : 0)
+                              << "|orphan_belief="
+                              << (in_orphan_belief ? 1 : 0)
+                              << "|in_delete=" << (in_delete ? 1 : 0)
+                              << "|in_expanded_selected="
+                              << (in_expanded_selected ? 1 : 0)
+                              << "|touches_x0="
+                              << (touches_root_anchor_x0 ? 1 : 0);
+                ++preview_count;
+              }
+            }
+            if (preview_count > 0u) {
+              if (remove_slots_this_attempt.size() > preview_count) {
+                first_few_oss << ";...";
+              }
+              forensic.applied_remove_slots_first_few =
+                  sanitize_forensic_token(first_few_oss.str());
+            }
+          }
+
           for (const gtsam::Key key : forensic.remove_analysis.touched_keys) {
             if (new_factor_keys.count(key) > 0u) {
               ++forensic.remove_intersects_new_factor_keys_count;
@@ -13996,6 +16620,23 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             const long long offending_factor_slot_guess,
             const std::string& offending_factor_type_guess,
             const std::string& offending_factor_keys_guess) {
+          cbs_phase2_first_bad_epoch_real_applied_direct_local_internal_count =
+              cbs_phase2_lag_remove_slots_applied_direct_local_internal;
+          cbs_phase2_first_bad_epoch_real_applied_summary_covered_crossing_count =
+              cbs_phase2_lag_remove_slots_applied_summary_covered_crossing;
+          cbs_phase2_first_bad_epoch_one_epoch_defer_mode =
+              cbs_phase2_defer_summary_covered_crossing_one_epoch_mode
+                  ? "defer_summary_covered_crossing_one_epoch"
+                  : sanitize_forensic_token(
+                        cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes);
+          cbs_phase2_first_bad_epoch_apply_class_mix =
+              sanitize_forensic_token(
+                  "direct_local_internal:" +
+                  std::to_string(
+                      cbs_phase2_first_bad_epoch_real_applied_direct_local_internal_count) +
+                  "|summary_covered_crossing:" +
+                  std::to_string(
+                      cbs_phase2_first_bad_epoch_real_applied_summary_covered_crossing_count));
           std::cerr << build_primary_update_packet_ab_snapshot(
                            snapshot_label,
                            cbs_update_packet_forensics,
@@ -14064,12 +16705,250 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << cbs_phase2_wrapper_remove_total_count
                     << " cbs_phase2_wrapper_remove_source_coherence_ok="
                     << (cbs_phase2_wrapper_remove_source_coherence_ok ? 1 : 0)
+                    << " cbs_phase2_remove_touches_new_factor_key="
+                    << (cbs_phase2_remove_touches_new_factor_key ? 1 : 0)
+                    << " cbs_phase2_remove_touches_new_value_key="
+                    << (cbs_phase2_remove_touches_new_value_key ? 1 : 0)
+                    << " cbs_phase2_remove_touches_summary_key="
+                    << (cbs_phase2_remove_touches_summary_key ? 1 : 0)
+                    << " cbs_phase2_overlap_guard_triggered="
+                    << (cbs_phase2_overlap_guard_triggered ? 1 : 0)
+                    << " cbs_phase2_overlap_guard_reason="
+                    << sanitize_forensic_token(cbs_phase2_overlap_guard_reason)
+                    << " cbs_phase2_overlap_guard_post_split_semantics="
+                    << (cbs_phase2_overlap_guard_post_split_semantics ? 1 : 0)
+                    << " cbs_phase2_overlap_guard_summary_key_only_allowed_for_covered_crossing="
+                    << (cbs_phase2_overlap_guard_summary_key_only_allowed_for_covered_crossing
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_primary_update_mode="
+                    << sanitize_forensic_token(cbs_phase2_primary_update_mode)
+                    << " cbs_phase2_two_stage_summary_crossing_mode="
+                    << (cbs_phase2_two_stage_summary_crossing_mode ? 1 : 0)
+                    << " cbs_phase2_one_epoch_replay_mode_forced_two_stage="
+                    << (cbs_phase2_one_epoch_replay_mode_forced_two_stage ? 1
+                                                                          : 0)
+                    << " cbs_phase2_single_packet_update_inconsistent_under_replay_mode="
+                    << (cbs_phase2_single_packet_update_inconsistent_under_replay_mode
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_two_stage_requested="
+                    << (cbs_phase2_two_stage_requested ? 1 : 0)
+                    << " cbs_phase2_two_stage_effective="
+                    << (cbs_phase2_two_stage_effective ? 1 : 0)
+                    << " cbs_phase2_replay_queue_size="
+                    << cbs_phase2_replay_queue_size
+                    << " cbs_phase2_replay_into_stage_a_count="
+                    << cbs_phase2_replay_into_stage_a_count
+                    << " cbs_phase2_two_stage_update_a_executed="
+                    << (cbs_phase2_two_stage_update_a_executed ? 1 : 0)
+                    << " cbs_phase2_two_stage_update_b_executed="
+                    << (cbs_phase2_two_stage_update_b_executed ? 1 : 0)
+                    << " cbs_phase2_two_stage_update_a_remove_count="
+                    << cbs_phase2_two_stage_update_a_remove_count
+                    << " cbs_phase2_two_stage_update_a_summary_factor_count="
+                    << cbs_phase2_two_stage_update_a_summary_factor_count
+                    << " cbs_phase2_two_stage_update_b_new_factor_count="
+                    << cbs_phase2_two_stage_update_b_new_factor_count
+                    << " cbs_phase2_two_stage_update_b_new_value_count="
+                    << cbs_phase2_two_stage_update_b_new_value_count
+                    << " cbs_phase2_stage_a_summary_only_mode="
+                    << (cbs_phase2_stage_a_summary_only_mode ? 1 : 0)
+                    << " cbs_phase2_replay_into_stage_a_mode="
+                    << (cbs_phase2_replay_into_stage_a_mode ? 1 : 0)
+                    << " cbs_phase2_replayed_summary_crossing_count="
+                    << cbs_phase2_replayed_summary_crossing_count
+                    << " cbs_phase2_stage_a_remove_count="
+                    << cbs_phase2_stage_a_remove_count
+                    << " cbs_phase2_stage_a_summary_factor_count="
+                    << cbs_phase2_stage_a_summary_factor_count
+                    << " cbs_phase2_stage_a_summary_crossing_remove_count="
+                    << cbs_phase2_stage_a_summary_crossing_remove_count
+                    << " cbs_phase2_stage_a_summary_crossing_remove_deferred_count="
+                    << cbs_phase2_stage_a_summary_crossing_remove_deferred_count
+                    << " cbs_phase2_stage_a_replay_skipped_due_to_failure="
+                    << (cbs_phase2_stage_a_replay_skipped_due_to_failure ? 1 : 0)
+                    << " cbs_phase2_stage_a_skip_epoch_on_initial_failure_mode="
+                    << (cbs_phase2_stage_a_skip_epoch_on_initial_failure_mode
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure="
+                    << (cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_stage_a_skipped_kf="
+                    << cbs_phase2_stage_a_skipped_kf
+                    << " cbs_phase2_stage_a_skip_reason="
+                    << sanitize_forensic_token(cbs_phase2_stage_a_skip_reason)
+                    << " cbs_phase2_two_stage_first_bad_epoch_stage="
+                    << sanitize_forensic_token(
+                           cbs_phase2_two_stage_first_bad_epoch_stage)
+                    << " cbs_phase2_stage_b_defer_delete_slots_mode="
+                    << (cbs_phase2_stage_b_defer_delete_slots_mode ? 1 : 0)
+                    << " cbs_phase2_stage_b_filter_invalid_smart_factors_mode="
+                    << (cbs_phase2_stage_b_filter_invalid_smart_factors_mode ? 1
+                                                                              : 0)
+                    << " cbs_phase2_stage_b_skip_smart_updates_one_epoch_mode="
+                    << (cbs_phase2_stage_b_skip_smart_updates_one_epoch_mode
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective="
+                    << (cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_stage_b_skip_epoch_on_initial_failure_mode="
+                    << (cbs_phase2_stage_b_skip_epoch_on_initial_failure_mode ? 1
+                                                                               : 0)
+                    << " cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure="
+                    << (cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure ? 1
+                                                                                  : 0)
+                    << " cbs_phase2_stage_b_skipped_kf="
+                    << cbs_phase2_stage_b_skipped_kf
+                    << " cbs_phase2_stage_b_skip_reason="
+                    << sanitize_forensic_token(cbs_phase2_stage_b_skip_reason)
+                    << " cbs_phase2_stage_b_delete_slots_raw_count="
+                    << cbs_phase2_stage_b_delete_slots_raw_count
+                    << " cbs_phase2_stage_b_delete_slots_applied_count="
+                    << cbs_phase2_stage_b_delete_slots_applied_count
+                    << " cbs_phase2_stage_b_delete_slots_deferred_count="
+                    << cbs_phase2_stage_b_delete_slots_deferred_count
+                    << " cbs_phase2_stage_b_smart_factor_raw_count="
+                    << cbs_phase2_stage_b_smart_factor_raw_count
+                    << " cbs_phase2_stage_b_smart_factor_kept_count="
+                    << cbs_phase2_stage_b_smart_factor_kept_count
+                    << " cbs_phase2_stage_b_smart_factor_dropped_count="
+                    << cbs_phase2_stage_b_smart_factor_dropped_count
+                    << " cbs_phase2_stage_b_smart_factor_skipped_count="
+                    << cbs_phase2_stage_b_smart_factor_skipped_count
+                    << " cbs_phase2_stage_b_smart_factor_reused_count="
+                    << cbs_phase2_stage_b_smart_factor_reused_count
+                    << " cbs_phase2_stage_b_map_at_thrown="
+                    << (cbs_phase2_stage_b_map_at_thrown ? 1 : 0)
+                    << " cbs_phase2_stage_b_first_dropped_smart_factor_keys="
+                    << sanitize_forensic_token(
+                           cbs_phase2_stage_b_first_dropped_smart_factor_keys)
+                    << " cbs_phase2_stage_b_first_dropped_smart_factor_reason="
+                    << sanitize_forensic_token(
+                           cbs_phase2_stage_b_first_dropped_smart_factor_reason)
+                    << " cbs_phase2_stage_b_first_bad_epoch_stage="
+                    << sanitize_forensic_token(
+                           cbs_phase2_stage_b_first_bad_epoch_stage)
+                    << " cbs_phase2_deferred_due_to_overlap_count="
+                    << cbs_phase2_deferred_due_to_overlap_count
+                    << " cbs_phase2_overlap_guard_deferred_direct_local_internal_count="
+                    << cbs_phase2_overlap_guard_deferred_direct_local_internal_count
+                    << " cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count="
+                    << cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count
+                    << " cbs_phase2_overlap_guard_summary_key_only_crossing_count="
+                    << cbs_phase2_overlap_guard_summary_key_only_crossing_count
+                    << " cbs_phase2_overlap_guard_new_factor_or_value_crossing_count="
+                    << cbs_phase2_overlap_guard_new_factor_or_value_crossing_count
+                    << " cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent="
+                    << (cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_diag_defer_direct_local_internal_only="
+                    << (cbs_phase2_diag_defer_direct_local_internal_only ? 1 : 0)
+                    << " cbs_phase2_direct_local_internal_forced_deferred_count="
+                    << cbs_phase2_direct_local_internal_forced_deferred_count
+                    << " cbs_phase2_summary_covered_crossing_kept_active_count="
+                    << cbs_phase2_summary_covered_crossing_kept_active_count
+                    << " cbs_phase2_diag_exclude_summary_covered_crossing_classes="
+                    << cbs_phase2_diag_exclude_summary_covered_crossing_classes
+                    << " cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes="
+                    << cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes
+                    << " cbs_phase2_summary_covered_crossing_one_epoch_deferred_count="
+                    << cbs_phase2_summary_covered_crossing_one_epoch_deferred_count
+                    << " cbs_phase2_summary_covered_crossing_one_epoch_deferred_first_few="
+                    << cbs_phase2_summary_covered_crossing_one_epoch_deferred_first_few
+                    << " cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count="
+                    << cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count
+                    << " cbs_phase2_summary_covered_crossing_one_epoch_reapplied_first_few="
+                    << cbs_phase2_summary_covered_crossing_one_epoch_reapplied_first_few
+                    << " cbs_phase2_defer_summary_covered_crossing_one_epoch_mode="
+                    << (cbs_phase2_defer_summary_covered_crossing_one_epoch_mode
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count="
+                    << cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count
+                    << " cbs_phase2_summary_covered_crossing_replayed_count="
+                    << cbs_phase2_summary_covered_crossing_replayed_count
+                    << " cbs_phase2_summary_covered_crossing_replay_epoch="
+                    << cbs_phase2_summary_covered_crossing_replay_epoch
+                    << " cbs_phase2_summary_covered_crossing_replay_stage="
+                    << sanitize_forensic_token(
+                           cbs_phase2_summary_covered_crossing_replay_stage)
+                    << " cbs_phase2_summary_crossing_replay_requested_count="
+                    << cbs_phase2_summary_crossing_replay_requested_count
+                    << " cbs_phase2_summary_crossing_replay_valid_count="
+                    << cbs_phase2_summary_crossing_replay_valid_count
+                    << " cbs_phase2_summary_crossing_replay_invalid_count="
+                    << cbs_phase2_summary_crossing_replay_invalid_count
+                    << " cbs_phase2_summary_crossing_replay_skipped_due_to_no_valid_slots="
+                    << (cbs_phase2_summary_crossing_replay_skipped_due_to_no_valid_slots
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_summary_crossing_replay_first_invalid_slot="
+                    << cbs_phase2_summary_crossing_replay_first_invalid_slot
+                    << " cbs_phase2_summary_crossing_replay_first_invalid_slot_class="
+                    << cbs_phase2_summary_crossing_replay_first_invalid_slot_class
+                    << " cbs_phase2_summary_crossing_replay_first_invalid_slot_keys="
+                    << cbs_phase2_summary_crossing_replay_first_invalid_slot_keys
+                    << " cbs_phase2_summary_crossing_replay_first_invalid_reason="
+                    << cbs_phase2_summary_crossing_replay_first_invalid_reason
+                    << " cbs_phase2_summary_crossing_replay_stage_executed="
+                    << (cbs_phase2_summary_crossing_replay_stage_executed ? 1 : 0)
+                    << " cbs_phase2_summary_crossing_replay_first_replayed_slot="
+                    << cbs_phase2_summary_crossing_replay_first_replayed_slot
+                    << " cbs_phase2_summary_crossing_replay_first_replayed_slot_class="
+                    << cbs_phase2_summary_crossing_replay_first_replayed_slot_class
+                    << " cbs_phase2_summary_crossing_replay_first_replayed_slot_keys="
+                    << cbs_phase2_summary_crossing_replay_first_replayed_slot_keys
+                    << " cbs_phase2_summary_covered_crossing_factor_type_counts_raw="
+                    << cbs_phase2_summary_covered_crossing_factor_type_counts_raw
+                    << " cbs_phase2_summary_covered_crossing_factor_type_counts_applied="
+                    << cbs_phase2_summary_covered_crossing_factor_type_counts_applied
+                    << " cbs_phase2_summary_covered_crossing_factor_type_counts_deferred="
+                    << cbs_phase2_summary_covered_crossing_factor_type_counts_deferred
+                    << " cbs_phase2_first_applied_summary_covered_crossing_slot_class="
+                    << cbs_phase2_first_applied_summary_covered_crossing_slot_class
+                    << " cbs_phase2_first_applied_summary_covered_crossing_slot_keys="
+                    << cbs_phase2_first_applied_summary_covered_crossing_slot_keys
+                    << " cbs_phase2_first_deferred_summary_covered_crossing_slot_class="
+                    << cbs_phase2_first_deferred_summary_covered_crossing_slot_class
+                    << " cbs_phase2_first_deferred_summary_covered_crossing_slot_keys="
+                    << cbs_phase2_first_deferred_summary_covered_crossing_slot_keys
+                    << " cbs_phase2_first_bad_epoch_apply_class_mix="
+                    << cbs_phase2_first_bad_epoch_apply_class_mix
+                    << " cbs_phase2_first_bad_epoch_real_applied_direct_local_internal_count="
+                    << cbs_phase2_first_bad_epoch_real_applied_direct_local_internal_count
+                    << " cbs_phase2_first_bad_epoch_real_applied_summary_covered_crossing_count="
+                    << cbs_phase2_first_bad_epoch_real_applied_summary_covered_crossing_count
+                    << " cbs_phase2_first_bad_epoch_one_epoch_defer_mode="
+                    << cbs_phase2_first_bad_epoch_one_epoch_defer_mode
+                    << " cbs_phase2_deferred_due_to_overlap_slots_first_few="
+                    << cbs_phase2_deferred_due_to_overlap_slots_first_few
+                    << " cbs_phase2_overlap_keys_first_few="
+                    << cbs_phase2_overlap_keys_first_few
+                    << " cbs_phase2_remove_indices_applied_count="
+                    << cbs_phase2_remove_indices_applied_count
+                    << " cbs_phase2_remove_indices_deferred_count="
+                    << cbs_phase2_remove_indices_deferred_count
                     << " cbs_phase2_fresh_lag_anchor_prior_protection_fired="
                     << (cbs_phase2_fresh_lag_anchor_prior_protection_fired ? 1 : 0)
                     << " cbs_phase2_fresh_lag_anchor_prior_blocked_count="
                     << cbs_phase2_fresh_lag_anchor_prior_blocked_count
                     << " cbs_phase2_fresh_lag_anchor_prior_blocked_slots="
                     << cbs_phase2_fresh_lag_anchor_prior_blocked_slots
+                    << " cbs_phase2_fresh_lag_structural_prior_protection_fired="
+                    << (cbs_phase2_fresh_lag_structural_prior_protection_fired ? 1
+                                                                                : 0)
+                    << " cbs_phase2_fresh_lag_structural_prior_blocked_count="
+                    << cbs_phase2_fresh_lag_structural_prior_blocked_count
+                    << " cbs_phase2_fresh_lag_structural_prior_blocked_slots="
+                    << cbs_phase2_fresh_lag_structural_prior_blocked_slots
+                    << " cbs_phase2_fresh_lag_structural_prior_blocked_keys="
+                    << cbs_phase2_fresh_lag_structural_prior_blocked_keys
                     << " lag_stale_local_keys="
                     << lag_window_state.stale_state_keys
                     << " lag_stale_local_factor_slots="
@@ -14090,6 +16969,19 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << cbs_phase2_expanded_eliminated_key_count
                     << " cbs_phase2_expanded_emitted_factor_count="
                     << cbs_phase2_expanded_emitted_factor_count
+                    << " cbs_phase2_expanded_summary_support_factor_count="
+                    << cbs_phase2_expanded_summary_support_factor_count
+                    << " cbs_phase2_expanded_summary_support_slots_first_few="
+                    << cbs_phase2_expanded_summary_support_slots_first_few
+                    << " cbs_phase2_expanded_summary_used_bootstrap_support_priors="
+                    << (cbs_phase2_expanded_summary_used_bootstrap_support_priors ? 1
+                                                                                   : 0)
+                    << " cbs_phase2_expanded_summary_bootstrap_support_keys="
+                    << cbs_phase2_expanded_summary_bootstrap_support_keys
+                    << " cbs_phase2_expanded_summary_removed_crossing_uses_bootstrap_support="
+                    << (cbs_phase2_expanded_summary_removed_crossing_uses_bootstrap_support
+                            ? 1
+                            : 0)
                     << " cbs_phase2_summary_targets="
                     << cbs_phase2_summary_targets
                     << " cbs_phase2_summary_requested_target_count="
@@ -14148,6 +17040,160 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << cbs_phase2_lag_remove_slots_applied
                     << " cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary="
                     << cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary
+                    << " cbs_phase2_lag_remove_slots_requested_raw="
+                    << cbs_phase2_lag_remove_slots_requested_raw
+                    << " cbs_phase2_lag_remove_slots_summary_covered="
+                    << cbs_phase2_lag_remove_slots_summary_covered
+                    << " cbs_phase2_lag_remove_slots_deferred_uncovered="
+                    << cbs_phase2_lag_remove_slots_deferred_uncovered
+                    << " cbs_phase2_lag_remove_slots_applied_after_coverage_gate="
+                    << cbs_phase2_lag_remove_slots_applied_after_coverage_gate
+                    << " cbs_phase2_current_epoch_requested_direct_local_internal_count="
+                    << cbs_phase2_current_epoch_requested_direct_local_internal_count
+                    << " cbs_phase2_current_epoch_requested_crossing_required_count="
+                    << cbs_phase2_current_epoch_requested_crossing_required_count
+                    << " cbs_phase2_current_epoch_requested_unsupported_count="
+                    << cbs_phase2_current_epoch_requested_unsupported_count
+                    << " cbs_phase2_deferred_queue_requested_count="
+                    << cbs_phase2_deferred_queue_requested_count
+                    << " cbs_phase2_effective_requested_crossing_required_count="
+                    << cbs_phase2_effective_requested_crossing_required_count
+                    << " cbs_phase2_effective_requested_crossing_intersection_with_heart_covered_count="
+                    << cbs_phase2_effective_requested_crossing_intersection_with_heart_covered_count
+                    << " cbs_phase2_effective_heart_covered_minus_requested_crossing_count="
+                    << cbs_phase2_effective_heart_covered_minus_requested_crossing_count
+                    << " cbs_phase2_crossing_gate_requested_count="
+                    << cbs_phase2_crossing_gate_requested_count
+                    << " cbs_phase2_crossing_gate_covered_count="
+                    << cbs_phase2_crossing_gate_covered_count
+                    << " cbs_phase2_crossing_gate_uncovered_count="
+                    << cbs_phase2_crossing_gate_uncovered_count
+                    << " cbs_phase2_crossing_gate_hard_blocked="
+                    << (cbs_phase2_crossing_gate_hard_blocked ? 1 : 0)
+                    << " cbs_phase2_crossing_gate_reason="
+                    << cbs_phase2_crossing_gate_reason
+                    << " cbs_phase2_crossing_gate_using_split_semantics="
+                    << (cbs_phase2_crossing_gate_using_split_semantics ? 1 : 0)
+                    << " cbs_phase2_crossing_gate_zero_apply_inconsistent="
+                    << (cbs_phase2_crossing_gate_zero_apply_inconsistent ? 1 : 0)
+                    << " cbs_phase2_crossing_export_coherence_ok="
+                    << (cbs_phase2_crossing_export_coherence_ok ? 1 : 0)
+                    << " cbs_phase2_phase2_slot_domain_source="
+                    << cbs_phase2_phase2_slot_domain_source
+                    << " cbs_phase2_summary_required_crossing_slots="
+                    << cbs_phase2_summary_required_crossing_slots
+                    << " cbs_phase2_summary_covered_crossing_slots="
+                    << cbs_phase2_summary_covered_crossing_slots
+                    << " cbs_phase2_directly_removable_local_internal_candidate_slots="
+                    << cbs_phase2_directly_removable_local_internal_candidate_slots
+                    << " cbs_phase2_directly_removable_local_internal_slots="
+                    << cbs_phase2_directly_removable_local_internal_slots
+                    << " cbs_phase2_retained_protected_local_support_slots="
+                    << cbs_phase2_retained_protected_local_support_slots
+                    << " cbs_phase2_retained_protected_local_support_slots_first_few="
+                    << cbs_phase2_retained_protected_local_support_slots_first_few
+                    << " cbs_phase2_first_retained_protected_local_support_slot_class="
+                    << cbs_phase2_first_retained_protected_local_support_slot_class
+                    << " cbs_phase2_first_retained_protected_local_support_slot_keys="
+                    << cbs_phase2_first_retained_protected_local_support_slot_keys
+                    << " cbs_phase2_direct_local_internal_rejected_due_to_incomplete_component="
+                    << cbs_phase2_direct_local_internal_rejected_due_to_incomplete_component
+                    << " cbs_phase2_first_direct_local_internal_rejected_slot="
+                    << cbs_phase2_first_direct_local_internal_rejected_slot
+                    << " cbs_phase2_first_direct_local_internal_rejected_slot_class="
+                    << cbs_phase2_first_direct_local_internal_rejected_slot_class
+                    << " cbs_phase2_first_direct_local_internal_rejected_slot_keys="
+                    << cbs_phase2_first_direct_local_internal_rejected_slot_keys
+                    << " cbs_phase2_first_direct_local_internal_rejected_reason="
+                    << cbs_phase2_first_direct_local_internal_rejected_reason
+                    << " cbs_phase2_first_direct_local_internal_rejected_blocking_key="
+                    << cbs_phase2_first_direct_local_internal_rejected_blocking_key
+                    << " cbs_phase2_first_direct_local_internal_rejected_blocking_slot="
+                    << cbs_phase2_first_direct_local_internal_rejected_blocking_slot
+                    << " cbs_phase2_first_direct_local_internal_rejected_blocking_slot_class="
+                    << cbs_phase2_first_direct_local_internal_rejected_blocking_slot_class
+                    << " cbs_phase2_first_direct_local_internal_rejected_blocking_slot_keys="
+                    << cbs_phase2_first_direct_local_internal_rejected_blocking_slot_keys
+                    << " cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_slot="
+                    << cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_slot
+                    << " cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_reason="
+                    << cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_reason
+                    << " cbs_phase2_unsupported_deferred_lag_slots="
+                    << cbs_phase2_unsupported_deferred_lag_slots
+                    << " cbs_phase2_lag_requested_slot_count="
+                    << cbs_phase2_lag_requested_slot_count
+                    << " cbs_phase2_lag_requested_partition_coherence_ok="
+                    << (cbs_phase2_lag_requested_partition_coherence_ok ? 1 : 0)
+                    << " cbs_phase2_unclassified_requested_lag_slots="
+                    << cbs_phase2_unclassified_requested_lag_slots
+                    << " cbs_phase2_unclassified_requested_lag_slots_first_few="
+                    << cbs_phase2_unclassified_requested_lag_slots_first_few
+                    << " cbs_phase2_first_unclassified_requested_lag_slot="
+                    << cbs_phase2_first_unclassified_requested_lag_slot
+                    << " cbs_phase2_first_unclassified_requested_lag_slot_class="
+                    << cbs_phase2_first_unclassified_requested_lag_slot_class
+                    << " cbs_phase2_first_unclassified_requested_lag_slot_keys="
+                    << cbs_phase2_first_unclassified_requested_lag_slot_keys
+                    << " cbs_phase2_first_unclassified_requested_lag_slot_reason="
+                    << cbs_phase2_first_unclassified_requested_lag_slot_reason
+                    << " cbs_phase2_requested_crossing_intersection_with_heart_covered_count="
+                    << cbs_phase2_requested_crossing_intersection_with_heart_covered_count
+                    << " cbs_phase2_requested_crossing_minus_heart_covered_count="
+                    << cbs_phase2_requested_crossing_minus_heart_covered_count
+                    << " cbs_phase2_heart_covered_minus_requested_crossing_count="
+                    << cbs_phase2_heart_covered_minus_requested_crossing_count
+                    << " cbs_phase2_first_requested_crossing_not_in_heart_covered="
+                    << cbs_phase2_first_requested_crossing_not_in_heart_covered
+                    << " cbs_phase2_first_heart_covered_not_in_requested_crossing="
+                    << cbs_phase2_first_heart_covered_not_in_requested_crossing
+                    << " cbs_phase2_lag_remove_slots_applied_direct_local_internal="
+                    << cbs_phase2_lag_remove_slots_applied_direct_local_internal
+                    << " cbs_phase2_lag_remove_slots_applied_summary_covered_crossing="
+                    << cbs_phase2_lag_remove_slots_applied_summary_covered_crossing
+                    << " cbs_phase2_lag_remove_slots_deferred_crossing_uncovered="
+                    << cbs_phase2_lag_remove_slots_deferred_crossing_uncovered
+                    << " cbs_phase2_lag_remove_slots_deferred_unsupported="
+                    << cbs_phase2_lag_remove_slots_deferred_unsupported
+                    << " cbs_phase2_real_applied_lag_slots_count="
+                    << cbs_phase2_real_applied_lag_slots_count
+                    << " cbs_phase2_real_applied_lag_slots_first_few="
+                    << cbs_phase2_real_applied_lag_slots_first_few
+                    << " cbs_phase2_real_applied_delete_slots_count="
+                    << cbs_phase2_real_applied_delete_slots_count
+                    << " cbs_phase2_real_applied_total_remove_slots_count="
+                    << cbs_phase2_real_applied_total_remove_slots_count
+                    << " cbs_phase2_real_applied_lag_slots_source="
+                    << cbs_phase2_real_applied_lag_slots_source
+                    << " cbs_phase2_applied_lag_slot_membership_ok="
+                    << (cbs_phase2_applied_lag_slot_membership_ok ? 1 : 0)
+                    << " cbs_phase2_first_applied_lag_slot_outside_split_contract="
+                    << cbs_phase2_first_applied_lag_slot_outside_split_contract
+                    << " cbs_phase2_first_applied_lag_slot_outside_split_contract_class="
+                    << cbs_phase2_first_applied_lag_slot_outside_split_contract_class
+                    << " cbs_phase2_first_applied_lag_slot_outside_split_contract_keys="
+                    << cbs_phase2_first_applied_lag_slot_outside_split_contract_keys
+                    << " cbs_phase2_lag_remove_coverage_gate_reason="
+                    << cbs_phase2_lag_remove_coverage_gate_reason
+                    << " cbs_phase2_summary_remove_coverage_mode="
+                    << cbs_phase2_summary_remove_coverage_mode
+                    << " cbs_phase2_summary_remove_coverage_coherence_ok="
+                    << (cbs_phase2_summary_remove_coverage_coherence_ok ? 1 : 0)
+                    << " cbs_phase2_summary_remove_coverage_first_inconsistency_reason="
+                    << cbs_phase2_summary_remove_coverage_first_inconsistency_reason
+                    << " cbs_phase2_lag_remove_hard_blocked_due_to_none_mode="
+                    << (cbs_phase2_lag_remove_hard_blocked_due_to_none_mode ? 1 : 0)
+                    << " cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export="
+                    << (cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export
+                            ? 1
+                            : 0)
+                    << " cbs_phase2_lag_remove_hard_blocked_count="
+                    << cbs_phase2_lag_remove_hard_blocked_count
+                    << " cbs_phase2_first_uncovered_lag_remove_slot="
+                    << cbs_phase2_first_uncovered_lag_remove_slot
+                    << " cbs_phase2_first_uncovered_lag_remove_slot_class="
+                    << cbs_phase2_first_uncovered_lag_remove_slot_class
+                    << " cbs_phase2_first_uncovered_lag_remove_slot_keys="
+                    << cbs_phase2_first_uncovered_lag_remove_slot_keys
                     << " cbs_phase2_lag_remove_boundary_touch_factor_count="
                     << cbs_phase2_lag_remove_boundary_touch_factor_count
                     << " cbs_phase2_lag_remove_filter_reason="
@@ -14184,6 +17230,15 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << cbs_phase2_deferred_lag_remove_anchor_prior_keys
                     << " deferred_lag_remove_anchor_prior_protection_reason="
                     << cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason
+                    << " cbs_phase2_deferred_structural_prior_protection_fired="
+                    << (cbs_phase2_deferred_structural_prior_protection_fired ? 1
+                                                                               : 0)
+                    << " cbs_phase2_deferred_structural_prior_blocked_count="
+                    << cbs_phase2_deferred_structural_prior_blocked_count
+                    << " cbs_phase2_deferred_structural_prior_blocked_slots="
+                    << cbs_phase2_deferred_structural_prior_blocked_slots
+                    << " cbs_phase2_deferred_structural_prior_blocked_keys="
+                    << cbs_phase2_deferred_structural_prior_blocked_keys
                     << " cbs_phase2_first_post_boundary_factor_class_filter_reason="
                     << cbs_phase2_first_post_boundary_factor_class_filter_reason
                     << " lag_prev_oldest_active_frame_id="
@@ -14245,6 +17300,43 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << " first_remove_slot_type="
                     << sanitize_forensic_token(
                            cbs_update_packet_forensics.remove_analysis.first_type)
+                    << " applied_remove_slots_first_few="
+                    << cbs_update_packet_forensics.applied_remove_slots_first_few
+                    << " first_applied_remove_slot="
+                    << cbs_update_packet_forensics.first_applied_remove_slot
+                    << " first_applied_remove_slot_source="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics
+                               .first_applied_remove_slot_source)
+                    << " first_applied_remove_slot_factor_class="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics
+                               .first_applied_remove_slot_factor_class)
+                    << " first_applied_remove_slot_factor_keys="
+                    << sanitize_forensic_token(
+                           cbs_update_packet_forensics
+                               .first_applied_remove_slot_factor_keys)
+                    << " first_applied_remove_slot_exists_before_update="
+                    << cbs_update_packet_forensics
+                           .first_applied_remove_slot_exists_before_update
+                    << " first_applied_remove_slot_in_stale_local_factor_slots="
+                    << cbs_update_packet_forensics
+                           .first_applied_remove_slot_in_stale_local_factor_slots
+                    << " first_applied_remove_slot_in_stale_belief_factor_slots="
+                    << cbs_update_packet_forensics
+                           .first_applied_remove_slot_in_stale_belief_factor_slots
+                    << " first_applied_remove_slot_in_orphan_belief_factor_slots="
+                    << cbs_update_packet_forensics
+                           .first_applied_remove_slot_in_orphan_belief_factor_slots
+                    << " first_applied_remove_slot_in_delete_slots="
+                    << cbs_update_packet_forensics
+                           .first_applied_remove_slot_in_delete_slots
+                    << " first_applied_remove_slot_in_phase2_expanded_selected_factor_slots="
+                    << cbs_update_packet_forensics
+                           .first_applied_remove_slot_in_phase2_expanded_selected_factor_slots
+                    << " first_applied_remove_slot_touches_root_anchor_x0="
+                    << cbs_update_packet_forensics
+                           .first_applied_remove_slot_touches_root_anchor_x0
                     << " first_delete_slot="
                     << cbs_update_packet_forensics.delete_analysis.first_slot
                     << " first_delete_slot_type="
@@ -14350,6 +17442,133 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << " failure_reason=" << failure_reason
                     << std::endl;
         };
+    bool cbs_crash_imminent_marker_epoch = false;
+    static bool cbs_lag_boundary_commit_diag_emitted_once = false;
+    static bool cbs_lag_transaction_atomicity_diag_emitted_once = false;
+    if (curr_kf_id_ == 0u && !cbs_first_bad_epoch_seen_) {
+      cbs_lag_boundary_commit_diag_emitted_once = false;
+      cbs_lag_transaction_atomicity_diag_emitted_once = false;
+    }
+    static bool cbs_stage_b_failure_sequence_diag_emitted_once = false;
+    if (curr_kf_id_ == 0u && !cbs_first_bad_epoch_seen_) {
+      cbs_stage_b_failure_sequence_diag_emitted_once = false;
+    }
+    bool cbs_stage_b_failure_sequence_active_epoch = false;
+    std::string cbs_stage_b_failure_sequence_initial_stage = "none";
+    std::string cbs_stage_b_failure_sequence_initial_exception_message = "none";
+    bool cbs_stage_b_failure_sequence_retry_attempted = false;
+    std::string cbs_stage_b_failure_sequence_retry_exception_message = "none";
+    bool cbs_stage_b_failure_sequence_recovery_attempted = false;
+    std::string cbs_stage_b_failure_sequence_recovery_exception_message = "none";
+    std::string cbs_stage_b_failure_sequence_final_failure_stage = "none";
+    const auto cbs_note_stage_b_failure_exception =
+        [&](const bool enable_remove_factor_indices,
+            const std::string& stage_label,
+            const std::string& message) {
+          cbs_stage_b_failure_sequence_active_epoch = true;
+          if (cbs_stage_b_failure_sequence_initial_stage == "none") {
+            cbs_stage_b_failure_sequence_initial_stage =
+                sanitize_forensic_token(stage_label);
+            cbs_stage_b_failure_sequence_initial_exception_message =
+                sanitize_forensic_token(message.empty() ? "unknown" : message);
+            return;
+          }
+          if (!enable_remove_factor_indices &&
+              cbs_stage_b_failure_sequence_retry_exception_message == "none") {
+            cbs_stage_b_failure_sequence_retry_exception_message =
+                sanitize_forensic_token(message.empty() ? "unknown" : message);
+          }
+        };
+    const auto cbs_emit_stage_b_failure_sequence_diag_once = [&]() {
+      if (!cbs_stage_b_failure_sequence_active_epoch ||
+          cbs_stage_b_failure_sequence_diag_emitted_once) {
+        return;
+      }
+      std::cerr << std::setprecision(12)
+                << "[CBS][StageBFailureSequenceDiag]"
+                << " curr_kf_id=" << curr_kf_id_
+                << " initial_stage="
+                << sanitize_forensic_token(
+                       cbs_stage_b_failure_sequence_initial_stage)
+                << " initial_exception_message="
+                << sanitize_forensic_token(
+                       cbs_stage_b_failure_sequence_initial_exception_message)
+                << " retry_attempted="
+                << (cbs_stage_b_failure_sequence_retry_attempted ? 1 : 0)
+                << " retry_exception_message="
+                << sanitize_forensic_token(
+                       cbs_stage_b_failure_sequence_retry_exception_message)
+                << " recovery_attempted="
+                << (cbs_stage_b_failure_sequence_recovery_attempted ? 1 : 0)
+                << " recovery_exception_message="
+                << sanitize_forensic_token(
+                       cbs_stage_b_failure_sequence_recovery_exception_message)
+                << " final_failure_stage="
+                << sanitize_forensic_token(
+                       cbs_stage_b_failure_sequence_final_failure_stage)
+                << std::endl;
+      cbs_stage_b_failure_sequence_diag_emitted_once = true;
+    };
+    static bool cbs_stage_a_failure_sequence_diag_emitted_once = false;
+    if (curr_kf_id_ == 0u && !cbs_first_bad_epoch_seen_) {
+      cbs_stage_a_failure_sequence_diag_emitted_once = false;
+    }
+    bool cbs_stage_a_failure_sequence_active_epoch = false;
+    std::string cbs_stage_a_failure_sequence_initial_stage = "none";
+    std::string cbs_stage_a_failure_sequence_initial_exception_message = "none";
+    bool cbs_stage_a_failure_sequence_retry_attempted = false;
+    std::string cbs_stage_a_failure_sequence_retry_exception_message = "none";
+    bool cbs_stage_a_failure_sequence_recovery_attempted = false;
+    std::string cbs_stage_a_failure_sequence_recovery_exception_message = "none";
+    std::string cbs_stage_a_failure_sequence_final_failure_stage = "none";
+    const auto cbs_note_stage_a_failure_exception =
+        [&](const bool enable_remove_factor_indices,
+            const std::string& stage_label,
+            const std::string& message) {
+          cbs_stage_a_failure_sequence_active_epoch = true;
+          if (cbs_stage_a_failure_sequence_initial_stage == "none") {
+            cbs_stage_a_failure_sequence_initial_stage =
+                sanitize_forensic_token(stage_label);
+            cbs_stage_a_failure_sequence_initial_exception_message =
+                sanitize_forensic_token(message.empty() ? "unknown" : message);
+            return;
+          }
+          if (!enable_remove_factor_indices &&
+              cbs_stage_a_failure_sequence_retry_exception_message == "none") {
+            cbs_stage_a_failure_sequence_retry_exception_message =
+                sanitize_forensic_token(message.empty() ? "unknown" : message);
+          }
+        };
+    const auto cbs_emit_stage_a_failure_sequence_diag_once = [&]() {
+      if (!cbs_stage_a_failure_sequence_active_epoch ||
+          cbs_stage_a_failure_sequence_diag_emitted_once) {
+        return;
+      }
+      std::cerr << std::setprecision(12)
+                << "[CBS][StageAFailureSequenceDiag]"
+                << " curr_kf_id=" << curr_kf_id_
+                << " initial_stage="
+                << sanitize_forensic_token(
+                       cbs_stage_a_failure_sequence_initial_stage)
+                << " initial_exception_message="
+                << sanitize_forensic_token(
+                       cbs_stage_a_failure_sequence_initial_exception_message)
+                << " retry_attempted="
+                << (cbs_stage_a_failure_sequence_retry_attempted ? 1 : 0)
+                << " retry_exception_message="
+                << sanitize_forensic_token(
+                       cbs_stage_a_failure_sequence_retry_exception_message)
+                << " recovery_attempted="
+                << (cbs_stage_a_failure_sequence_recovery_attempted ? 1 : 0)
+                << " recovery_exception_message="
+                << sanitize_forensic_token(
+                       cbs_stage_a_failure_sequence_recovery_exception_message)
+                << " final_failure_stage="
+                << sanitize_forensic_token(
+                       cbs_stage_a_failure_sequence_final_failure_stage)
+                << std::endl;
+      cbs_stage_a_failure_sequence_diag_emitted_once = true;
+    };
 
     const auto run_cbs_update_epoch =
         [&](const bool enable_remove_factor_indices,
@@ -14358,6 +17577,9 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           *should_retry_without_remove = false;
           std::string exception_phase_label = "start";
           gtsam::FactorIndices forensic_remove_slots_this_attempt;
+          static std::string
+              cbs_phase2_two_stage_first_bad_epoch_stage_persistent = "none";
+          std::string cbs_two_stage_current_update_stage = "none";
 
           try {
             // zy Step 40f
@@ -14402,99 +17624,7356 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             exception_phase_label = "remove_index_consumption";
             cbs::BPSAM::UpdateParams cbs_first_update_params =
                 build_cbs_first_update_params(enable_remove_factor_indices);
-            size_t removed_factor_indices_applied =
-                cbs_first_update_params.removeFactorIndices.size();
-            forensic_remove_slots_this_attempt =
-                cbs_first_update_params.removeFactorIndices;
-            cbs_update_packet_forensics =
-                build_update_packet_forensics(forensic_remove_slots_this_attempt);
-            std::vector<size_t> invalid_remove_slots;
-            gtsam::FactorIndices valid_remove_slots;
-            valid_remove_slots.reserve(
-                cbs_first_update_params.removeFactorIndices.size());
-            exception_phase_label = "remove_slot_exists_check";
-            {
-              const gtsam::NonlinearFactorGraph& factors =
-                  cbs_optimizer_->getFactorsUnsafe();
-              for (const size_t slot : cbs_first_update_params.removeFactorIndices) {
-                const bool exists = factors.exists(slot) && factors.at(slot);
-                std::cerr << "[CBS][PrimaryRemoveSlotCheck] curr_kf_id="
-                          << curr_kf_id_ << " slot_id=" << slot
-                          << " exists=" << (exists ? 1 : 0) << std::endl;
-                if (exists) {
-                  valid_remove_slots.push_back(slot);
-                } else {
-                  invalid_remove_slots.push_back(slot);
-                }
-              }
-              const long long first_invalid_slot =
-                  invalid_remove_slots.empty()
-                      ? -1
-                      : static_cast<long long>(invalid_remove_slots.front());
-              std::cerr << "[CBS][PrimaryRemoveSlotCheckSummary] curr_kf_id="
-                        << curr_kf_id_
-                        << " invalid_slot_count=" << invalid_remove_slots.size()
-                        << " first_invalid_slot_id=" << first_invalid_slot
-                        << std::endl;
+            if (curr_kf_id_ == 0u && !cbs_first_bad_epoch_seen_) {
+              cbs_phase2_two_stage_first_bad_epoch_stage_persistent = "none";
             }
-            const ActiveStateCounts active_pre = count_active_state_keys();
-            const auto run_primary_update_call =
-                [&](const cbs::BPSAM::UpdateParams& params,
-                    const std::string& phase_label) {
-                  exception_phase_label = phase_label;
-                  const auto call_start = std::chrono::steady_clock::now();
-                  gtsam::ISAM2Result update_result = cbs_optimizer_->update(
-                      cbs_update_factors, new_values, params);
-                  cbs_first_update_ms +=
-                      elapsedMs(call_start, std::chrono::steady_clock::now());
-                  return update_result;
+            cbs_phase2_two_stage_first_bad_epoch_stage =
+                cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+            cbs_phase2_stage_b_first_bad_epoch_stage =
+                cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+            cbs_two_stage_current_update_stage = "single_packet_update";
+            const auto count_nonnull_factors =
+                [](const gtsam::NonlinearFactorGraph& graph) {
+                  size_t count = 0u;
+                  for (const auto& factor_ptr : graph) {
+                    if (factor_ptr) {
+                      ++count;
+                    }
+                  }
+                  return count;
                 };
-
+            const bool two_stage_requested_flag =
+                FLAGS_cbs_diag_split_summary_covered_crossing_two_stage ||
+                cbs_phase2_diag_split_summary_covered_crossing_two_stage;
+            const bool defer_summary_crossing_one_epoch_requested =
+                FLAGS_cbs_diag_defer_summary_covered_crossing_one_epoch ||
+                cbs_phase2_defer_summary_covered_crossing_one_epoch_mode;
+            const bool stage_a_summary_only_requested =
+                FLAGS_cbs_diag_stage_a_summary_only ||
+                cbs_phase2_diag_stage_a_summary_only;
+            cbs_phase2_replay_queue_size =
+                cbs_phase2_summary_covered_crossing_replay_metadata_map.size();
+            const bool one_epoch_replay_state_nonempty =
+                cbs_phase2_replay_queue_size > 0u ||
+                cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count >
+                    0u ||
+                cbs_phase2_summary_covered_crossing_one_epoch_deferred_count >
+                    0u ||
+                !cbs_phase2_lag_apply_summary_covered_crossing_slots_set.empty();
+            const bool two_stage_requested_by_split_config =
+                (two_stage_requested_flag && enable_remove_factor_indices &&
+                 cbs_use_phase2_summary_prior_bridge &&
+                 !cbs_phase2_lag_apply_summary_covered_crossing_slots_set.empty() &&
+                 cbs_phase2_lag_apply_direct_local_internal_slots_set.empty() &&
+                 !cbs_phase2_summary_only_factors.empty());
+            const bool two_stage_mode_requested_by_one_epoch_replay =
+                defer_summary_crossing_one_epoch_requested &&
+                enable_remove_factor_indices &&
+                cbs_use_phase2_summary_prior_bridge &&
+                one_epoch_replay_state_nonempty;
+            cbs_phase2_one_epoch_replay_mode_forced_two_stage =
+                two_stage_mode_requested_by_one_epoch_replay &&
+                !two_stage_requested_by_split_config;
+            cbs_phase2_two_stage_requested =
+                two_stage_requested_by_split_config ||
+                two_stage_mode_requested_by_one_epoch_replay;
+            cbs_phase2_two_stage_summary_crossing_mode =
+                cbs_phase2_two_stage_requested;
+            cbs_phase2_stage_a_summary_only_mode =
+                (stage_a_summary_only_requested ||
+                 defer_summary_crossing_one_epoch_requested) &&
+                cbs_phase2_two_stage_summary_crossing_mode;
+            cbs_phase2_two_stage_effective = false;
+            if (cbs_phase2_two_stage_summary_crossing_mode) {
+              cbs_phase2_primary_update_mode = "two_stage_summary_crossing";
+            }
+            if (defer_summary_crossing_one_epoch_requested &&
+                enable_remove_factor_indices &&
+                cbs_use_phase2_summary_prior_bridge &&
+                one_epoch_replay_state_nonempty &&
+                !cbs_phase2_two_stage_summary_crossing_mode) {
+              cbs_phase2_single_packet_update_inconsistent_under_replay_mode =
+                  true;
+              LOG(ERROR)
+                  << "CBS phase2 invariant violation: replay mode requested "
+                     "with active replay/apply state but two-stage routing was "
+                     "not selected. curr_kf_id="
+                  << curr_kf_id_;
+            }
+            size_t removed_factor_indices_applied = 0u;
+            const ActiveStateCounts active_pre = count_active_state_keys();
             bool invalid_slot_retry_attempted = false;
             bool invalid_slot_retry_succeeded = false;
             gtsam::ISAM2Result cbs_result;
-            try {
-              cbs_result =
-                  run_primary_update_call(cbs_first_update_params, "bpsam_update_call");
-            } catch (const std::exception& first_update_error) {
-              const std::string first_error_msg =
-                  first_update_error.what() ? std::string(first_update_error.what())
-                                            : std::string();
-              const bool has_map_at =
-                  first_error_msg.find("map::at") != std::string::npos;
-              if (!invalid_remove_slots.empty() && has_map_at) {
-                invalid_slot_retry_attempted = true;
-                cbs::BPSAM::UpdateParams retry_params = cbs_first_update_params;
-                retry_params.removeFactorIndices = valid_remove_slots;
-                forensic_remove_slots_this_attempt = retry_params.removeFactorIndices;
-                cbs_update_packet_forensics = build_update_packet_forensics(
-                    forensic_remove_slots_this_attempt);
-                removed_factor_indices_applied = retry_params.removeFactorIndices.size();
-                cbs_remove_curr_epoch_size = retry_params.removeFactorIndices.size();
-                cbs_remove_indices_applied = retry_params.removeFactorIndices.size();
-                cbs_prev_epoch_remove_factor_indices_.clear();
-                cbs_prev_epoch_remove_factor_indices_.insert(
-                    retry_params.removeFactorIndices.begin(),
-                    retry_params.removeFactorIndices.end());
-                cbs_result = run_primary_update_call(
-                    retry_params,
-                    "bpsam_update_call_retry_skip_invalid_remove_slots");
-                invalid_slot_retry_succeeded = true;
-              } else {
-                throw;
-              }
+              const auto run_update_stage_with_retry =
+                [&](const std::string& stage_label,
+                    const gtsam::NonlinearFactorGraph& stage_factors,
+                    const gtsam::Values& stage_values,
+                    const cbs::BPSAM::UpdateParams& stage_params,
+                    gtsam::ISAM2Result* stage_result,
+                    gtsam::FactorIndices* effective_remove_slots,
+                    bool* stage_retry_attempted,
+                    bool* stage_retry_succeeded) {
+                  CHECK_NOTNULL(stage_result);
+                  CHECK_NOTNULL(effective_remove_slots);
+                  CHECK_NOTNULL(stage_retry_attempted);
+                  CHECK_NOTNULL(stage_retry_succeeded);
+                  *stage_retry_attempted = false;
+                  *stage_retry_succeeded = false;
+                  *effective_remove_slots = stage_params.removeFactorIndices;
+
+                  const auto format_missing_key_factor_keys =
+                      [](const gtsam::NonlinearFactor::shared_ptr& factor_ptr) {
+                        if (!factor_ptr) {
+                          return std::string("none");
+                        }
+                        std::ostringstream oss;
+                        bool first = true;
+                        for (const gtsam::Key key : factor_ptr->keys()) {
+                          if (!first) {
+                            oss << "|";
+                          }
+                          first = false;
+                          oss << gtsam::DefaultKeyFormatter(key);
+                        }
+                        const std::string out = oss.str();
+                        return out.empty() ? std::string("none") : out;
+                      };
+
+                  std::unordered_set<gtsam::Key> stage_value_keys;
+                  stage_value_keys.reserve(stage_values.size());
+                  for (const auto& kv : stage_values) {
+                    stage_value_keys.insert(kv.key);
+                  }
+
+                  const auto& stage_variable_index =
+                      cbs_optimizer_->getVariableIndex();
+                  const size_t stage_raw_factor_count =
+                      count_nonnull_factors(stage_factors);
+                  size_t stage_filtered_factor_count = stage_raw_factor_count;
+                  std::unordered_set<gtsam::Key> stage_missing_key_set;
+                  std::string stage_first_missing_key = "none";
+                  std::string stage_first_missing_factor_keys = "none";
+                  gtsam::NonlinearFactorGraph stage_factors_after_missing_key_filter;
+                  const gtsam::NonlinearFactorGraph* stage_factors_for_update =
+                      &stage_factors;
+
+                  if (stage_raw_factor_count > 0u) {
+                    stage_factors_after_missing_key_filter.reserve(stage_factors.size());
+                    for (const auto& factor_ptr : stage_factors) {
+                      if (!factor_ptr) {
+                        continue;
+                      }
+                      bool factor_has_missing_key = false;
+                      for (const gtsam::Key key : factor_ptr->keys()) {
+                        const bool key_in_optimizer_state =
+                            stage_variable_index.find(key) !=
+                                stage_variable_index.end() ||
+                            cbs_optimizer_->valueExists(key);
+                        const bool key_in_stage_values =
+                            stage_value_keys.count(key) > 0u;
+                        if (!key_in_optimizer_state && !key_in_stage_values) {
+                          factor_has_missing_key = true;
+                          stage_missing_key_set.insert(key);
+                          if (stage_first_missing_key == "none") {
+                            stage_first_missing_key =
+                                gtsam::DefaultKeyFormatter(key);
+                            stage_first_missing_factor_keys =
+                                format_missing_key_factor_keys(factor_ptr);
+                          }
+                        }
+                      }
+                      if (!factor_has_missing_key) {
+                        stage_factors_after_missing_key_filter.push_back(factor_ptr);
+                      }
+                    }
+                    stage_filtered_factor_count =
+                        count_nonnull_factors(stage_factors_after_missing_key_filter);
+                    if (stage_filtered_factor_count < stage_raw_factor_count) {
+                      stage_factors_for_update =
+                          &stage_factors_after_missing_key_filter;
+                    }
+                  }
+
+                  const size_t stage_missing_key_count = stage_missing_key_set.size();
+                  if (stage_missing_key_count > 0u) {
+                    std::cerr << std::setprecision(12)
+                              << "[CBS][MissingKeyPacketDiag]"
+                              << " curr_kf_id=" << curr_kf_id_
+                              << " update_stage="
+                              << sanitize_forensic_token(stage_label)
+                              << " first_missing_key="
+                              << sanitize_forensic_token(stage_first_missing_key)
+                              << " first_missing_factor_keys="
+                              << sanitize_forensic_token(
+                                     stage_first_missing_factor_keys)
+                              << " missing_key_count="
+                              << stage_missing_key_count << std::endl;
+                  }
+
+                  const bool skip_stage_due_to_missing_key_packet =
+                      stage_raw_factor_count > 0u &&
+                      stage_filtered_factor_count == 0u &&
+                      stage_missing_key_count > 0u;
+                  if (skip_stage_due_to_missing_key_packet) {
+                    cbs_two_stage_current_update_stage =
+                        stage_label + "_skipped_missing_key_packet";
+                    exception_phase_label =
+                        stage_label + "_missing_key_packet_skip";
+                    forensic_remove_slots_this_attempt.clear();
+                    cbs_update_packet_forensics = build_update_packet_forensics(
+                        forensic_remove_slots_this_attempt);
+                    *effective_remove_slots = gtsam::FactorIndices();
+                    *stage_result = gtsam::ISAM2Result();
+                    return;
+                  }
+
+                  forensic_remove_slots_this_attempt = stage_params.removeFactorIndices;
+                  cbs_update_packet_forensics = build_update_packet_forensics(
+                      forensic_remove_slots_this_attempt);
+
+                  std::vector<size_t> invalid_remove_slots;
+                  gtsam::FactorIndices valid_remove_slots;
+                  valid_remove_slots.reserve(stage_params.removeFactorIndices.size());
+                  exception_phase_label = stage_label + "_remove_slot_exists_check";
+                  {
+                    const gtsam::NonlinearFactorGraph& factors =
+                        cbs_optimizer_->getFactorsUnsafe();
+                    for (const size_t slot : stage_params.removeFactorIndices) {
+                      const bool exists = factors.exists(slot) && factors.at(slot);
+                      std::cerr << "[CBS][PrimaryRemoveSlotCheck] curr_kf_id="
+                                << curr_kf_id_ << " stage=" << stage_label
+                                << " slot_id=" << slot
+                                << " exists=" << (exists ? 1 : 0) << std::endl;
+                      if (exists) {
+                        valid_remove_slots.push_back(slot);
+                      } else {
+                        invalid_remove_slots.push_back(slot);
+                      }
+                    }
+                    const long long first_invalid_slot =
+                        invalid_remove_slots.empty()
+                            ? -1
+                            : static_cast<long long>(invalid_remove_slots.front());
+                    std::cerr
+                        << "[CBS][PrimaryRemoveSlotCheckSummary] curr_kf_id="
+                        << curr_kf_id_ << " stage=" << stage_label
+                        << " invalid_slot_count=" << invalid_remove_slots.size()
+                        << " first_invalid_slot_id=" << first_invalid_slot
+                        << std::endl;
+                  }
+
+                  const auto run_stage_update_call =
+                      [&](const cbs::BPSAM::UpdateParams& params,
+                          const std::string& phase_label) {
+                        cbs_two_stage_current_update_stage = stage_label;
+                        exception_phase_label = phase_label;
+                        cbs::BPSAM::UpdateParams call_params = params;
+                        call_params.cbs_update_stage_label = stage_label;
+                        call_params.disable_live_ils_retry_for_this_update =
+                            (stage_label == "two_stage_update_a" ||
+                             stage_label ==
+                                 "stage_a_direct_local_replay_post_stage_b_apply" ||
+                             stage_label == "stage_a_direct_local_replay_apply");
+                        const auto call_start = std::chrono::steady_clock::now();
+                        gtsam::ISAM2Result update_result = cbs_optimizer_->update(
+                            *stage_factors_for_update, stage_values, call_params);
+                        cbs_first_update_ms +=
+                            elapsedMs(call_start, std::chrono::steady_clock::now());
+                        return update_result;
+                      };
+
+                  try {
+                    *stage_result = run_stage_update_call(
+                        stage_params, "bpsam_update_call_" + stage_label);
+                  } catch (const std::exception& first_update_error) {
+                    const std::string first_error_msg =
+                        first_update_error.what()
+                            ? std::string(first_update_error.what())
+                            : std::string();
+                    const bool stage_a_skip_mode_active_for_call =
+                        cbs_phase2_stage_a_skip_epoch_on_initial_failure_mode &&
+                        stage_label == "two_stage_update_a";
+                    const bool has_map_at =
+                        first_error_msg.find("map::at") != std::string::npos;
+                    if (stage_a_skip_mode_active_for_call) {
+                      throw;
+                    }
+                    if (!invalid_remove_slots.empty() && has_map_at) {
+                      *stage_retry_attempted = true;
+                      cbs::BPSAM::UpdateParams retry_params = stage_params;
+                      retry_params.removeFactorIndices = valid_remove_slots;
+                      *effective_remove_slots = retry_params.removeFactorIndices;
+                      forensic_remove_slots_this_attempt =
+                          retry_params.removeFactorIndices;
+                      cbs_update_packet_forensics = build_update_packet_forensics(
+                          forensic_remove_slots_this_attempt);
+                      *stage_result = run_stage_update_call(
+                          retry_params,
+                          "bpsam_update_call_" + stage_label +
+                              "_retry_skip_invalid_remove_slots");
+                      *stage_retry_succeeded = true;
+                    } else {
+                      throw;
+                    }
+                  }
+                  std::cerr
+                      << "[CBS][PrimaryRemoveSlotCheckRetry] curr_kf_id="
+                      << curr_kf_id_ << " stage=" << stage_label
+                      << " invalid_slot_count=" << invalid_remove_slots.size()
+                      << " retry_attempted="
+                      << (*stage_retry_attempted ? 1 : 0)
+                      << " crash_disappeared="
+                      << ((*stage_retry_attempted && *stage_retry_succeeded) ? 1
+                                                                            : 0)
+                      << " remove_slots_before="
+                      << stage_params.removeFactorIndices.size()
+                      << " remove_slots_after="
+                      << effective_remove_slots->size() << std::endl;
+                  forensic_remove_slots_this_attempt = *effective_remove_slots;
+                  cbs_update_packet_forensics = build_update_packet_forensics(
+                      forensic_remove_slots_this_attempt);
+                };
+
+            struct StageBPacketSnapshot {
+              long long curr_kf_id = -1;
+              size_t factor_count = 0u;
+              size_t value_count = 0u;
+              size_t remove_count = 0u;
+              size_t delete_slots_count = 0u;
+              size_t remove_overlap_delete_slots_count = 0u;
+              size_t smart_factor_count = 0u;
+              size_t imu_factor_count = 0u;
+              size_t between_factor_count = 0u;
+              size_t prior_factor_count = 0u;
+              size_t other_factor_count = 0u;
+              std::string factor_classes_first_few = "none";
+              std::string factor_keys_first_few = "none";
+              std::string smart_factor_keys_first_few = "none";
+              std::string imu_factor_keys_first_few = "none";
+              std::string between_factor_keys_first_few = "none";
+              std::string prior_factor_keys_first_few = "none";
+              std::string other_factor_keys_first_few = "none";
+              std::string value_keys_first_few = "none";
+            };
+            struct PostStageAPreStageBStateSnapshot {
+              long long curr_kf_id = -1;
+              bool stage_a_completed_successfully = false;
+              size_t active_key_count_after_stage_a = 0u;
+              size_t active_factor_count_after_stage_a = 0u;
+              long long newest_local_frame_id = -1;
+              long long oldest_active_frame_id = -1;
+              std::string stage_b_value_keys = "none";
+              std::string stage_b_value_keys_in_estimate = "none";
+              std::string stage_b_value_keys_in_variable_index = "none";
+              size_t stage_b_value_keys_missing_in_estimate_count = 0u;
+              size_t stage_b_value_keys_missing_in_variable_index_count = 0u;
+              size_t
+                  stage_b_factor_keys_missing_from_current_optimizer_state_count =
+                      0u;
+              std::string first_missing_stage_b_factor_key = "none";
+            };
+            struct PreStageAStateSnapshot {
+              long long curr_kf_id = -1;
+              size_t active_key_count = 0u;
+              size_t active_factor_count = 0u;
+              long long newest_local_frame_id = -1;
+              long long oldest_active_frame_id = -1;
+              std::string stage_a_value_keys = "none";
+              std::string stage_a_value_keys_in_estimate = "none";
+              std::string stage_a_value_keys_in_variable_index = "none";
+              size_t stage_a_value_keys_missing_in_estimate_count = 0u;
+              size_t stage_a_value_keys_missing_in_variable_index_count = 0u;
+              size_t stage_a_factor_keys_missing_from_current_optimizer_state_count =
+                  0u;
+              std::string first_missing_stage_a_factor_key = "none";
+            };
+            struct LagBoundaryStateCardinalitySnapshot {
+              long long curr_kf_id = -1;
+              long long newest_local_frame_id = -1;
+              long long oldest_active_frame_id = -1;
+              size_t expected_active_local_state_key_count = 0u;
+              size_t actual_active_local_state_key_count = 0u;
+              size_t stale_local_state_key_count_below_oldest_active = 0u;
+              size_t stale_pose_key_count_below_oldest_active = 0u;
+              size_t stale_vel_key_count_below_oldest_active = 0u;
+              size_t stale_bias_key_count_below_oldest_active = 0u;
+              std::string first_stale_pose_key = "none";
+              std::string first_stale_vel_key = "none";
+              std::string first_stale_bias_key = "none";
+              bool x_prev_exists_in_estimate = false;
+              bool v_prev_exists_in_estimate = false;
+              bool b_prev_exists_in_estimate = false;
+              bool x_prev_exists_in_variable_index = false;
+              bool v_prev_exists_in_variable_index = false;
+              bool b_prev_exists_in_variable_index = false;
+              size_t first_stale_frame_incident_factor_slot_count = 0u;
+            };
+            static bool stage_a_last_clean_snapshot_valid = false;
+            static StageBPacketSnapshot stage_a_last_clean_snapshot;
+            static bool pre_stage_a_last_clean_snapshot_valid = false;
+            static PreStageAStateSnapshot pre_stage_a_last_clean_snapshot;
+            static bool lag_boundary_state_cardinality_last_clean_snapshot_valid =
+                false;
+            static LagBoundaryStateCardinalitySnapshot
+                lag_boundary_state_cardinality_last_clean_snapshot;
+            static bool stage_a_first_failure_diag_emitted = false;
+            static bool stage_b_last_clean_snapshot_valid = false;
+            static StageBPacketSnapshot stage_b_last_clean_snapshot;
+            static bool post_stage_a_pre_stage_b_last_clean_snapshot_valid =
+                false;
+            static PostStageAPreStageBStateSnapshot
+                post_stage_a_pre_stage_b_last_clean_snapshot;
+            static bool stage_b_first_failure_diag_emitted = false;
+            static bool stage_a_zero_remove_boundary_diag_emitted_once = false;
+            static bool stage_a_replay_subset_probe_diag_emitted_once = false;
+            static bool stage_a_replay_ordering_probe_diag_emitted_once = false;
+            static bool stage_a_boundary_support_guard_triggered_once = false;
+            static std::unordered_map<
+                std::string,
+                CbsSummaryCoveredCrossingReplayMetadata>
+                cbs_phase2_direct_local_hard_quarantine_identity_store;
+            static std::unordered_set<std::string>
+                cbs_phase2_direct_local_applied_consumed_terminal_identity_store;
+            static std::unordered_set<std::string>
+                cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store;
+            if (curr_kf_id_ == 0u && !cbs_first_bad_epoch_seen_) {
+              stage_a_last_clean_snapshot_valid = false;
+              pre_stage_a_last_clean_snapshot_valid = false;
+              lag_boundary_state_cardinality_last_clean_snapshot_valid = false;
+              stage_a_first_failure_diag_emitted = false;
+              stage_b_last_clean_snapshot_valid = false;
+              post_stage_a_pre_stage_b_last_clean_snapshot_valid = false;
+              stage_b_first_failure_diag_emitted = false;
+              stage_a_zero_remove_boundary_diag_emitted_once = false;
+              stage_a_replay_subset_probe_diag_emitted_once = false;
+              stage_a_replay_ordering_probe_diag_emitted_once = false;
+              stage_a_boundary_support_guard_triggered_once = false;
+              cbs_phase2_direct_local_hard_quarantine_identity_store.clear();
+              cbs_phase2_direct_local_applied_consumed_terminal_identity_store
+                  .clear();
+              cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store
+                  .clear();
             }
-            std::cerr
-                << "[CBS][PrimaryRemoveSlotCheckRetry] curr_kf_id=" << curr_kf_id_
-                << " invalid_slot_count=" << invalid_remove_slots.size()
-                << " retry_attempted=" << (invalid_slot_retry_attempted ? 1 : 0)
-                << " crash_disappeared="
-                << (invalid_slot_retry_attempted && invalid_slot_retry_succeeded ? 1
-                                                                                  : 0)
-                << " remove_slots_before="
-                << cbs_first_update_params.removeFactorIndices.size()
-                << " remove_slots_after="
-                << forensic_remove_slots_this_attempt.size() << std::endl;
+            const auto format_stage_factor_keys =
+                [&](const gtsam::NonlinearFactor::shared_ptr& factor_ptr) {
+                  if (!factor_ptr) {
+                    return std::string("none");
+                  }
+                  std::ostringstream oss;
+                  bool first = true;
+                  for (const gtsam::Key key : factor_ptr->keys()) {
+                    if (!first) {
+                      oss << "|";
+                    }
+                    first = false;
+                    oss << gtsam::DefaultKeyFormatter(key);
+                  }
+                  const std::string out = oss.str();
+                  return out.empty() ? std::string("none") : out;
+                };
+            const auto classify_stage_b_factor_class =
+                [&](const gtsam::NonlinearFactor::shared_ptr& factor_ptr) {
+                  if (!factor_ptr) {
+                    return std::string("other");
+                  }
+                  const std::string base_type =
+                      classify_forensic_factor_type(factor_ptr.get());
+                  if (base_type == "smart") {
+                    return std::string("smart");
+                  }
+                  if (base_type == "imu") {
+                    return std::string("imu");
+                  }
+                  if (base_type == "between") {
+                    return std::string("between");
+                  }
+                  if (base_type == "prior" || base_type == "external_prior") {
+                    return std::string("prior");
+                  }
+                  return std::string("other");
+                };
+            const auto build_stage_b_packet_snapshot =
+                [&](const gtsam::NonlinearFactorGraph& stage_factors,
+                    const gtsam::Values& stage_values,
+                    const cbs::BPSAM::UpdateParams& stage_params) {
+                  StageBPacketSnapshot snapshot;
+                  snapshot.curr_kf_id = static_cast<long long>(curr_kf_id_);
+                  snapshot.factor_count = count_nonnull_factors(stage_factors);
+                  snapshot.value_count = stage_values.size();
+                  snapshot.remove_count = stage_params.removeFactorIndices.size();
+                  snapshot.delete_slots_count = delete_slots_forensic.size();
+                  std::unordered_set<size_t> delete_slot_set(
+                      delete_slots_forensic.begin(),
+                      delete_slots_forensic.end());
+                  for (const size_t slot : stage_params.removeFactorIndices) {
+                    if (delete_slot_set.count(slot) > 0u) {
+                      ++snapshot.remove_overlap_delete_slots_count;
+                    }
+                  }
+
+                  const size_t kPreviewLimit = 8u;
+                  std::ostringstream factor_classes_oss;
+                  std::ostringstream factor_keys_oss;
+                  size_t factor_preview_count = 0u;
+                  for (size_t idx = 0u; idx < stage_factors.size(); ++idx) {
+                    const auto& factor_ptr = stage_factors.at(idx);
+                    if (!factor_ptr) {
+                      continue;
+                    }
+                    if (factor_preview_count >= kPreviewLimit) {
+                      break;
+                    }
+                    if (factor_preview_count > 0u) {
+                      factor_classes_oss << ",";
+                      factor_keys_oss << ";";
+                    }
+                    factor_classes_oss << sanitize_forensic_token(
+                        classify_forensic_factor_type(factor_ptr.get()));
+                    factor_keys_oss << sanitize_forensic_token(
+                        format_stage_factor_keys(factor_ptr));
+                    ++factor_preview_count;
+                  }
+                  if (factor_preview_count > 0u) {
+                    if (snapshot.factor_count > factor_preview_count) {
+                      factor_classes_oss << ",...";
+                      factor_keys_oss << ";...";
+                    }
+                    snapshot.factor_classes_first_few = factor_classes_oss.str();
+                    snapshot.factor_keys_first_few = factor_keys_oss.str();
+                  }
+
+                  const size_t kClassPreviewLimit = 4u;
+                  std::ostringstream smart_factor_keys_oss;
+                  std::ostringstream imu_factor_keys_oss;
+                  std::ostringstream between_factor_keys_oss;
+                  std::ostringstream prior_factor_keys_oss;
+                  std::ostringstream other_factor_keys_oss;
+                  size_t smart_factor_preview_count = 0u;
+                  size_t imu_factor_preview_count = 0u;
+                  size_t between_factor_preview_count = 0u;
+                  size_t prior_factor_preview_count = 0u;
+                  size_t other_factor_preview_count = 0u;
+                  const auto append_class_preview =
+                      [&](const std::string& factor_keys,
+                          size_t* preview_count,
+                          std::ostringstream* oss) {
+                        CHECK_NOTNULL(preview_count);
+                        CHECK_NOTNULL(oss);
+                        if (*preview_count >= kClassPreviewLimit) {
+                          return;
+                        }
+                        if (*preview_count > 0u) {
+                          *oss << ";";
+                        }
+                        *oss << sanitize_forensic_token(factor_keys);
+                        ++(*preview_count);
+                      };
+                  for (size_t idx = 0u; idx < stage_factors.size(); ++idx) {
+                    const auto& factor_ptr = stage_factors.at(idx);
+                    if (!factor_ptr) {
+                      continue;
+                    }
+                    const std::string factor_class =
+                        classify_stage_b_factor_class(factor_ptr);
+                    const std::string factor_keys =
+                        format_stage_factor_keys(factor_ptr);
+                    if (factor_class == "smart") {
+                      ++snapshot.smart_factor_count;
+                      append_class_preview(factor_keys,
+                                           &smart_factor_preview_count,
+                                           &smart_factor_keys_oss);
+                    } else if (factor_class == "imu") {
+                      ++snapshot.imu_factor_count;
+                      append_class_preview(factor_keys,
+                                           &imu_factor_preview_count,
+                                           &imu_factor_keys_oss);
+                    } else if (factor_class == "between") {
+                      ++snapshot.between_factor_count;
+                      append_class_preview(factor_keys,
+                                           &between_factor_preview_count,
+                                           &between_factor_keys_oss);
+                    } else if (factor_class == "prior") {
+                      ++snapshot.prior_factor_count;
+                      append_class_preview(factor_keys,
+                                           &prior_factor_preview_count,
+                                           &prior_factor_keys_oss);
+                    } else {
+                      ++snapshot.other_factor_count;
+                      append_class_preview(factor_keys,
+                                           &other_factor_preview_count,
+                                           &other_factor_keys_oss);
+                    }
+                  }
+                  if (smart_factor_preview_count > 0u) {
+                    if (snapshot.smart_factor_count > smart_factor_preview_count) {
+                      smart_factor_keys_oss << ";...";
+                    }
+                    snapshot.smart_factor_keys_first_few =
+                        smart_factor_keys_oss.str();
+                  }
+                  if (imu_factor_preview_count > 0u) {
+                    if (snapshot.imu_factor_count > imu_factor_preview_count) {
+                      imu_factor_keys_oss << ";...";
+                    }
+                    snapshot.imu_factor_keys_first_few =
+                        imu_factor_keys_oss.str();
+                  }
+                  if (between_factor_preview_count > 0u) {
+                    if (snapshot.between_factor_count >
+                        between_factor_preview_count) {
+                      between_factor_keys_oss << ";...";
+                    }
+                    snapshot.between_factor_keys_first_few =
+                        between_factor_keys_oss.str();
+                  }
+                  if (prior_factor_preview_count > 0u) {
+                    if (snapshot.prior_factor_count > prior_factor_preview_count) {
+                      prior_factor_keys_oss << ";...";
+                    }
+                    snapshot.prior_factor_keys_first_few =
+                        prior_factor_keys_oss.str();
+                  }
+                  if (other_factor_preview_count > 0u) {
+                    if (snapshot.other_factor_count > other_factor_preview_count) {
+                      other_factor_keys_oss << ";...";
+                    }
+                    snapshot.other_factor_keys_first_few =
+                        other_factor_keys_oss.str();
+                  }
+
+                  std::ostringstream value_keys_oss;
+                  size_t value_preview_count = 0u;
+                  for (const auto& kv : stage_values) {
+                    if (value_preview_count >= kPreviewLimit) {
+                      break;
+                    }
+                    if (value_preview_count > 0u) {
+                      value_keys_oss << ",";
+                    }
+                    value_keys_oss << sanitize_forensic_token(
+                        gtsam::DefaultKeyFormatter(kv.key));
+                    ++value_preview_count;
+                  }
+                  if (value_preview_count > 0u) {
+                    if (snapshot.value_count > value_preview_count) {
+                      value_keys_oss << ",...";
+                    }
+                    snapshot.value_keys_first_few = value_keys_oss.str();
+                  }
+                  return snapshot;
+                };
+            const auto build_post_stage_a_pre_stage_b_state_snapshot =
+                [&](const bool stage_a_completed_successfully,
+                    const gtsam::NonlinearFactorGraph& stage_b_factors,
+                    const gtsam::Values& stage_b_values) {
+                  PostStageAPreStageBStateSnapshot snapshot;
+                  snapshot.curr_kf_id = static_cast<long long>(curr_kf_id_);
+                  snapshot.stage_a_completed_successfully =
+                      stage_a_completed_successfully;
+                  snapshot.newest_local_frame_id =
+                      static_cast<long long>(curr_kf_id_);
+                  snapshot.oldest_active_frame_id =
+                      static_cast<long long>(lag_window_state.oldest_active_frame_id);
+
+                  const auto& optimizer_factors = cbs_optimizer_->getFactorsUnsafe();
+                  snapshot.active_factor_count_after_stage_a =
+                      count_nonnull_factors(optimizer_factors);
+
+                  const auto& variable_index = cbs_optimizer_->getVariableIndex();
+                  snapshot.active_key_count_after_stage_a = variable_index.size();
+                  std::unordered_set<gtsam::Key> variable_index_keys;
+                  variable_index_keys.reserve(variable_index.size());
+                  for (const auto& key_and_slots : variable_index) {
+                    variable_index_keys.insert(key_and_slots.first);
+                  }
+
+                  std::unordered_set<gtsam::Key> estimate_keys;
+                  estimate_keys.reserve(variable_index_keys.size());
+                  bool estimate_keys_available = true;
+                  try {
+                    const gtsam::Values estimate_values =
+                        cbs_optimizer_->calculateEstimate();
+                    estimate_keys.reserve(std::max(estimate_values.size(),
+                                                   variable_index_keys.size()));
+                    for (const auto& kv : estimate_values) {
+                      estimate_keys.insert(kv.key);
+                    }
+                  } catch (const std::exception&) {
+                    estimate_keys_available = false;
+                  }
+
+                  std::ostringstream value_keys_oss;
+                  std::ostringstream value_in_estimate_oss;
+                  std::ostringstream value_in_variable_index_oss;
+                  size_t value_index = 0u;
+                  std::unordered_set<gtsam::Key> stage_b_value_keys_set;
+                  stage_b_value_keys_set.reserve(stage_b_values.size());
+                  for (const auto& kv : stage_b_values) {
+                    const gtsam::Key key = kv.key;
+                    stage_b_value_keys_set.insert(key);
+                    const std::string key_label = sanitize_forensic_token(
+                        gtsam::DefaultKeyFormatter(key));
+                    const bool in_estimate =
+                        estimate_keys_available
+                            ? (estimate_keys.count(key) > 0u)
+                            : cbs_optimizer_->valueExists(key);
+                    const bool in_variable_index =
+                        variable_index_keys.count(key) > 0u;
+                    if (!in_estimate) {
+                      ++snapshot.stage_b_value_keys_missing_in_estimate_count;
+                    }
+                    if (!in_variable_index) {
+                      ++snapshot
+                           .stage_b_value_keys_missing_in_variable_index_count;
+                    }
+                    if (value_index > 0u) {
+                      value_keys_oss << ",";
+                      value_in_estimate_oss << ",";
+                      value_in_variable_index_oss << ",";
+                    }
+                    value_keys_oss << key_label;
+                    value_in_estimate_oss << key_label << ":" << (in_estimate ? 1 : 0);
+                    value_in_variable_index_oss << key_label << ":"
+                                                << (in_variable_index ? 1 : 0);
+                    ++value_index;
+                  }
+                  if (value_index > 0u) {
+                    snapshot.stage_b_value_keys = value_keys_oss.str();
+                    snapshot.stage_b_value_keys_in_estimate =
+                        value_in_estimate_oss.str();
+                    snapshot.stage_b_value_keys_in_variable_index =
+                        value_in_variable_index_oss.str();
+                  }
+
+                  std::unordered_set<gtsam::Key> stage_b_factor_keys_seen;
+                  for (const auto& factor_ptr : stage_b_factors) {
+                    if (!factor_ptr) {
+                      continue;
+                    }
+                    for (const gtsam::Key key : factor_ptr->keys()) {
+                      if (!stage_b_factor_keys_seen.insert(key).second) {
+                        continue;
+                      }
+                      if (stage_b_value_keys_set.count(key) > 0u) {
+                        continue;
+                      }
+                      const bool in_estimate =
+                          estimate_keys_available
+                              ? (estimate_keys.count(key) > 0u)
+                              : cbs_optimizer_->valueExists(key);
+                      const bool in_variable_index =
+                          variable_index_keys.count(key) > 0u;
+                      const bool missing_from_current_optimizer_state =
+                          !in_estimate || !in_variable_index;
+                      if (missing_from_current_optimizer_state) {
+                        ++snapshot
+                             .stage_b_factor_keys_missing_from_current_optimizer_state_count;
+                        if (snapshot.first_missing_stage_b_factor_key == "none") {
+                          snapshot.first_missing_stage_b_factor_key =
+                              sanitize_forensic_token(
+                                  gtsam::DefaultKeyFormatter(key));
+                        }
+                      }
+                    }
+                  }
+                  return snapshot;
+                };
+            const auto build_pre_stage_a_state_snapshot =
+                [&](const gtsam::NonlinearFactorGraph& stage_a_factors,
+                    const gtsam::Values& stage_a_values) {
+                  PreStageAStateSnapshot snapshot;
+                  snapshot.curr_kf_id = static_cast<long long>(curr_kf_id_);
+                  snapshot.newest_local_frame_id =
+                      static_cast<long long>(curr_kf_id_);
+                  snapshot.oldest_active_frame_id =
+                      static_cast<long long>(lag_window_state.oldest_active_frame_id);
+
+                  const auto& optimizer_factors = cbs_optimizer_->getFactorsUnsafe();
+                  snapshot.active_factor_count =
+                      count_nonnull_factors(optimizer_factors);
+
+                  const auto& variable_index = cbs_optimizer_->getVariableIndex();
+                  snapshot.active_key_count = variable_index.size();
+                  std::unordered_set<gtsam::Key> variable_index_keys;
+                  variable_index_keys.reserve(variable_index.size());
+                  for (const auto& key_and_slots : variable_index) {
+                    variable_index_keys.insert(key_and_slots.first);
+                  }
+
+                  std::unordered_set<gtsam::Key> estimate_keys;
+                  estimate_keys.reserve(variable_index_keys.size());
+                  bool estimate_keys_available = true;
+                  try {
+                    const gtsam::Values estimate_values =
+                        cbs_optimizer_->calculateEstimate();
+                    estimate_keys.reserve(
+                        std::max(estimate_values.size(), variable_index_keys.size()));
+                    for (const auto& kv : estimate_values) {
+                      estimate_keys.insert(kv.key);
+                    }
+                  } catch (const std::exception&) {
+                    estimate_keys_available = false;
+                  }
+
+                  std::ostringstream value_keys_oss;
+                  std::ostringstream value_in_estimate_oss;
+                  std::ostringstream value_in_variable_index_oss;
+                  size_t value_index = 0u;
+                  std::unordered_set<gtsam::Key> stage_a_value_keys_set;
+                  stage_a_value_keys_set.reserve(stage_a_values.size());
+                  for (const auto& kv : stage_a_values) {
+                    const gtsam::Key key = kv.key;
+                    stage_a_value_keys_set.insert(key);
+                    const std::string key_label = sanitize_forensic_token(
+                        gtsam::DefaultKeyFormatter(key));
+                    const bool in_estimate =
+                        estimate_keys_available
+                            ? (estimate_keys.count(key) > 0u)
+                            : cbs_optimizer_->valueExists(key);
+                    const bool in_variable_index =
+                        variable_index_keys.count(key) > 0u;
+                    if (!in_estimate) {
+                      ++snapshot.stage_a_value_keys_missing_in_estimate_count;
+                    }
+                    if (!in_variable_index) {
+                      ++snapshot.stage_a_value_keys_missing_in_variable_index_count;
+                    }
+                    if (value_index > 0u) {
+                      value_keys_oss << ",";
+                      value_in_estimate_oss << ",";
+                      value_in_variable_index_oss << ",";
+                    }
+                    value_keys_oss << key_label;
+                    value_in_estimate_oss << key_label << ":" << (in_estimate ? 1 : 0);
+                    value_in_variable_index_oss << key_label << ":"
+                                                << (in_variable_index ? 1 : 0);
+                    ++value_index;
+                  }
+                  if (value_index > 0u) {
+                    snapshot.stage_a_value_keys = value_keys_oss.str();
+                    snapshot.stage_a_value_keys_in_estimate =
+                        value_in_estimate_oss.str();
+                    snapshot.stage_a_value_keys_in_variable_index =
+                        value_in_variable_index_oss.str();
+                  }
+
+                  std::unordered_set<gtsam::Key> stage_a_factor_keys_seen;
+                  for (const auto& factor_ptr : stage_a_factors) {
+                    if (!factor_ptr) {
+                      continue;
+                    }
+                    for (const gtsam::Key key : factor_ptr->keys()) {
+                      if (!stage_a_factor_keys_seen.insert(key).second) {
+                        continue;
+                      }
+                      if (stage_a_value_keys_set.count(key) > 0u) {
+                        continue;
+                      }
+                      const bool in_estimate =
+                          estimate_keys_available
+                              ? (estimate_keys.count(key) > 0u)
+                              : cbs_optimizer_->valueExists(key);
+                      const bool in_variable_index =
+                          variable_index_keys.count(key) > 0u;
+                      const bool missing_from_current_optimizer_state =
+                          !in_estimate || !in_variable_index;
+                      if (missing_from_current_optimizer_state) {
+                        ++snapshot
+                             .stage_a_factor_keys_missing_from_current_optimizer_state_count;
+                        if (snapshot.first_missing_stage_a_factor_key == "none") {
+                          snapshot.first_missing_stage_a_factor_key =
+                              sanitize_forensic_token(
+                                  gtsam::DefaultKeyFormatter(key));
+                        }
+                      }
+                    }
+                  }
+                  return snapshot;
+                };
+            const auto build_lag_boundary_state_cardinality_snapshot = [&]() {
+              LagBoundaryStateCardinalitySnapshot snapshot;
+              snapshot.curr_kf_id = static_cast<long long>(curr_kf_id_);
+              snapshot.newest_local_frame_id = static_cast<long long>(curr_kf_id_);
+              snapshot.oldest_active_frame_id =
+                  static_cast<long long>(lag_window_state.oldest_active_frame_id);
+
+              const auto& variable_index = cbs_optimizer_->getVariableIndex();
+              std::unordered_set<gtsam::Key> variable_index_keys;
+              variable_index_keys.reserve(variable_index.size());
+              for (const auto& key_and_slots : variable_index) {
+                variable_index_keys.insert(key_and_slots.first);
+              }
+
+              std::unordered_set<gtsam::Key> estimate_keys;
+              estimate_keys.reserve(variable_index_keys.size());
+              bool estimate_keys_available = true;
+              try {
+                const gtsam::Values estimate_values =
+                    cbs_optimizer_->calculateEstimate();
+                estimate_keys.reserve(
+                    std::max(estimate_values.size(), variable_index_keys.size()));
+                for (const auto& kv : estimate_values) {
+                  estimate_keys.insert(kv.key);
+                }
+              } catch (const std::exception&) {
+                estimate_keys_available = false;
+              }
+
+              const FrameId oldest_active_frame_id =
+                  lag_window_state.oldest_active_frame_id;
+              const FrameId newest_local_frame_id = curr_kf_id_;
+              if (newest_local_frame_id >= oldest_active_frame_id) {
+                const size_t active_frame_count = static_cast<size_t>(
+                    newest_local_frame_id - oldest_active_frame_id + 1u);
+                snapshot.expected_active_local_state_key_count =
+                    3u * active_frame_count;
+              }
+
+              long long first_stale_pose_frame = std::numeric_limits<long long>::max();
+              long long first_stale_vel_frame = std::numeric_limits<long long>::max();
+              long long first_stale_bias_frame = std::numeric_limits<long long>::max();
+              for (const auto& key_and_slots : variable_index) {
+                const gtsam::Key key = key_and_slots.first;
+                const gtsam::Symbol sym(key);
+                const char key_char = sym.chr();
+                if (key_char != kPoseSymbolChar && key_char != kVelocitySymbolChar &&
+                    key_char != kImuBiasSymbolChar) {
+                  continue;
+                }
+                const FrameId key_frame = static_cast<FrameId>(sym.index());
+                const bool key_below_oldest = key_frame < oldest_active_frame_id;
+                if (key_below_oldest) {
+                  ++snapshot.stale_local_state_key_count_below_oldest_active;
+                  const long long key_frame_ll =
+                      static_cast<long long>(key_frame);
+                  if (key_char == kPoseSymbolChar) {
+                    ++snapshot.stale_pose_key_count_below_oldest_active;
+                    if (key_frame_ll < first_stale_pose_frame) {
+                      first_stale_pose_frame = key_frame_ll;
+                      snapshot.first_stale_pose_key = sanitize_forensic_token(
+                          gtsam::DefaultKeyFormatter(key));
+                    }
+                  } else if (key_char == kVelocitySymbolChar) {
+                    ++snapshot.stale_vel_key_count_below_oldest_active;
+                    if (key_frame_ll < first_stale_vel_frame) {
+                      first_stale_vel_frame = key_frame_ll;
+                      snapshot.first_stale_vel_key = sanitize_forensic_token(
+                          gtsam::DefaultKeyFormatter(key));
+                    }
+                  } else if (key_char == kImuBiasSymbolChar) {
+                    ++snapshot.stale_bias_key_count_below_oldest_active;
+                    if (key_frame_ll < first_stale_bias_frame) {
+                      first_stale_bias_frame = key_frame_ll;
+                      snapshot.first_stale_bias_key = sanitize_forensic_token(
+                          gtsam::DefaultKeyFormatter(key));
+                    }
+                  }
+                } else if (key_frame <= newest_local_frame_id) {
+                  ++snapshot.actual_active_local_state_key_count;
+                }
+              }
+
+              if (oldest_active_frame_id > 0u) {
+                const FrameId prev_frame = oldest_active_frame_id - 1u;
+                const gtsam::Key prev_pose_key =
+                    gtsam::Symbol(kPoseSymbolChar, prev_frame).key();
+                const gtsam::Key prev_vel_key =
+                    gtsam::Symbol(kVelocitySymbolChar, prev_frame).key();
+                const gtsam::Key prev_bias_key =
+                    gtsam::Symbol(kImuBiasSymbolChar, prev_frame).key();
+
+                const auto in_estimate = [&](const gtsam::Key key) {
+                  return estimate_keys_available ? (estimate_keys.count(key) > 0u)
+                                                 : cbs_optimizer_->valueExists(key);
+                };
+                snapshot.x_prev_exists_in_estimate = in_estimate(prev_pose_key);
+                snapshot.v_prev_exists_in_estimate = in_estimate(prev_vel_key);
+                snapshot.b_prev_exists_in_estimate = in_estimate(prev_bias_key);
+                snapshot.x_prev_exists_in_variable_index =
+                    variable_index_keys.count(prev_pose_key) > 0u;
+                snapshot.v_prev_exists_in_variable_index =
+                    variable_index_keys.count(prev_vel_key) > 0u;
+                snapshot.b_prev_exists_in_variable_index =
+                    variable_index_keys.count(prev_bias_key) > 0u;
+
+                std::unordered_set<size_t> incident_slots;
+                const auto collect_incident_slots = [&](const gtsam::Key key) {
+                  const auto it = variable_index.find(key);
+                  if (it == variable_index.end()) {
+                    return;
+                  }
+                  for (const size_t slot : it->second) {
+                    incident_slots.insert(slot);
+                  }
+                };
+                collect_incident_slots(prev_pose_key);
+                collect_incident_slots(prev_vel_key);
+                collect_incident_slots(prev_bias_key);
+                snapshot.first_stale_frame_incident_factor_slot_count =
+                    incident_slots.size();
+              }
+              return snapshot;
+            };
+            const auto classify_pre_stage_a_inconsistency =
+                [](const PreStageAStateSnapshot& clean_snapshot,
+                    const bool clean_snapshot_available,
+                    const StageBPacketSnapshot& clean_packet_snapshot,
+                    const bool clean_packet_snapshot_available,
+                    const PreStageAStateSnapshot& fail_snapshot,
+                    const StageBPacketSnapshot& fail_packet_snapshot) {
+                  const auto value_missing_fail =
+                      fail_snapshot.stage_a_value_keys_missing_in_estimate_count +
+                      fail_snapshot
+                          .stage_a_value_keys_missing_in_variable_index_count;
+                  const auto value_missing_clean =
+                      clean_snapshot.stage_a_value_keys_missing_in_estimate_count +
+                      clean_snapshot
+                          .stage_a_value_keys_missing_in_variable_index_count;
+                  if (value_missing_fail >
+                      (clean_snapshot_available ? value_missing_clean : 0u)) {
+                    return std::string("missing_stage_a_value_key");
+                  }
+                  if (fail_snapshot
+                          .stage_a_factor_keys_missing_from_current_optimizer_state_count >
+                      (clean_snapshot_available
+                           ? clean_snapshot
+                                 .stage_a_factor_keys_missing_from_current_optimizer_state_count
+                           : 0u)) {
+                    return std::string("missing_stage_a_factor_key");
+                  }
+                  if (clean_snapshot_available &&
+                      fail_snapshot.active_key_count !=
+                          clean_snapshot.active_key_count) {
+                    return std::string("key_count_jump");
+                  }
+                  if (clean_packet_snapshot_available &&
+                      fail_packet_snapshot.factor_count !=
+                          clean_packet_snapshot.factor_count) {
+                    return std::string("factor_count_jump");
+                  }
+                  if (clean_packet_snapshot_available &&
+                      (fail_packet_snapshot.smart_factor_count !=
+                           clean_packet_snapshot.smart_factor_count ||
+                       fail_packet_snapshot.smart_factor_keys_first_few !=
+                           clean_packet_snapshot.smart_factor_keys_first_few)) {
+                    return std::string("smart_factor_shape_change");
+                  }
+                  if (clean_packet_snapshot_available &&
+                      (fail_packet_snapshot.imu_factor_count !=
+                           clean_packet_snapshot.imu_factor_count ||
+                       fail_packet_snapshot.imu_factor_keys_first_few !=
+                           clean_packet_snapshot.imu_factor_keys_first_few)) {
+                    return std::string("imu_factor_shape_change");
+                  }
+                  return std::string("other_structural");
+                };
+            const auto classify_post_stage_a_pre_stage_b_inconsistency =
+                [](const PostStageAPreStageBStateSnapshot& clean_snapshot,
+                    const bool clean_snapshot_available,
+                    const StageBPacketSnapshot& clean_packet_snapshot,
+                    const bool clean_packet_snapshot_available,
+                    const PostStageAPreStageBStateSnapshot& fail_snapshot,
+                    const StageBPacketSnapshot& fail_packet_snapshot) {
+                  const auto value_missing_fail =
+                      fail_snapshot.stage_b_value_keys_missing_in_estimate_count +
+                      fail_snapshot
+                          .stage_b_value_keys_missing_in_variable_index_count;
+                  const auto value_missing_clean =
+                      clean_snapshot.stage_b_value_keys_missing_in_estimate_count +
+                      clean_snapshot
+                          .stage_b_value_keys_missing_in_variable_index_count;
+                  if (value_missing_fail >
+                      (clean_snapshot_available ? value_missing_clean : 0u)) {
+                    return std::string("missing_stage_b_value_key");
+                  }
+                  if (fail_snapshot
+                          .stage_b_factor_keys_missing_from_current_optimizer_state_count >
+                      (clean_snapshot_available
+                           ? clean_snapshot
+                                 .stage_b_factor_keys_missing_from_current_optimizer_state_count
+                           : 0u)) {
+                    return std::string("missing_stage_b_factor_key");
+                  }
+                  if (clean_snapshot_available &&
+                      fail_snapshot.active_key_count_after_stage_a !=
+                          clean_snapshot.active_key_count_after_stage_a) {
+                    return std::string("key_count_jump");
+                  }
+                  if (clean_packet_snapshot_available &&
+                      fail_packet_snapshot.factor_count !=
+                          clean_packet_snapshot.factor_count) {
+                    return std::string("factor_count_jump");
+                  }
+                  if (clean_packet_snapshot_available &&
+                      (fail_packet_snapshot.smart_factor_count !=
+                           clean_packet_snapshot.smart_factor_count ||
+                       fail_packet_snapshot.smart_factor_keys_first_few !=
+                           clean_packet_snapshot.smart_factor_keys_first_few)) {
+                    return std::string("smart_factor_shape_change");
+                  }
+                  if (clean_packet_snapshot_available &&
+                      (fail_packet_snapshot.imu_factor_count !=
+                           clean_packet_snapshot.imu_factor_count ||
+                       fail_packet_snapshot.imu_factor_keys_first_few !=
+                           clean_packet_snapshot.imu_factor_keys_first_few)) {
+                    return std::string("imu_factor_shape_change");
+                  }
+                  if (!fail_snapshot.stage_a_completed_successfully) {
+                    return std::string("other_structural");
+                  }
+                  return std::string("other_structural");
+                };
+            const auto classify_stage_b_failure_cause =
+                [](const StageBPacketSnapshot& clean_snapshot,
+                    const StageBPacketSnapshot& fail_snapshot) {
+                  if (fail_snapshot.remove_overlap_delete_slots_count > 0u ||
+                      clean_snapshot.delete_slots_count !=
+                          fail_snapshot.delete_slots_count) {
+                    return std::string("delete_slot_interaction");
+                  }
+                  if (clean_snapshot.factor_count != fail_snapshot.factor_count ||
+                      clean_snapshot.factor_classes_first_few !=
+                          fail_snapshot.factor_classes_first_few ||
+                      clean_snapshot.factor_keys_first_few !=
+                          fail_snapshot.factor_keys_first_few) {
+                    return std::string("stage_b_new_factor_composition");
+                  }
+                  if (clean_snapshot.value_count != fail_snapshot.value_count ||
+                      clean_snapshot.value_keys_first_few !=
+                          fail_snapshot.value_keys_first_few) {
+                    return std::string("stage_b_value_composition");
+                  }
+                  if (clean_snapshot.remove_count != fail_snapshot.remove_count) {
+                    return std::string("delete_slot_interaction");
+                  }
+                  return std::string("bad_carryover_from_stage_a");
+                };
+            const auto describe_first_stage_b_difference =
+                [](const StageBPacketSnapshot& clean_snapshot,
+                    const StageBPacketSnapshot& fail_snapshot) {
+                  auto diff_pair = [](const std::string& field,
+                                      const std::string& clean_value,
+                                      const std::string& fail_value) {
+                    std::ostringstream oss;
+                    oss << field << ":" << clean_value << "->" << fail_value;
+                    return oss.str();
+                  };
+                  if (clean_snapshot.factor_count != fail_snapshot.factor_count) {
+                    return diff_pair("factor_count",
+                                     std::to_string(clean_snapshot.factor_count),
+                                     std::to_string(fail_snapshot.factor_count));
+                  }
+                  if (clean_snapshot.value_count != fail_snapshot.value_count) {
+                    return diff_pair("value_count",
+                                     std::to_string(clean_snapshot.value_count),
+                                     std::to_string(fail_snapshot.value_count));
+                  }
+                  if (clean_snapshot.remove_count != fail_snapshot.remove_count) {
+                    return diff_pair("remove_count",
+                                     std::to_string(clean_snapshot.remove_count),
+                                     std::to_string(fail_snapshot.remove_count));
+                  }
+                  if (clean_snapshot.delete_slots_count !=
+                      fail_snapshot.delete_slots_count) {
+                    return diff_pair(
+                        "delete_slots_count",
+                        std::to_string(clean_snapshot.delete_slots_count),
+                        std::to_string(fail_snapshot.delete_slots_count));
+                  }
+                  if (clean_snapshot.factor_classes_first_few !=
+                      fail_snapshot.factor_classes_first_few) {
+                    return diff_pair("factor_classes_first_few",
+                                     clean_snapshot.factor_classes_first_few,
+                                     fail_snapshot.factor_classes_first_few);
+                  }
+                  if (clean_snapshot.factor_keys_first_few !=
+                      fail_snapshot.factor_keys_first_few) {
+                    return diff_pair("factor_keys_first_few",
+                                     clean_snapshot.factor_keys_first_few,
+                                     fail_snapshot.factor_keys_first_few);
+                  }
+                  if (clean_snapshot.value_keys_first_few !=
+                      fail_snapshot.value_keys_first_few) {
+                    return diff_pair("value_keys_first_few",
+                                     clean_snapshot.value_keys_first_few,
+                                     fail_snapshot.value_keys_first_few);
+                  }
+                  return std::string("none");
+                };
+            const auto stage_b_class_count =
+                [](const StageBPacketSnapshot& snapshot,
+                    const std::string& factor_class) -> size_t {
+                  if (factor_class == "smart") {
+                    return snapshot.smart_factor_count;
+                  }
+                  if (factor_class == "imu") {
+                    return snapshot.imu_factor_count;
+                  }
+                  if (factor_class == "between") {
+                    return snapshot.between_factor_count;
+                  }
+                  if (factor_class == "prior") {
+                    return snapshot.prior_factor_count;
+                  }
+                  if (factor_class == "other") {
+                    return snapshot.other_factor_count;
+                  }
+                  return 0u;
+                };
+            const auto stage_b_class_keys_preview =
+                [](const StageBPacketSnapshot& snapshot,
+                    const std::string& factor_class) {
+                  if (factor_class == "smart") {
+                    return snapshot.smart_factor_keys_first_few;
+                  }
+                  if (factor_class == "imu") {
+                    return snapshot.imu_factor_keys_first_few;
+                  }
+                  if (factor_class == "between") {
+                    return snapshot.between_factor_keys_first_few;
+                  }
+                  if (factor_class == "prior") {
+                    return snapshot.prior_factor_keys_first_few;
+                  }
+                  if (factor_class == "other") {
+                    return snapshot.other_factor_keys_first_few;
+                  }
+                  return std::string("none");
+                };
+            const auto stage_b_signed_count_diff =
+                [&](const std::string& factor_class,
+                    const StageBPacketSnapshot& clean_snapshot,
+                    const StageBPacketSnapshot& fail_snapshot) {
+                  return static_cast<long long>(
+                             stage_b_class_count(fail_snapshot, factor_class)) -
+                         static_cast<long long>(
+                             stage_b_class_count(clean_snapshot, factor_class));
+                };
+            const auto format_stage_b_factor_class_count_diff =
+                [&](const StageBPacketSnapshot& clean_snapshot,
+                    const StageBPacketSnapshot& fail_snapshot) {
+                  std::ostringstream oss;
+                  oss << "smart:" << stage_b_signed_count_diff("smart",
+                                                              clean_snapshot,
+                                                              fail_snapshot)
+                      << "|imu:" << stage_b_signed_count_diff("imu",
+                                                             clean_snapshot,
+                                                             fail_snapshot)
+                      << "|between:"
+                      << stage_b_signed_count_diff("between",
+                                                   clean_snapshot,
+                                                   fail_snapshot)
+                      << "|prior:" << stage_b_signed_count_diff("prior",
+                                                               clean_snapshot,
+                                                               fail_snapshot)
+                      << "|other:" << stage_b_signed_count_diff("other",
+                                                               clean_snapshot,
+                                                               fail_snapshot);
+                  return oss.str();
+                };
+            const auto first_stage_b_diff_class =
+                [&](const StageBPacketSnapshot& clean_snapshot,
+                    const StageBPacketSnapshot& fail_snapshot,
+                    const bool request_missing_class) {
+                  const std::vector<std::string> class_order = {"smart",
+                                                                "imu",
+                                                                "between",
+                                                                "prior",
+                                                                "other"};
+                  for (const auto& factor_class : class_order) {
+                    const long long diff = stage_b_signed_count_diff(
+                        factor_class, clean_snapshot, fail_snapshot);
+                    if (request_missing_class) {
+                      if (diff < 0) {
+                        return factor_class;
+                      }
+                    } else {
+                      if (diff > 0) {
+                        return factor_class;
+                      }
+                    }
+                  }
+                  return std::string("none");
+                };
+            const auto classify_stage_b_composition_dominant_cause =
+                [&](const StageBPacketSnapshot& clean_snapshot,
+                    const StageBPacketSnapshot& fail_snapshot) {
+                  const long long smart_diff = stage_b_signed_count_diff(
+                      "smart", clean_snapshot, fail_snapshot);
+                  const long long imu_diff = stage_b_signed_count_diff(
+                      "imu", clean_snapshot, fail_snapshot);
+                  const long long between_diff = stage_b_signed_count_diff(
+                      "between", clean_snapshot, fail_snapshot);
+                  const long long prior_diff = stage_b_signed_count_diff(
+                      "prior", clean_snapshot, fail_snapshot);
+                  const long long total_diff =
+                      static_cast<long long>(fail_snapshot.factor_count) -
+                      static_cast<long long>(clean_snapshot.factor_count);
+                  const auto abs_ll = [](const long long value) {
+                    return value >= 0 ? value : -value;
+                  };
+                  const long long smart_abs = abs_ll(smart_diff);
+                  const long long imu_abs = abs_ll(imu_diff);
+                  const long long between_abs = abs_ll(between_diff);
+                  const long long prior_abs = abs_ll(prior_diff);
+                  if (smart_abs > 0 && smart_abs >= imu_abs &&
+                      smart_abs >= between_abs && smart_abs >= prior_abs) {
+                    return std::string("smart_factor_churn");
+                  }
+                  if (total_diff < 0) {
+                    return std::string("missing_expected_factors");
+                  }
+                  if (total_diff > 0) {
+                    return std::string("unexpected_extra_factors");
+                  }
+                  return std::string("bad_carryover_from_stage_a");
+                };
+
+            std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+                replay_metadata_map_raw =
+                    cbs_phase2_summary_covered_crossing_replay_metadata_map;
+            for (const auto& kv : cbs_phase2_direct_local_pending_replay_metadata_map) {
+              replay_metadata_map_raw[kv.first] = kv.second;
+            }
+            gtsam::FactorIndices replay_remove_slots_sorted;
+            replay_remove_slots_sorted.reserve(replay_metadata_map_raw.size());
+            for (const auto& kv : replay_metadata_map_raw) {
+              replay_remove_slots_sorted.push_back(kv.first);
+            }
+            std::sort(replay_remove_slots_sorted.begin(),
+                      replay_remove_slots_sorted.end());
+            cbs_phase2_summary_crossing_replay_requested_count =
+                replay_remove_slots_sorted.size();
+            const bool replay_into_stage_a_requested =
+                defer_summary_crossing_one_epoch_requested &&
+                enable_remove_factor_indices &&
+                cbs_phase2_two_stage_summary_crossing_mode;
+            cbs_phase2_replay_into_stage_a_mode = replay_into_stage_a_requested;
+            gtsam::FactorIndices replay_valid_slots_for_stage_a;
+            std::unordered_set<size_t> replay_valid_slots_for_stage_a_set;
+            gtsam::FactorIndices replay_resolved_direct_local_internal;
+            gtsam::FactorIndices replay_resolved_summary_covered_crossing;
+            gtsam::FactorIndices replay_resolved_deferred_unsupported;
+            gtsam::FactorIndices replay_resolved_unknown;
+            long long first_replay_routed_direct_local_internal_slot = -1;
+            std::string first_replay_routed_direct_local_internal_slot_class =
+                "none";
+            std::string first_replay_routed_direct_local_internal_slot_keys =
+                "none";
+            std::string first_replay_deferred_reason = "none";
+            size_t replay_direct_local_pending_queue_size_before_diag = 0u;
+            size_t replay_direct_local_removed_after_promotion_count_diag = 0u;
+            size_t replay_direct_local_reinserted_same_identity_count_diag = 0u;
+            size_t replay_direct_local_deduped_existing_pending_count_diag = 0u;
+            size_t replay_direct_local_removable_classified_count_diag = 0u;
+            size_t replay_direct_local_applied_and_consumed_count_diag = 0u;
+            size_t replay_direct_local_policy_deferred_count_diag = 0u;
+            size_t replay_direct_local_apply_candidate_count_diag = 0u;
+            size_t replay_direct_local_apply_attempted_count_diag = 0u;
+            size_t replay_direct_local_apply_succeeded_count_diag = 0u;
+            size_t replay_direct_local_apply_failed_count_diag = 0u;
+            size_t replay_direct_local_apply_ineligible_count_diag = 0u;
+            size_t replay_direct_local_apply_quarantined_count_diag = 0u;
+            size_t replay_direct_local_hard_quarantined_identity_count_diag = 0u;
+            size_t replay_direct_local_skipped_due_to_hard_quarantine_count_diag =
+                0u;
+            size_t replay_direct_local_failed_apply_candidate_count_diag = 0u;
+            size_t replay_direct_local_requeued_after_failed_apply_count_diag = 0u;
+            size_t replay_direct_local_dropped_after_failed_apply_count_diag = 0u;
+            std::string replay_direct_local_apply_stage_slots_first_few_diag =
+                "none";
+            std::string replay_direct_local_apply_stage_mode_diag =
+                "not_requested";
+            std::string replay_direct_local_apply_stage_first_failure_reason_diag =
+                "none";
+            bool replay_direct_local_apply_failure_audit_triggered_diag = false;
+            std::string replay_direct_local_apply_failure_stage_diag = "none";
+            std::string replay_direct_local_apply_failure_reason_diag = "none";
+            std::string replay_direct_local_apply_stage_a_remove_slots_first_few_diag =
+                "none";
+            std::string replay_direct_local_apply_failure_apply_stage_remove_slots_first_few_diag =
+                "none";
+            size_t replay_direct_local_apply_failure_pending_queue_size_before_diag =
+                0u;
+            size_t replay_direct_local_apply_failure_pending_queue_size_after_diag =
+                0u;
+            bool replay_direct_local_apply_requeue_diag_triggered = false;
+            long long replay_direct_local_first_requeued_slot_diag = -1;
+            std::string replay_direct_local_first_requeued_slot_class_diag = "none";
+            std::string replay_direct_local_first_requeued_slot_keys_diag = "none";
+            std::string replay_direct_local_requeue_reason_diag = "none";
+            std::string replay_direct_local_requeue_mode_diag = "not_triggered";
+            long long replay_direct_local_first_quarantined_slot_diag = -1;
+            std::string replay_direct_local_first_quarantined_slot_class_diag =
+                "none";
+            std::string replay_direct_local_first_quarantined_slot_keys_diag =
+                "none";
+            std::string replay_direct_local_quarantine_reason_diag = "none";
+            std::string replay_direct_local_quarantine_mode_diag = "not_triggered";
+            std::vector<std::string>
+                replay_direct_local_hard_quarantined_identity_first_few_diag;
+            gtsam::FactorIndices
+                replay_direct_local_skipped_due_to_hard_quarantine_slots_diag;
+            long long replay_direct_local_hard_quarantined_slot_diag = -1;
+            std::string replay_direct_local_hard_quarantined_slot_class_diag =
+                "none";
+            std::string replay_direct_local_hard_quarantined_slot_keys_diag = "none";
+            std::string replay_direct_local_hard_quarantine_reason_diag = "none";
+            bool replay_direct_local_apply_allowed_this_epoch_diag = false;
+            bool replay_direct_local_two_stage_summary_crossing_mode_diag = false;
+            std::string replay_direct_local_apply_policy_mode_diag = "not_requested";
+            size_t replay_removed_from_summary_replay_metadata_count_diag = 0u;
+            size_t replay_removed_from_summary_replay_queue_count_diag = 0u;
+            size_t replay_removed_from_direct_local_pending_queue_count_diag = 0u;
+            size_t replay_blocked_reenqueue_same_epoch_count_diag = 0u;
+            gtsam::FactorIndices replay_direct_local_promoted_this_epoch_diag;
+            gtsam::FactorIndices
+                replay_direct_local_applied_and_consumed_this_epoch_diag;
+            gtsam::FactorIndices replay_direct_local_still_blocked_diag;
+            long long first_promoted_removed_slot_diag = -1;
+            std::string first_promoted_removed_slot_class_diag = "none";
+            std::string first_promoted_removed_slot_keys_diag = "none";
+            long long replay_direct_local_first_policy_deferred_slot_diag = -1;
+            std::string
+                replay_direct_local_first_policy_deferred_slot_class_diag = "none";
+            std::string replay_direct_local_first_policy_deferred_slot_keys_diag =
+                "none";
+            std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+                replay_direct_local_apply_candidates_metadata;
+            gtsam::FactorIndices replay_direct_local_apply_candidate_slots;
+            std::unordered_set<std::string> replay_consumed_identity_set_epoch;
+            std::vector<std::string> replay_consumed_identity_first_few_diag;
+            const FrameId replay_unresolved_too_old_age_epochs =
+                std::max<FrameId>(static_cast<FrameId>(2 * backend_params_.nr_states_),
+                                  static_cast<FrameId>(100));
+            size_t replay_direct_local_terminal_applied_consumed_count_diag = 0u;
+            size_t replay_direct_local_terminal_hard_quarantine_count_diag = 0u;
+            size_t replay_direct_local_terminal_unresolved_too_old_count_diag =
+                0u;
+            std::string replay_direct_local_apply_contract_diag =
+                "post_stage_b_followup_remove_only";
+            std::string replay_direct_local_contract_mode_diag =
+                "authoritative_post_stage_b_contract";
+            const auto normalize_replay_metadata_for_lifecycle_identity =
+                [&](CbsSummaryCoveredCrossingReplayMetadata* metadata) {
+                  CHECK_NOTNULL(metadata);
+                  std::string factor_class = metadata->factor_class;
+                  if (metadata->factor_class == "imu") {
+                    factor_class = "imu_like";
+                  } else if (metadata->factor_class == "between") {
+                    factor_class = "binary";
+                  }
+                  if (factor_class.empty()) {
+                    factor_class = "none";
+                  }
+                  metadata->factor_class = factor_class;
+                  if (metadata->factor_keys.empty()) {
+                    metadata->factor_keys = "none";
+                  }
+                  if (metadata->blocking_incident_id.empty()) {
+                    metadata->blocking_incident_id = "none";
+                  }
+                  if (metadata->first_defer_epoch == 0u) {
+                    metadata->first_defer_epoch =
+                        metadata->defer_epoch == 0u ? curr_kf_id_
+                                                    : metadata->defer_epoch;
+                  }
+                };
+            const auto build_replay_lifecycle_identity =
+                [&](CbsSummaryCoveredCrossingReplayMetadata metadata) {
+                  normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                  std::ostringstream oss;
+                  oss << "class=" << metadata.factor_class
+                      << "|keys=" << metadata.factor_keys
+                      << "|incident=" << metadata.blocking_incident_id
+                      << "|first_defer_epoch=" << metadata.first_defer_epoch;
+                  return oss.str();
+                };
+            const auto format_replay_identity_preview =
+                [&](const std::vector<std::string>& identities,
+                    const size_t max_items) -> std::string {
+                  if (identities.empty()) {
+                    return "none";
+                  }
+                  std::ostringstream oss;
+                  const size_t limit = std::min(max_items, identities.size());
+                  for (size_t i = 0; i < limit; ++i) {
+                    if (i > 0u) {
+                      oss << ";";
+                    }
+                    oss << sanitize_forensic_token(identities[i]);
+                  }
+                  if (identities.size() > limit) {
+                    oss << ",...";
+                  }
+                  return sanitize_forensic_token(oss.str());
+                };
+            const auto erase_replay_identity_from_store =
+                [&](auto* store,
+                    const std::string& replay_identity,
+                    const size_t resolved_slot,
+                    const size_t raw_slot,
+                    size_t* removed_count) {
+                  CHECK_NOTNULL(store);
+                  CHECK_NOTNULL(removed_count);
+                  gtsam::FactorIndices erase_slots;
+                  erase_slots.reserve(store->size());
+                  for (const auto& kv : *store) {
+                    const size_t slot_key = static_cast<size_t>(kv.first);
+                    if (slot_key == resolved_slot || slot_key == raw_slot ||
+                        build_replay_lifecycle_identity(kv.second) ==
+                            replay_identity) {
+                      erase_slots.push_back(slot_key);
+                    }
+                  }
+                  std::sort(erase_slots.begin(), erase_slots.end());
+                  erase_slots.erase(
+                      std::unique(erase_slots.begin(), erase_slots.end()),
+                      erase_slots.end());
+                  for (const size_t erase_slot : erase_slots) {
+                    if (store->erase(erase_slot) > 0u) {
+                      ++(*removed_count);
+                    }
+                  }
+                };
+            const auto consume_replay_identity_from_all_stores =
+                [&](const size_t resolved_slot,
+                    CbsSummaryCoveredCrossingReplayMetadata metadata) {
+                  if (metadata.slot_id == 0u) {
+                    metadata.slot_id = resolved_slot;
+                  }
+                  normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                  const std::string replay_identity =
+                      build_replay_lifecycle_identity(metadata);
+                  if (replay_consumed_identity_set_epoch
+                          .insert(replay_identity)
+                          .second &&
+                      replay_consumed_identity_first_few_diag.size() < 8u) {
+                    replay_consumed_identity_first_few_diag.push_back(
+                        replay_identity);
+                  }
+                  erase_replay_identity_from_store(
+                      &cbs_phase2_summary_covered_crossing_replay_metadata_map,
+                      replay_identity,
+                      resolved_slot,
+                      metadata.slot_id,
+                      &replay_removed_from_summary_replay_metadata_count_diag);
+                  erase_replay_identity_from_store(
+                      &cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_,
+                      replay_identity,
+                      resolved_slot,
+                      metadata.slot_id,
+                      &replay_removed_from_summary_replay_queue_count_diag);
+                  erase_replay_identity_from_store(
+                      &cbs_phase2_direct_local_pending_one_epoch_replay_queue_,
+                      replay_identity,
+                      resolved_slot,
+                      metadata.slot_id,
+                      &replay_removed_from_direct_local_pending_queue_count_diag);
+                  cbs_phase2_direct_local_applied_consumed_terminal_identity_store
+                      .insert(replay_identity);
+                  cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store
+                      .erase(replay_identity);
+                  cbs_phase2_direct_local_hard_quarantine_identity_store.erase(
+                      replay_identity);
+                };
+            const auto is_replay_identity_consumed_this_epoch =
+                [&](CbsSummaryCoveredCrossingReplayMetadata metadata) {
+                  normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                  const std::string replay_identity =
+                      build_replay_lifecycle_identity(metadata);
+                  return replay_consumed_identity_set_epoch.count(
+                             replay_identity) > 0u;
+                };
+            const auto is_replay_identity_terminal_applied_consumed =
+                [&](CbsSummaryCoveredCrossingReplayMetadata metadata,
+                    std::string* out_identity) {
+                  normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                  const std::string replay_identity =
+                      build_replay_lifecycle_identity(metadata);
+                  if (out_identity) {
+                    *out_identity = replay_identity;
+                  }
+                  return cbs_phase2_direct_local_applied_consumed_terminal_identity_store
+                             .count(replay_identity) > 0u;
+                };
+            const auto is_replay_identity_terminal_unresolved_too_old =
+                [&](CbsSummaryCoveredCrossingReplayMetadata metadata,
+                    std::string* out_identity) {
+                  normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                  const std::string replay_identity =
+                      build_replay_lifecycle_identity(metadata);
+                  if (out_identity) {
+                    *out_identity = replay_identity;
+                  }
+                  return cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store
+                             .count(replay_identity) > 0u;
+                };
+            const auto is_direct_local_identity_hard_quarantined =
+                [&](CbsSummaryCoveredCrossingReplayMetadata metadata,
+                    std::string* out_identity) {
+                  normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                  const std::string replay_identity =
+                      build_replay_lifecycle_identity(metadata);
+                  if (out_identity) {
+                    *out_identity = replay_identity;
+                  }
+                  return cbs_phase2_direct_local_hard_quarantine_identity_store
+                             .count(replay_identity) > 0u;
+                };
+            replay_direct_local_terminal_applied_consumed_count_diag =
+                cbs_phase2_direct_local_applied_consumed_terminal_identity_store
+                    .size();
+            replay_direct_local_terminal_hard_quarantine_count_diag =
+                cbs_phase2_direct_local_hard_quarantine_identity_store.size();
+            replay_direct_local_terminal_unresolved_too_old_count_diag =
+                cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store
+                    .size();
+            if (replay_into_stage_a_requested &&
+                !replay_metadata_map_raw.empty()) {
+              const gtsam::NonlinearFactorGraph& replay_factors =
+                  cbs_optimizer_->getFactorsUnsafe();
+              const auto normalize_replay_descriptor_class =
+                  [](std::string cls) {
+                    if (cls == "imu") {
+                      return std::string("imu_like");
+                    }
+                    if (cls == "between") {
+                      return std::string("binary");
+                    }
+                    if (cls.empty()) {
+                      return std::string("none");
+                    }
+                    return cls;
+                  };
+              const auto classify_current_slot_replay_descriptor_class =
+                  [&](const size_t slot) {
+                    if (!replay_factors.exists(slot) || !replay_factors.at(slot)) {
+                      return std::string("other");
+                    }
+                    return normalize_replay_descriptor_class(
+                        classify_forensic_remove_factor_class(
+                            replay_factors.at(slot)));
+                  };
+              struct ReplayDescriptor {
+                size_t raw_slot = 0u;
+                CbsSummaryCoveredCrossingReplayMetadata metadata;
+              };
+              std::vector<ReplayDescriptor> replay_descriptors;
+              replay_descriptors.reserve(replay_metadata_map_raw.size());
+              for (const auto& kv : replay_metadata_map_raw) {
+                ReplayDescriptor descriptor;
+                descriptor.raw_slot = kv.first;
+                descriptor.metadata = kv.second;
+                if (descriptor.metadata.slot_id == 0u) {
+                  descriptor.metadata.slot_id = kv.first;
+                }
+                if (descriptor.metadata.factor_class.empty() ||
+                    descriptor.metadata.factor_class == "none" ||
+                    descriptor.metadata.factor_keys.empty() ||
+                    descriptor.metadata.factor_keys == "none") {
+                  if (replay_factors.exists(kv.first) && replay_factors.at(kv.first)) {
+                    descriptor.metadata.factor_class =
+                        classify_current_slot_replay_descriptor_class(kv.first);
+                    descriptor.metadata.factor_keys =
+                        format_factor_keys_for_slot(replay_factors, kv.first);
+                  }
+                }
+                descriptor.metadata.factor_class =
+                    normalize_replay_descriptor_class(
+                        descriptor.metadata.factor_class);
+                if (descriptor.metadata.replay_path.empty() ||
+                    descriptor.metadata.replay_path == "none") {
+                  descriptor.metadata.replay_path = "summary_crossing";
+                }
+                if (descriptor.metadata.pending_reason.empty()) {
+                  descriptor.metadata.pending_reason = "none";
+                }
+                if (descriptor.metadata.first_defer_epoch == 0u) {
+                  descriptor.metadata.first_defer_epoch =
+                      descriptor.metadata.defer_epoch;
+                }
+                if (descriptor.metadata.blocking_key.empty()) {
+                  descriptor.metadata.blocking_key = "none";
+                }
+                if (descriptor.metadata.blocking_support_slot_class.empty()) {
+                  descriptor.metadata.blocking_support_slot_class = "none";
+                }
+                if (descriptor.metadata.blocking_support_slot_keys.empty()) {
+                  descriptor.metadata.blocking_support_slot_keys = "none";
+                }
+                std::string descriptor_identity;
+                if (is_replay_identity_terminal_applied_consumed(
+                        descriptor.metadata, &descriptor_identity) ||
+                    is_replay_identity_terminal_unresolved_too_old(
+                        descriptor.metadata, &descriptor_identity)) {
+                  ++replay_blocked_reenqueue_same_epoch_count_diag;
+                  continue;
+                }
+                replay_descriptors.push_back(std::move(descriptor));
+              }
+              std::sort(replay_descriptors.begin(),
+                        replay_descriptors.end(),
+                        [](const ReplayDescriptor& lhs,
+                           const ReplayDescriptor& rhs) {
+                          return lhs.raw_slot < rhs.raw_slot;
+                        });
+              replay_remove_slots_sorted.clear();
+              replay_remove_slots_sorted.reserve(replay_descriptors.size());
+              for (const ReplayDescriptor& descriptor : replay_descriptors) {
+                replay_remove_slots_sorted.push_back(descriptor.raw_slot);
+              }
+              cbs_phase2_summary_crossing_replay_requested_count =
+                  replay_descriptors.size();
+              auto build_replay_descriptor_signature =
+                  [](const std::string& factor_class,
+                     const std::string& factor_keys) {
+                    return factor_class + "||" + factor_keys;
+                  };
+              std::unordered_map<std::string, gtsam::FactorIndices>
+                  current_slots_by_descriptor;
+              for (size_t slot = 0u; slot < replay_factors.size(); ++slot) {
+                if (!replay_factors.exists(slot) || !replay_factors.at(slot)) {
+                  continue;
+                }
+                const std::string signature =
+                    build_replay_descriptor_signature(
+                        classify_current_slot_replay_descriptor_class(slot),
+                        format_factor_keys_for_slot(replay_factors, slot));
+                current_slots_by_descriptor[signature].push_back(slot);
+              }
+              for (auto& kv : current_slots_by_descriptor) {
+                std::sort(kv.second.begin(), kv.second.end());
+              }
+              std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+                  replay_metadata_map_resolved;
+              std::unordered_map<size_t, CbsSummaryCoveredCrossingReplayMetadata>
+                  replay_metadata_map_deferred_unresolved;
+              std::unordered_map<size_t, size_t>
+                  replay_resolved_slot_to_raw_slot;
+              size_t replay_descriptor_resolved_count = 0u;
+              size_t replay_descriptor_unresolved_count = 0u;
+              size_t replay_descriptor_ambiguous_count = 0u;
+              std::string replay_first_unresolved_descriptor_class = "none";
+              std::string replay_first_unresolved_descriptor_keys = "none";
+              std::string replay_first_unresolved_reason = "none";
+              const auto note_first_unresolved_descriptor =
+                  [&](const ReplayDescriptor& descriptor,
+                      const std::string& unresolved_reason) {
+                    if (replay_first_unresolved_reason != "none") {
+                      return;
+                    }
+                    replay_first_unresolved_descriptor_class =
+                        sanitize_forensic_token(descriptor.metadata.factor_class);
+                    replay_first_unresolved_descriptor_keys =
+                        sanitize_forensic_token(descriptor.metadata.factor_keys);
+                    replay_first_unresolved_reason =
+                        sanitize_forensic_token(unresolved_reason);
+                  };
+              const auto format_replay_slot_execution_diag =
+                  [&](const gtsam::FactorIndices& slots,
+                      const size_t max_items) -> std::string {
+                if (slots.empty()) {
+                  return "none";
+                }
+                std::ostringstream oss;
+                const size_t limit = std::min(max_items, slots.size());
+                for (size_t i = 0; i < limit; ++i) {
+                  const size_t slot = slots[i];
+                  const bool exists = replay_factors.exists(slot);
+                  const bool nonnull = exists && replay_factors.at(slot);
+                  std::string metadata_class = "none";
+                  std::string metadata_keys = "none";
+                  long long metadata_defer_epoch = -1;
+                  const auto metadata_it =
+                      replay_metadata_map_raw.find(
+                          slot);
+                  const auto metadata_resolved_it =
+                      replay_metadata_map_resolved.find(slot);
+                  if (metadata_resolved_it != replay_metadata_map_resolved.end()) {
+                    metadata_class = sanitize_forensic_token(
+                        metadata_resolved_it->second.factor_class);
+                    metadata_keys = sanitize_forensic_token(
+                        metadata_resolved_it->second.factor_keys);
+                    metadata_defer_epoch =
+                        static_cast<long long>(
+                            metadata_resolved_it->second.defer_epoch);
+                  } else if (metadata_it != replay_metadata_map_raw.end()) {
+                    metadata_class = sanitize_forensic_token(
+                        metadata_it->second.factor_class);
+                    metadata_keys =
+                        sanitize_forensic_token(metadata_it->second.factor_keys);
+                    metadata_defer_epoch =
+                        static_cast<long long>(metadata_it->second.defer_epoch);
+                  } else {
+                    const auto metadata_deferred_it =
+                        replay_metadata_map_deferred_unresolved.find(slot);
+                    if (metadata_deferred_it !=
+                        replay_metadata_map_deferred_unresolved.end()) {
+                      metadata_class = sanitize_forensic_token(
+                          metadata_deferred_it->second.factor_class);
+                      metadata_keys = sanitize_forensic_token(
+                          metadata_deferred_it->second.factor_keys);
+                      metadata_defer_epoch = static_cast<long long>(
+                          metadata_deferred_it->second.defer_epoch);
+                    }
+                  }
+                  std::string execution_factor_type = "missing_slot";
+                  std::string execution_factor_keys = "none";
+                  if (nonnull) {
+                    execution_factor_type = sanitize_forensic_token(
+                        classify_forensic_remove_factor_class(
+                            replay_factors.at(slot)));
+                    execution_factor_keys = sanitize_forensic_token(
+                        format_factor_keys_for_slot(replay_factors, slot));
+                  }
+                  if (i > 0u) {
+                    oss << ";";
+                  }
+                  oss << "slot=" << slot
+                      << "|defer_epoch=" << metadata_defer_epoch
+                      << "|exists=" << (exists ? 1 : 0)
+                      << "|nonnull=" << (nonnull ? 1 : 0)
+                      << "|metadata_class=" << metadata_class
+                      << "|metadata_keys=" << metadata_keys
+                      << "|exec_factor_type=" << execution_factor_type
+                      << "|exec_factor_keys=" << execution_factor_keys;
+                }
+                if (slots.size() > limit) {
+                  oss << ";...";
+                }
+                return oss.str();
+              };
+              gtsam::FactorIndices replay_valid_slots;
+              replay_valid_slots.reserve(replay_descriptors.size());
+              gtsam::FactorIndices replay_invalid_slots;
+              replay_invalid_slots.reserve(replay_descriptors.size());
+              for (const ReplayDescriptor& descriptor : replay_descriptors) {
+                const size_t slot = descriptor.raw_slot;
+                bool replay_age_exactly_one = false;
+                if (descriptor.metadata.defer_epoch <=
+                    static_cast<FrameId>(curr_kf_id_)) {
+                  replay_age_exactly_one =
+                      descriptor.metadata.defer_epoch + 1u ==
+                      static_cast<FrameId>(curr_kf_id_);
+                }
+                CbsSummaryCoveredCrossingReplayMetadata deferred_metadata =
+                    descriptor.metadata;
+                deferred_metadata.slot_id = descriptor.raw_slot;
+                if (deferred_metadata.first_defer_epoch == 0u) {
+                  deferred_metadata.first_defer_epoch =
+                      deferred_metadata.defer_epoch;
+                }
+                deferred_metadata.defer_epoch = curr_kf_id_;
+                if (!replay_age_exactly_one) {
+                  replay_invalid_slots.push_back(slot);
+                  ++replay_descriptor_unresolved_count;
+                  replay_metadata_map_deferred_unresolved[descriptor.raw_slot] =
+                      deferred_metadata;
+                  note_first_unresolved_descriptor(descriptor,
+                                                   "replay_age_not_one_epoch");
+                  if (cbs_phase2_summary_crossing_replay_first_invalid_slot < 0) {
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot =
+                        static_cast<long long>(descriptor.raw_slot);
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot_class =
+                        sanitize_forensic_token(descriptor.metadata.factor_class);
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot_keys =
+                        sanitize_forensic_token(descriptor.metadata.factor_keys);
+                    cbs_phase2_summary_crossing_replay_first_invalid_reason =
+                        "replay_age_not_one_epoch";
+                  }
+                  continue;
+                }
+                const std::string factor_class =
+                    normalize_replay_descriptor_class(
+                        descriptor.metadata.factor_class).empty()
+                        ? std::string("none")
+                        : normalize_replay_descriptor_class(
+                              descriptor.metadata.factor_class);
+                const std::string factor_keys =
+                    descriptor.metadata.factor_keys.empty()
+                        ? std::string("none")
+                        : descriptor.metadata.factor_keys;
+                const std::string descriptor_signature =
+                    build_replay_descriptor_signature(factor_class, factor_keys);
+                const auto matches_it =
+                    current_slots_by_descriptor.find(descriptor_signature);
+                size_t match_count = 0u;
+                if (matches_it != current_slots_by_descriptor.end()) {
+                  match_count = matches_it->second.size();
+                }
+                if (match_count == 1u) {
+                  const size_t resolved_slot = matches_it->second.front();
+                  replay_valid_slots.push_back(resolved_slot);
+                  replay_metadata_map_resolved[resolved_slot] = descriptor.metadata;
+                  replay_metadata_map_resolved[resolved_slot].slot_id =
+                      descriptor.raw_slot;
+                  replay_resolved_slot_to_raw_slot[resolved_slot] =
+                      descriptor.raw_slot;
+                  ++replay_descriptor_resolved_count;
+                  continue;
+                }
+                replay_invalid_slots.push_back(slot);
+                if (match_count == 0u) {
+                  ++replay_descriptor_unresolved_count;
+                  replay_metadata_map_deferred_unresolved[descriptor.raw_slot] =
+                      deferred_metadata;
+                  note_first_unresolved_descriptor(descriptor,
+                                                   "unresolved_current_slot");
+                  if (cbs_phase2_summary_crossing_replay_first_invalid_slot < 0) {
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot =
+                        static_cast<long long>(descriptor.raw_slot);
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot_class =
+                        sanitize_forensic_token(descriptor.metadata.factor_class);
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot_keys =
+                        sanitize_forensic_token(descriptor.metadata.factor_keys);
+                    cbs_phase2_summary_crossing_replay_first_invalid_reason =
+                        "unresolved_current_slot";
+                  }
+                } else {
+                  ++replay_descriptor_ambiguous_count;
+                  replay_metadata_map_deferred_unresolved[descriptor.raw_slot] =
+                      deferred_metadata;
+                  note_first_unresolved_descriptor(descriptor,
+                                                   "ambiguous_current_slot");
+                  if (cbs_phase2_summary_crossing_replay_first_invalid_slot < 0) {
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot =
+                        static_cast<long long>(descriptor.raw_slot);
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot_class =
+                        sanitize_forensic_token(descriptor.metadata.factor_class);
+                    cbs_phase2_summary_crossing_replay_first_invalid_slot_keys =
+                        sanitize_forensic_token(descriptor.metadata.factor_keys);
+                    cbs_phase2_summary_crossing_replay_first_invalid_reason =
+                        "ambiguous_current_slot";
+                  }
+                }
+              }
+              std::sort(replay_valid_slots.begin(), replay_valid_slots.end());
+              replay_valid_slots.erase(
+                  std::unique(replay_valid_slots.begin(), replay_valid_slots.end()),
+                  replay_valid_slots.end());
+              const bool direct_local_apply_allowed_this_epoch =
+                  !cbs_phase2_diag_defer_direct_local_internal_only ||
+                  cbs_phase2_replay_into_stage_a_mode;
+              replay_direct_local_apply_allowed_this_epoch_diag =
+                  direct_local_apply_allowed_this_epoch;
+              replay_direct_local_two_stage_summary_crossing_mode_diag =
+                  cbs_phase2_two_stage_summary_crossing_mode;
+              replay_direct_local_apply_policy_mode_diag =
+                  direct_local_apply_allowed_this_epoch
+                      ? (cbs_phase2_diag_defer_direct_local_internal_only
+                             ? "apply_replay_direct_local_removable_in_replay_mode_despite_diag_defer"
+                             : "apply_direct_local_removable_even_when_two_stage")
+                      : "policy_defer_direct_local_removable_due_to_diag_defer_mode";
+              const size_t replay_direct_local_pending_queue_size_before =
+                  cbs_phase2_direct_local_pending_replay_metadata_map.size();
+              size_t replay_direct_local_removed_from_pending_after_promotion_count =
+                  0u;
+              size_t replay_direct_local_reinserted_same_identity_count = 0u;
+              size_t replay_direct_local_deduped_existing_pending_count = 0u;
+              long long first_promoted_removed_slot = -1;
+              std::string first_promoted_removed_slot_class = "none";
+              std::string first_promoted_removed_slot_keys = "none";
+              long long first_policy_deferred_slot = -1;
+              std::string first_policy_deferred_slot_class = "none";
+              std::string first_policy_deferred_slot_keys = "none";
+              std::unordered_set<std::string>
+                  replay_direct_local_promoted_identity_set;
+              const auto get_replay_metadata_for_slot =
+                  [&](const size_t slot) {
+                    CbsSummaryCoveredCrossingReplayMetadata metadata;
+                    const auto resolved_it =
+                        replay_metadata_map_resolved.find(slot);
+                    if (resolved_it != replay_metadata_map_resolved.end()) {
+                      metadata = resolved_it->second;
+                    } else {
+                      metadata.slot_id = slot;
+                      if (replay_factors.exists(slot) && replay_factors.at(slot)) {
+                        metadata.factor_class =
+                            classify_current_slot_replay_descriptor_class(slot);
+                        metadata.factor_keys =
+                            format_factor_keys_for_slot(replay_factors, slot);
+                      } else {
+                        metadata.factor_class = "missing_slot";
+                        metadata.factor_keys = "none";
+                      }
+                    }
+                    if (metadata.slot_id == 0u) {
+                      metadata.slot_id = slot;
+                    }
+                    if (metadata.factor_class.empty() ||
+                        metadata.factor_class == "none") {
+                      metadata.factor_class =
+                          classify_current_slot_replay_descriptor_class(slot);
+                    }
+                    if (metadata.factor_keys.empty() ||
+                        metadata.factor_keys == "none") {
+                      if (replay_factors.exists(slot) && replay_factors.at(slot)) {
+                        metadata.factor_keys =
+                            format_factor_keys_for_slot(replay_factors, slot);
+                      } else {
+                        metadata.factor_keys = "none";
+                      }
+                    }
+                    metadata.factor_class =
+                        normalize_replay_descriptor_class(metadata.factor_class);
+                    if (metadata.factor_class.empty()) {
+                      metadata.factor_class = "none";
+                    }
+                    if (metadata.factor_keys.empty()) {
+                      metadata.factor_keys = "none";
+                    }
+                    if (metadata.replay_path.empty() ||
+                        metadata.replay_path == "none") {
+                      metadata.replay_path = "summary_crossing";
+                    }
+                    if (metadata.pending_reason.empty()) {
+                      metadata.pending_reason = "none";
+                    }
+                    if (metadata.first_defer_epoch == 0u) {
+                      metadata.first_defer_epoch = metadata.defer_epoch;
+                    }
+                    if (metadata.blocking_key.empty()) {
+                      metadata.blocking_key = "none";
+                    }
+                    if (metadata.blocking_support_slot_class.empty()) {
+                      metadata.blocking_support_slot_class = "none";
+                    }
+                    if (metadata.blocking_support_slot_keys.empty()) {
+                      metadata.blocking_support_slot_keys = "none";
+                    }
+                    if (metadata.blocking_incident_id.empty()) {
+                      metadata.blocking_incident_id = "none";
+                    }
+                    if (metadata.blocking_incident_member_slots.empty()) {
+                      metadata.blocking_incident_member_slots = "none";
+                    }
+                    return metadata;
+                  };
+              const auto normalize_replay_metadata_for_pending_identity =
+                  [&](CbsSummaryCoveredCrossingReplayMetadata* metadata) {
+                    CHECK_NOTNULL(metadata);
+                    metadata->factor_class =
+                        normalize_replay_descriptor_class(metadata->factor_class);
+                    if (metadata->factor_class.empty()) {
+                      metadata->factor_class = "none";
+                    }
+                    if (metadata->factor_keys.empty()) {
+                      metadata->factor_keys = "none";
+                    }
+                    if (metadata->blocking_incident_id.empty()) {
+                      metadata->blocking_incident_id = "none";
+                    }
+                    if (metadata->first_defer_epoch == 0u) {
+                      metadata->first_defer_epoch =
+                          metadata->defer_epoch == 0u ? curr_kf_id_
+                                                      : metadata->defer_epoch;
+                    }
+                  };
+              const auto build_direct_local_pending_identity =
+                  [&](CbsSummaryCoveredCrossingReplayMetadata metadata) {
+                    normalize_replay_metadata_for_pending_identity(&metadata);
+                    std::ostringstream oss;
+                    oss << "class=" << metadata.factor_class
+                        << "|keys=" << metadata.factor_keys
+                        << "|incident=" << metadata.blocking_incident_id
+                        << "|first_defer_epoch=" << metadata.first_defer_epoch;
+                    return oss.str();
+                  };
+              const auto upsert_direct_local_pending_metadata =
+                  [&](CbsSummaryCoveredCrossingReplayMetadata metadata) {
+                    if (metadata.slot_id == 0u) {
+                      return;
+                    }
+                    normalize_replay_metadata_for_pending_identity(&metadata);
+                    const std::string metadata_identity =
+                        build_direct_local_pending_identity(metadata);
+                    if (cbs_phase2_direct_local_applied_consumed_terminal_identity_store
+                            .count(metadata_identity) > 0u ||
+                        cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store
+                            .count(metadata_identity) > 0u) {
+                      ++replay_blocked_reenqueue_same_epoch_count_diag;
+                      return;
+                    }
+                    if (replay_consumed_identity_set_epoch.count(
+                            metadata_identity) > 0u) {
+                      ++replay_blocked_reenqueue_same_epoch_count_diag;
+                      return;
+                    }
+                    if (replay_direct_local_promoted_identity_set.count(
+                            metadata_identity) > 0u) {
+                      ++replay_direct_local_reinserted_same_identity_count;
+                      return;
+                    }
+                    for (auto it =
+                             cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                                 .begin();
+                         it != cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                                   .end();
+                         ++it) {
+                      const std::string queued_identity =
+                          build_direct_local_pending_identity(it->second);
+                      if (queued_identity != metadata_identity) {
+                        continue;
+                      }
+                      auto& existing = it->second;
+                      if (existing.first_defer_epoch == 0u) {
+                        existing.first_defer_epoch = metadata.first_defer_epoch;
+                      } else {
+                        existing.first_defer_epoch =
+                            std::min(existing.first_defer_epoch,
+                                     metadata.first_defer_epoch);
+                      }
+                      existing.defer_epoch = curr_kf_id_;
+                      existing.factor_class = metadata.factor_class;
+                      existing.factor_keys = metadata.factor_keys;
+                      existing.replay_path = "direct_local_pending";
+                      existing.pending_reason = metadata.pending_reason;
+                      existing.blocking_key = metadata.blocking_key;
+                      existing.blocking_support_slot =
+                          metadata.blocking_support_slot;
+                      existing.blocking_support_slot_class =
+                          metadata.blocking_support_slot_class;
+                      existing.blocking_support_slot_keys =
+                          metadata.blocking_support_slot_keys;
+                      existing.blocking_incident_id =
+                          metadata.blocking_incident_id;
+                      existing.blocking_incident_member_slots =
+                          metadata.blocking_incident_member_slots;
+                      ++replay_direct_local_deduped_existing_pending_count;
+                      return;
+                    }
+                    auto existing_it =
+                        cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                            .find(metadata.slot_id);
+                    if (existing_it !=
+                        cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                            .end()) {
+                      auto& existing = existing_it->second;
+                      if (existing.first_defer_epoch == 0u) {
+                        existing.first_defer_epoch = metadata.first_defer_epoch;
+                      } else {
+                        existing.first_defer_epoch =
+                            std::min(existing.first_defer_epoch,
+                                     metadata.first_defer_epoch);
+                      }
+                      existing.defer_epoch = curr_kf_id_;
+                      existing.factor_class = metadata.factor_class;
+                      existing.factor_keys = metadata.factor_keys;
+                      existing.replay_path = "direct_local_pending";
+                      existing.pending_reason = metadata.pending_reason;
+                      existing.blocking_key = metadata.blocking_key;
+                      existing.blocking_support_slot =
+                          metadata.blocking_support_slot;
+                      existing.blocking_support_slot_class =
+                          metadata.blocking_support_slot_class;
+                      existing.blocking_support_slot_keys =
+                          metadata.blocking_support_slot_keys;
+                      existing.blocking_incident_id =
+                          metadata.blocking_incident_id;
+                      existing.blocking_incident_member_slots =
+                          metadata.blocking_incident_member_slots;
+                      ++replay_direct_local_deduped_existing_pending_count;
+                      return;
+                    }
+                    cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                        [metadata.slot_id] = metadata;
+                  };
+              const auto note_first_replay_routed_direct_local_internal =
+                  [&](const size_t slot) {
+                    if (first_replay_routed_direct_local_internal_slot >= 0) {
+                      return;
+                    }
+                    first_replay_routed_direct_local_internal_slot =
+                        static_cast<long long>(slot);
+                    const auto metadata = get_replay_metadata_for_slot(slot);
+                    first_replay_routed_direct_local_internal_slot_class =
+                        sanitize_forensic_token(metadata.factor_class);
+                    first_replay_routed_direct_local_internal_slot_keys =
+                        sanitize_forensic_token(metadata.factor_keys);
+                  };
+              const auto defer_replay_descriptor_to_summary_queue =
+                  [&](const size_t slot, const std::string& reason) {
+                    auto metadata = get_replay_metadata_for_slot(slot);
+                    const auto raw_slot_it =
+                        replay_resolved_slot_to_raw_slot.find(slot);
+                    if (raw_slot_it != replay_resolved_slot_to_raw_slot.end()) {
+                      metadata.slot_id = raw_slot_it->second;
+                    }
+                    if (metadata.first_defer_epoch == 0u) {
+                      metadata.first_defer_epoch =
+                          metadata.defer_epoch == 0u ? curr_kf_id_
+                                                     : metadata.defer_epoch;
+                    }
+                    metadata.defer_epoch = curr_kf_id_;
+                    metadata.replay_path = "summary_crossing";
+                    metadata.pending_reason = reason;
+                    metadata.blocking_key = "none";
+                    metadata.blocking_support_slot = -1;
+                    metadata.blocking_support_slot_class = "none";
+                    metadata.blocking_support_slot_keys = "none";
+                    metadata.blocking_incident_id = "none";
+                    metadata.blocking_incident_member_slots = "none";
+                    if (is_replay_identity_consumed_this_epoch(metadata)) {
+                      ++replay_blocked_reenqueue_same_epoch_count_diag;
+                      return;
+                    }
+                    std::string metadata_identity;
+                    if (is_replay_identity_terminal_applied_consumed(metadata,
+                                                                     &metadata_identity) ||
+                        is_replay_identity_terminal_unresolved_too_old(
+                            metadata, &metadata_identity)) {
+                      ++replay_blocked_reenqueue_same_epoch_count_diag;
+                      return;
+                    }
+                    cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_
+                        [metadata.slot_id] = metadata;
+                    if (first_replay_deferred_reason == "none") {
+                      first_replay_deferred_reason =
+                          sanitize_forensic_token(reason);
+                    }
+                  };
+              const auto defer_replay_descriptor_to_direct_local_pending_queue =
+                  [&](const size_t slot,
+                      const std::string& reason,
+                      const std::string& blocking_key,
+                      const long long blocking_support_slot,
+                      const std::string& blocking_support_slot_class,
+                      const std::string& blocking_support_slot_keys) {
+                    auto metadata = get_replay_metadata_for_slot(slot);
+                    const auto raw_slot_it =
+                        replay_resolved_slot_to_raw_slot.find(slot);
+                    if (raw_slot_it != replay_resolved_slot_to_raw_slot.end()) {
+                      metadata.slot_id = raw_slot_it->second;
+                    }
+                    if (metadata.first_defer_epoch == 0u) {
+                      metadata.first_defer_epoch =
+                          metadata.defer_epoch == 0u ? curr_kf_id_
+                                                     : metadata.defer_epoch;
+                    }
+                    std::string metadata_identity;
+                    if (is_replay_identity_terminal_applied_consumed(metadata,
+                                                                     &metadata_identity) ||
+                        is_replay_identity_terminal_unresolved_too_old(
+                            metadata, &metadata_identity)) {
+                      ++replay_blocked_reenqueue_same_epoch_count_diag;
+                      return;
+                    }
+                    metadata.defer_epoch = curr_kf_id_;
+                    metadata.replay_path = "direct_local_pending";
+                    metadata.pending_reason = reason;
+                    metadata.blocking_key =
+                        blocking_key.empty() ? "none" : blocking_key;
+                    metadata.blocking_support_slot = blocking_support_slot;
+                    metadata.blocking_support_slot_class =
+                        blocking_support_slot_class.empty()
+                            ? "none"
+                            : blocking_support_slot_class;
+                    metadata.blocking_support_slot_keys =
+                        blocking_support_slot_keys.empty()
+                            ? "none"
+                            : blocking_support_slot_keys;
+                    std::ostringstream blocking_incident_id_oss;
+                    if (cbs_phase2_root_bootstrap_blocking_incident_id !=
+                        "none") {
+                      metadata.blocking_incident_id =
+                          cbs_phase2_root_bootstrap_blocking_incident_id;
+                    } else {
+                      blocking_incident_id_oss
+                          << "key="
+                          << (metadata.blocking_key.empty() ? "none"
+                                                            : metadata.blocking_key)
+                          << "|slot=" << metadata.blocking_support_slot;
+                      metadata.blocking_incident_id =
+                          blocking_incident_id_oss.str();
+                    }
+                    metadata.blocking_incident_member_slots =
+                        cbs_phase2_root_bootstrap_blocked_component_slots_set.empty()
+                            ? "none"
+                            : format_slot_set_preview(
+                                  cbs_phase2_root_bootstrap_blocked_component_slots_set,
+                                  16u);
+                    if (metadata.slot_id == 0u) {
+                      metadata.slot_id = slot;
+                    }
+                    if (is_replay_identity_consumed_this_epoch(metadata)) {
+                      ++replay_blocked_reenqueue_same_epoch_count_diag;
+                      return;
+                    }
+                    upsert_direct_local_pending_metadata(metadata);
+                    if (first_replay_deferred_reason == "none") {
+                      first_replay_deferred_reason =
+                          sanitize_forensic_token(reason);
+                    }
+                  };
+              replay_resolved_direct_local_internal.clear();
+              replay_resolved_summary_covered_crossing.clear();
+              replay_resolved_deferred_unsupported.clear();
+              replay_resolved_unknown.clear();
+              gtsam::FactorIndices replay_direct_local_pending_blocked;
+              gtsam::FactorIndices replay_direct_local_promoted_this_epoch;
+              gtsam::FactorIndices replay_direct_local_policy_deferred_slots;
+              gtsam::FactorIndices replay_direct_local_blocked_total;
+              gtsam::FactorIndices replay_direct_local_blocked_preserved;
+              gtsam::FactorIndices replay_direct_local_still_blocked;
+              gtsam::FactorIndices replay_in_direct_local_candidate;
+              gtsam::FactorIndices replay_in_direct_local_removable;
+              gtsam::FactorIndices replay_in_unsupported_deferred;
+              long long first_promoted_slot = -1;
+              std::string first_promoted_slot_class = "none";
+              std::string first_promoted_slot_keys = "none";
+              long long first_pending_blocked_slot = -1;
+              std::string first_pending_blocked_slot_class = "none";
+              std::string first_pending_blocked_slot_keys = "none";
+              std::string first_pending_blocked_reason = "none";
+              std::string first_pending_blocked_key = "none";
+              long long first_pending_blocked_support_slot = -1;
+              std::string first_pending_blocked_support_slot_class = "none";
+              std::string first_pending_blocked_support_slot_keys = "none";
+              long long first_still_blocked_slot = -1;
+              std::string first_still_blocked_slot_class = "none";
+              std::string first_still_blocked_slot_keys = "none";
+              std::string first_still_blocked_reason = "none";
+              const auto note_first_pending_blocked =
+                  [&](const size_t slot,
+                      const CbsSummaryCoveredCrossingReplayMetadata& metadata) {
+                    if (first_pending_blocked_slot >= 0) {
+                      return;
+                    }
+                    first_pending_blocked_slot = static_cast<long long>(slot);
+                    first_pending_blocked_slot_class =
+                        sanitize_forensic_token(metadata.factor_class);
+                    first_pending_blocked_slot_keys =
+                        sanitize_forensic_token(metadata.factor_keys);
+                    first_pending_blocked_reason =
+                        sanitize_forensic_token(metadata.pending_reason);
+                    first_pending_blocked_key =
+                        sanitize_forensic_token(metadata.blocking_key);
+                    first_pending_blocked_support_slot =
+                        metadata.blocking_support_slot;
+                    first_pending_blocked_support_slot_class =
+                        sanitize_forensic_token(
+                            metadata.blocking_support_slot_class);
+                    first_pending_blocked_support_slot_keys =
+                        sanitize_forensic_token(
+                            metadata.blocking_support_slot_keys);
+                  };
+              const auto note_first_promoted =
+                  [&](const size_t slot,
+                      const CbsSummaryCoveredCrossingReplayMetadata& metadata) {
+                    if (first_promoted_slot >= 0) {
+                      return;
+                    }
+                    first_promoted_slot = static_cast<long long>(slot);
+                    first_promoted_slot_class =
+                        sanitize_forensic_token(metadata.factor_class);
+                    first_promoted_slot_keys =
+                        sanitize_forensic_token(metadata.factor_keys);
+                  };
+              const auto note_first_policy_deferred =
+                  [&](const size_t slot,
+                      const CbsSummaryCoveredCrossingReplayMetadata& metadata) {
+                    if (first_policy_deferred_slot >= 0) {
+                      return;
+                    }
+                    first_policy_deferred_slot = static_cast<long long>(slot);
+                    first_policy_deferred_slot_class =
+                        sanitize_forensic_token(metadata.factor_class);
+                    first_policy_deferred_slot_keys =
+                        sanitize_forensic_token(metadata.factor_keys);
+                  };
+              const auto note_first_still_blocked =
+                  [&](const size_t slot,
+                      const CbsSummaryCoveredCrossingReplayMetadata& metadata,
+                      const std::string& reason) {
+                    if (first_still_blocked_slot >= 0) {
+                      return;
+                    }
+                    first_still_blocked_slot = static_cast<long long>(slot);
+                    first_still_blocked_slot_class =
+                        sanitize_forensic_token(metadata.factor_class);
+                    first_still_blocked_slot_keys =
+                        sanitize_forensic_token(metadata.factor_keys);
+                    first_still_blocked_reason =
+                        sanitize_forensic_token(reason);
+                  };
+              const bool has_retained_support_blocking_incident =
+                  cbs_phase2_first_direct_local_internal_rejected_reason
+                          .find("retained_protected_support") !=
+                      std::string::npos ||
+                  cbs_phase2_first_direct_local_internal_rejected_reason
+                          .find("protected_bootstrap_prior") !=
+                      std::string::npos ||
+                  cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_slot >=
+                      0;
+              for (const size_t slot : replay_valid_slots) {
+                const bool in_direct_local_candidate =
+                    cbs_phase2_directly_removable_local_internal_candidate_slots_set
+                        .count(slot) > 0u;
+                const bool in_direct_local_removable =
+                    cbs_phase2_directly_removable_local_internal_slots_set.count(
+                        slot) > 0u;
+                const bool in_summary_covered_crossing =
+                    cbs_phase2_lag_apply_summary_covered_crossing_slots_set.count(
+                        slot) > 0u;
+                const bool in_deferred_unsupported =
+                    cbs_phase2_unsupported_deferred_lag_slots_set.count(slot) > 0u;
+                if (in_direct_local_candidate) {
+                  replay_resolved_direct_local_internal.push_back(slot);
+                  note_first_replay_routed_direct_local_internal(slot);
+                  if (in_direct_local_removable) {
+                    const auto promoted_metadata = get_replay_metadata_for_slot(slot);
+                    std::string promoted_identity;
+                    const bool promoted_identity_hard_quarantined =
+                        is_direct_local_identity_hard_quarantined(
+                            promoted_metadata, &promoted_identity);
+                    if (promoted_identity_hard_quarantined) {
+                      ++replay_direct_local_skipped_due_to_hard_quarantine_count_diag;
+                      replay_direct_local_skipped_due_to_hard_quarantine_slots_diag
+                          .push_back(slot);
+                      auto deferred_metadata = promoted_metadata;
+                      const auto quarantined_it =
+                          cbs_phase2_direct_local_hard_quarantine_identity_store.find(
+                              promoted_identity);
+                      if (quarantined_it !=
+                          cbs_phase2_direct_local_hard_quarantine_identity_store
+                              .end()) {
+                        deferred_metadata = quarantined_it->second;
+                      }
+                      std::string quarantine_reason =
+                          deferred_metadata.pending_reason;
+                      if (quarantine_reason.empty() || quarantine_reason == "none") {
+                        quarantine_reason =
+                            "direct_local_apply_live_map_at_incompatible_slot";
+                      }
+                      defer_replay_descriptor_to_direct_local_pending_queue(
+                          slot,
+                          quarantine_reason,
+                          deferred_metadata.blocking_key,
+                          deferred_metadata.blocking_support_slot,
+                          deferred_metadata.blocking_support_slot_class,
+                          deferred_metadata.blocking_support_slot_keys);
+                      continue;
+                    }
+                    replay_direct_local_promoted_this_epoch.push_back(slot);
+                    note_first_promoted(slot, promoted_metadata);
+                    if (direct_local_apply_allowed_this_epoch) {
+                      replay_direct_local_apply_candidates_metadata[slot] =
+                          promoted_metadata;
+                      defer_replay_descriptor_to_direct_local_pending_queue(
+                          slot,
+                          "direct_local_apply_pending_until_stage_a_success",
+                          "none",
+                          -1,
+                          "none",
+                          "none");
+                    }
+                    if (!direct_local_apply_allowed_this_epoch) {
+                      replay_direct_local_policy_deferred_slots.push_back(slot);
+                      note_first_policy_deferred(slot, promoted_metadata);
+                      defer_replay_descriptor_to_direct_local_pending_queue(
+                          slot,
+                          "direct_local_apply_policy_deferred",
+                          "none",
+                          -1,
+                          "none",
+                          "none");
+                    }
+                    continue;
+                  }
+                  const auto replay_metadata = get_replay_metadata_for_slot(slot);
+                  const bool metadata_reports_retained_block =
+                      replay_metadata.pending_reason.find(
+                          "retained_protected_support") != std::string::npos ||
+                      replay_metadata.pending_reason.find(
+                          "protected_bootstrap_prior") != std::string::npos;
+                  const bool blocked_by_retained_protected_support =
+                      cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set
+                          .count(slot) > 0u ||
+                      metadata_reports_retained_block ||
+                      has_retained_support_blocking_incident ||
+                      cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_slot ==
+                          static_cast<long long>(slot);
+                  if (blocked_by_retained_protected_support) {
+                    replay_direct_local_pending_blocked.push_back(slot);
+                    replay_direct_local_blocked_total.push_back(slot);
+                    replay_direct_local_blocked_preserved.push_back(slot);
+                    replay_direct_local_still_blocked.push_back(slot);
+                    std::string blocked_reason =
+                        "blocked_by_retained_protected_support";
+                    std::string blocked_key = "none";
+                    long long blocked_support_slot = -1;
+                    std::string blocked_support_slot_class = "none";
+                    std::string blocked_support_slot_keys = "none";
+                    if (cbs_phase2_first_direct_local_internal_rejected_slot ==
+                        static_cast<long long>(slot)) {
+                      if (cbs_phase2_first_direct_local_internal_rejected_reason !=
+                          "none") {
+                        blocked_reason =
+                            cbs_phase2_first_direct_local_internal_rejected_reason;
+                      }
+                      blocked_key =
+                          cbs_phase2_first_direct_local_internal_rejected_blocking_key;
+                      blocked_support_slot =
+                          cbs_phase2_first_direct_local_internal_rejected_blocking_slot;
+                      blocked_support_slot_class =
+                          cbs_phase2_first_direct_local_internal_rejected_blocking_slot_class;
+                      blocked_support_slot_keys =
+                          cbs_phase2_first_direct_local_internal_rejected_blocking_slot_keys;
+                    } else if (
+                        cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_slot ==
+                        static_cast<long long>(slot)) {
+                      if (cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_reason !=
+                          "none") {
+                        blocked_reason =
+                            cbs_phase2_first_direct_local_internal_rejected_due_to_retained_support_reason;
+                      }
+                    }
+                    defer_replay_descriptor_to_direct_local_pending_queue(
+                        slot,
+                        blocked_reason,
+                        blocked_key,
+                        blocked_support_slot,
+                        blocked_support_slot_class,
+                        blocked_support_slot_keys);
+                    auto blocked_metadata = get_replay_metadata_for_slot(slot);
+                    blocked_metadata.pending_reason = blocked_reason;
+                    blocked_metadata.blocking_key = blocked_key;
+                    blocked_metadata.blocking_support_slot = blocked_support_slot;
+                    blocked_metadata.blocking_support_slot_class =
+                        blocked_support_slot_class;
+                    blocked_metadata.blocking_support_slot_keys =
+                        blocked_support_slot_keys;
+                    note_first_pending_blocked(slot, blocked_metadata);
+                    note_first_still_blocked(slot, blocked_metadata, blocked_reason);
+                    continue;
+                  }
+                  defer_replay_descriptor_to_direct_local_pending_queue(
+                      slot,
+                      "direct_local_not_removable",
+                      "none",
+                      -1,
+                      "none",
+                      "none");
+                  continue;
+                }
+                if (in_summary_covered_crossing) {
+                  replay_resolved_summary_covered_crossing.push_back(slot);
+                  continue;
+                }
+                if (in_deferred_unsupported) {
+                  replay_resolved_deferred_unsupported.push_back(slot);
+                  defer_replay_descriptor_to_summary_queue(
+                      slot,
+                      "resolved_to_deferred_unsupported_partition");
+                  continue;
+                }
+                replay_resolved_unknown.push_back(slot);
+                defer_replay_descriptor_to_summary_queue(
+                    slot,
+                    "resolved_to_unknown_partition");
+              }
+              for (const size_t slot : replay_valid_slots) {
+                if (cbs_phase2_directly_removable_local_internal_candidate_slots_set
+                        .count(slot) > 0u) {
+                  replay_in_direct_local_candidate.push_back(slot);
+                }
+                if (cbs_phase2_directly_removable_local_internal_slots_set.count(
+                        slot) > 0u) {
+                  replay_in_direct_local_removable.push_back(slot);
+                }
+                if (cbs_phase2_unsupported_deferred_lag_slots_set.count(slot) > 0u) {
+                  replay_in_unsupported_deferred.push_back(slot);
+                }
+              }
+              auto sort_unique_slots = [](gtsam::FactorIndices* slots) {
+                std::sort(slots->begin(), slots->end());
+                slots->erase(std::unique(slots->begin(), slots->end()),
+                             slots->end());
+              };
+              sort_unique_slots(&replay_resolved_direct_local_internal);
+              sort_unique_slots(&replay_resolved_summary_covered_crossing);
+              sort_unique_slots(&replay_resolved_deferred_unsupported);
+              sort_unique_slots(&replay_resolved_unknown);
+              sort_unique_slots(&replay_direct_local_pending_blocked);
+              sort_unique_slots(&replay_direct_local_promoted_this_epoch);
+              sort_unique_slots(&replay_direct_local_policy_deferred_slots);
+              sort_unique_slots(&replay_direct_local_blocked_total);
+              sort_unique_slots(&replay_direct_local_blocked_preserved);
+              sort_unique_slots(&replay_direct_local_still_blocked);
+              sort_unique_slots(&replay_in_direct_local_candidate);
+              sort_unique_slots(&replay_in_direct_local_removable);
+              sort_unique_slots(&replay_in_unsupported_deferred);
+              replay_direct_local_apply_candidate_slots.clear();
+              replay_direct_local_apply_candidate_slots.reserve(
+                  replay_direct_local_apply_candidates_metadata.size());
+              for (const auto& kv :
+                   replay_direct_local_apply_candidates_metadata) {
+                replay_direct_local_apply_candidate_slots.push_back(kv.first);
+              }
+              sort_unique_slots(&replay_direct_local_apply_candidate_slots);
+              replay_direct_local_removable_classified_count_diag =
+                  replay_direct_local_promoted_this_epoch.size();
+              replay_direct_local_policy_deferred_count_diag =
+                  replay_direct_local_policy_deferred_slots.size();
+              replay_direct_local_first_policy_deferred_slot_diag =
+                  first_policy_deferred_slot;
+              replay_direct_local_first_policy_deferred_slot_class_diag =
+                  first_policy_deferred_slot_class;
+              replay_direct_local_first_policy_deferred_slot_keys_diag =
+                  first_policy_deferred_slot_keys;
+              replay_valid_slots_for_stage_a =
+                  replay_resolved_summary_covered_crossing;
+              replay_valid_slots_for_stage_a_set.insert(
+                  replay_valid_slots_for_stage_a.begin(),
+                  replay_valid_slots_for_stage_a.end());
+              if (first_replay_deferred_reason == "none" &&
+                  replay_first_unresolved_reason != "none") {
+                first_replay_deferred_reason =
+                    sanitize_forensic_token(replay_first_unresolved_reason);
+              }
+              std::unordered_set<size_t>
+                  replay_resolved_direct_local_internal_set(
+                      replay_resolved_direct_local_internal.begin(),
+                      replay_resolved_direct_local_internal.end());
+              cbs_phase2_summary_covered_crossing_replay_metadata_map.clear();
+              for (const auto& kv : replay_metadata_map_resolved) {
+                if (replay_resolved_direct_local_internal_set.count(kv.first) >
+                    0u) {
+                  continue;
+                }
+                if (is_replay_identity_consumed_this_epoch(kv.second)) {
+                  ++replay_blocked_reenqueue_same_epoch_count_diag;
+                  continue;
+                }
+                cbs_phase2_summary_covered_crossing_replay_metadata_map[kv.first] =
+                    kv.second;
+              }
+              for (const auto& kv : replay_metadata_map_deferred_unresolved) {
+                CbsSummaryCoveredCrossingReplayMetadata metadata = kv.second;
+                if (metadata.slot_id == 0u) {
+                  metadata.slot_id = kv.first;
+                }
+                if (metadata.first_defer_epoch == 0u) {
+                  metadata.first_defer_epoch =
+                      metadata.defer_epoch == 0u ? curr_kf_id_
+                                                 : metadata.defer_epoch;
+                }
+                const size_t unresolved_age_epochs =
+                    static_cast<FrameId>(curr_kf_id_) >= metadata.first_defer_epoch
+                        ? static_cast<size_t>(static_cast<FrameId>(curr_kf_id_) -
+                                              metadata.first_defer_epoch)
+                        : 0u;
+                std::string unresolved_identity;
+                normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                unresolved_identity = build_replay_lifecycle_identity(metadata);
+                if (unresolved_age_epochs >
+                    static_cast<size_t>(replay_unresolved_too_old_age_epochs)) {
+                  cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store
+                      .insert(unresolved_identity);
+                  ++replay_blocked_reenqueue_same_epoch_count_diag;
+                  continue;
+                }
+                if (is_replay_identity_consumed_this_epoch(metadata)) {
+                  ++replay_blocked_reenqueue_same_epoch_count_diag;
+                  continue;
+                }
+                if (kv.second.replay_path == "direct_local_pending") {
+                  upsert_direct_local_pending_metadata(metadata);
+                } else {
+                  cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_
+                      [metadata.slot_id] = metadata;
+                }
+              }
+              cbs_phase2_summary_crossing_replay_valid_count =
+                  replay_valid_slots.size();
+              cbs_phase2_summary_crossing_replay_invalid_count =
+                  replay_descriptor_unresolved_count +
+                  replay_descriptor_ambiguous_count;
+              cbs_phase2_summary_covered_crossing_replay_epoch =
+                  static_cast<long long>(curr_kf_id_);
+              std::cerr << std::setprecision(12)
+                        << "[CBS][StageAReplayResolveDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " replay_descriptor_requested_count="
+                        << replay_descriptors.size()
+                        << " replay_descriptor_resolved_count="
+                        << replay_descriptor_resolved_count
+                        << " replay_descriptor_unresolved_count="
+                        << replay_descriptor_unresolved_count
+                        << " replay_descriptor_ambiguous_count="
+                        << replay_descriptor_ambiguous_count
+                        << " resolved_current_slots_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(replay_valid_slots, 16u))
+                        << " first_unresolved_replay_descriptor_class="
+                        << replay_first_unresolved_descriptor_class
+                        << " first_unresolved_replay_descriptor_keys="
+                        << replay_first_unresolved_descriptor_keys
+                        << " first_unresolved_replay_reason="
+                        << replay_first_unresolved_reason
+                        << " resolve_mode=semantic_descriptor_reresolution"
+                        << std::endl;
+              std::cerr << std::setprecision(12)
+                        << "[CBS][StageAReplayPartitionRoutingDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " replay_descriptor_requested_count="
+                        << replay_descriptors.size()
+                        << " replay_resolved_direct_local_internal_count="
+                        << replay_resolved_direct_local_internal.size()
+                        << " replay_resolved_summary_covered_crossing_count="
+                        << replay_resolved_summary_covered_crossing.size()
+                        << " replay_resolved_deferred_unsupported_count="
+                        << replay_resolved_deferred_unsupported.size()
+                        << " replay_resolved_unknown_count="
+                        << replay_resolved_unknown.size()
+                        << " replay_resolved_direct_local_internal_first_few="
+                        << sanitize_forensic_token(format_factor_slots_preview(
+                               replay_resolved_direct_local_internal, 16u))
+                        << " replay_resolved_summary_covered_crossing_first_few="
+                        << sanitize_forensic_token(format_factor_slots_preview(
+                               replay_resolved_summary_covered_crossing, 16u))
+                        << " first_replay_routed_direct_local_internal_slot="
+                        << first_replay_routed_direct_local_internal_slot
+                        << " first_replay_routed_direct_local_internal_slot_class="
+                        << sanitize_forensic_token(
+                               first_replay_routed_direct_local_internal_slot_class)
+                        << " first_replay_routed_direct_local_internal_slot_keys="
+                        << sanitize_forensic_token(
+                               first_replay_routed_direct_local_internal_slot_keys)
+                        << " first_replay_deferred_reason="
+                        << sanitize_forensic_token(first_replay_deferred_reason)
+                        << " routing_mode=partition_aware_replay_epoch_routing"
+                        << std::endl;
+              long long first_replay_direct_local_rejected_slot = -1;
+              std::string first_replay_direct_local_rejected_slot_class = "none";
+              std::string first_replay_direct_local_rejected_slot_keys = "none";
+              std::string first_replay_direct_local_rejected_reason = "none";
+              std::string first_replay_direct_local_rejected_blocking_key =
+                  "none";
+              long long first_replay_direct_local_rejected_blocking_slot = -1;
+              std::string
+                  first_replay_direct_local_rejected_blocking_slot_class = "none";
+              std::string
+                  first_replay_direct_local_rejected_blocking_slot_keys = "none";
+              for (const size_t slot : replay_in_direct_local_candidate) {
+                if (cbs_phase2_directly_removable_local_internal_slots_set.count(
+                        slot) > 0u) {
+                  continue;
+                }
+                first_replay_direct_local_rejected_slot =
+                    static_cast<long long>(slot);
+                const auto metadata = get_replay_metadata_for_slot(slot);
+                first_replay_direct_local_rejected_slot_class =
+                    sanitize_forensic_token(metadata.factor_class);
+                first_replay_direct_local_rejected_slot_keys =
+                    sanitize_forensic_token(metadata.factor_keys);
+                if (cbs_phase2_first_direct_local_internal_rejected_slot ==
+                    static_cast<long long>(slot)) {
+                  first_replay_direct_local_rejected_reason =
+                      sanitize_forensic_token(
+                          cbs_phase2_first_direct_local_internal_rejected_reason);
+                  first_replay_direct_local_rejected_blocking_key =
+                      sanitize_forensic_token(
+                          cbs_phase2_first_direct_local_internal_rejected_blocking_key);
+                  first_replay_direct_local_rejected_blocking_slot =
+                      cbs_phase2_first_direct_local_internal_rejected_blocking_slot;
+                  first_replay_direct_local_rejected_blocking_slot_class =
+                      sanitize_forensic_token(
+                          cbs_phase2_first_direct_local_internal_rejected_blocking_slot_class);
+                  first_replay_direct_local_rejected_blocking_slot_keys =
+                      sanitize_forensic_token(
+                          cbs_phase2_first_direct_local_internal_rejected_blocking_slot_keys);
+                } else if (cbs_phase2_first_direct_local_internal_rejected_slot >=
+                           0) {
+                  first_replay_direct_local_rejected_reason =
+                      "replay_slot_not_first_heart_rejection_slot";
+                } else {
+                  first_replay_direct_local_rejected_reason =
+                      "no_heart_rejection_metadata";
+                }
+                break;
+              }
+              std::cerr << std::setprecision(12)
+                        << "[CBS][StageAReplayDirectLocalDecisionDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " replay_resolved_slots_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(replay_valid_slots,
+                                                           16u))
+                        << " replay_in_direct_local_candidate_count="
+                        << replay_in_direct_local_candidate.size()
+                        << " replay_in_direct_local_removable_count="
+                        << replay_in_direct_local_removable.size()
+                        << " replay_in_unsupported_deferred_count="
+                        << replay_in_unsupported_deferred.size()
+                        << " replay_direct_local_candidate_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(
+                                   replay_in_direct_local_candidate, 16u))
+                        << " replay_direct_local_removable_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(
+                                   replay_in_direct_local_removable, 16u))
+                        << " replay_unsupported_deferred_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(
+                                   replay_in_unsupported_deferred, 16u))
+                        << " first_replay_direct_local_rejected_slot="
+                        << first_replay_direct_local_rejected_slot
+                        << " first_replay_direct_local_rejected_slot_class="
+                        << sanitize_forensic_token(
+                               first_replay_direct_local_rejected_slot_class)
+                        << " first_replay_direct_local_rejected_slot_keys="
+                        << sanitize_forensic_token(
+                               first_replay_direct_local_rejected_slot_keys)
+                        << " first_replay_direct_local_rejected_reason="
+                        << sanitize_forensic_token(
+                               first_replay_direct_local_rejected_reason)
+                        << " first_replay_direct_local_rejected_blocking_key="
+                        << sanitize_forensic_token(
+                               first_replay_direct_local_rejected_blocking_key)
+                        << " first_replay_direct_local_rejected_blocking_slot="
+                        << first_replay_direct_local_rejected_blocking_slot
+                        << " first_replay_direct_local_rejected_blocking_slot_class="
+                        << sanitize_forensic_token(
+                               first_replay_direct_local_rejected_blocking_slot_class)
+                        << " first_replay_direct_local_rejected_blocking_slot_keys="
+                        << sanitize_forensic_token(
+                               first_replay_direct_local_rejected_blocking_slot_keys)
+                        << " decision_mode=heart_direct_local_candidate_vs_removable_vs_unsupported"
+                        << std::endl;
+              std::cerr << std::setprecision(12)
+                        << "[CBS][StageAReplayDirectLocalPendingDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " replay_direct_local_candidate_count="
+                        << replay_in_direct_local_candidate.size()
+                        << " replay_direct_local_removable_count="
+                        << replay_in_direct_local_removable.size()
+                        << " replay_direct_local_pending_blocked_count="
+                        << replay_direct_local_pending_blocked.size()
+                        << " replay_direct_local_pending_blocked_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(
+                                   replay_direct_local_pending_blocked, 16u))
+                        << " replay_direct_local_promoted_this_epoch_count="
+                        << replay_direct_local_promoted_this_epoch.size()
+                        << " first_pending_blocked_slot="
+                        << first_pending_blocked_slot
+                        << " first_pending_blocked_slot_class="
+                        << sanitize_forensic_token(
+                               first_pending_blocked_slot_class)
+                        << " first_pending_blocked_slot_keys="
+                        << sanitize_forensic_token(first_pending_blocked_slot_keys)
+                        << " first_pending_blocked_reason="
+                        << sanitize_forensic_token(first_pending_blocked_reason)
+                        << " first_pending_blocked_key="
+                        << sanitize_forensic_token(first_pending_blocked_key)
+                        << " first_pending_blocked_support_slot="
+                        << first_pending_blocked_support_slot
+                        << " first_pending_blocked_support_slot_class="
+                        << sanitize_forensic_token(
+                               first_pending_blocked_support_slot_class)
+                        << " first_pending_blocked_support_slot_keys="
+                        << sanitize_forensic_token(
+                               first_pending_blocked_support_slot_keys)
+                        << " pending_mode=direct_local_pending_blocked_by_retained_protected_support"
+                        << std::endl;
+              size_t replay_direct_local_pending_max_age_epochs = 0u;
+              for (const auto& kv :
+                   cbs_phase2_direct_local_pending_one_epoch_replay_queue_) {
+                const auto& md = kv.second;
+                if (md.first_defer_epoch == 0u ||
+                    static_cast<FrameId>(curr_kf_id_) < md.first_defer_epoch) {
+                  continue;
+                }
+                const size_t age =
+                    static_cast<size_t>(curr_kf_id_ - md.first_defer_epoch);
+                replay_direct_local_pending_max_age_epochs =
+                    std::max(replay_direct_local_pending_max_age_epochs, age);
+              }
+              std::cerr << std::setprecision(12)
+                        << "[CBS][StageAReplayDirectLocalPromotionDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " replay_direct_local_candidate_count="
+                        << replay_in_direct_local_candidate.size()
+                        << " replay_direct_local_blocked_total_count="
+                        << replay_direct_local_blocked_total.size()
+                        << " replay_direct_local_blocked_preserved_count="
+                        << replay_direct_local_blocked_preserved.size()
+                        << " replay_direct_local_blocked_preserved_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(
+                                   replay_direct_local_blocked_preserved, 16u))
+                        << " replay_direct_local_promoted_this_epoch_count="
+                        << replay_direct_local_promoted_this_epoch.size()
+                        << " replay_direct_local_promoted_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(
+                                   replay_direct_local_promoted_this_epoch,
+                                   16u))
+                        << " replay_direct_local_still_blocked_count="
+                        << replay_direct_local_still_blocked.size()
+                        << " replay_direct_local_still_blocked_first_few="
+                        << sanitize_forensic_token(
+                               format_factor_slots_preview(
+                                   replay_direct_local_still_blocked, 16u))
+                        << " first_promoted_slot="
+                        << first_promoted_slot
+                        << " first_promoted_slot_class="
+                        << sanitize_forensic_token(first_promoted_slot_class)
+                        << " first_promoted_slot_keys="
+                        << sanitize_forensic_token(first_promoted_slot_keys)
+                        << " first_still_blocked_slot="
+                        << first_still_blocked_slot
+                        << " first_still_blocked_slot_class="
+                        << sanitize_forensic_token(
+                               first_still_blocked_slot_class)
+                        << " first_still_blocked_slot_keys="
+                        << sanitize_forensic_token(
+                               first_still_blocked_slot_keys)
+                        << " first_still_blocked_reason="
+                        << sanitize_forensic_token(first_still_blocked_reason)
+                        << " replay_direct_local_pending_queue_size="
+                        << cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                               .size()
+                        << " replay_direct_local_pending_max_age_epochs="
+                        << replay_direct_local_pending_max_age_epochs
+                        << " promotion_mode=direct_local_pending_preserve_full_blocked_set_and_promote_when_clear"
+                        << std::endl;
+              static bool replay_remove_packet_diag_emitted_once = false;
+              const bool emit_replay_remove_packet_diag =
+                  cbs_phase2_summary_crossing_replay_requested_count > 0u &&
+                  (!replay_remove_packet_diag_emitted_once ||
+                   !cbs_first_bad_epoch_seen_);
+              if (emit_replay_remove_packet_diag) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][ReplayRemovePacketDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " replay_stage="
+                          << (cbs_phase2_two_stage_summary_crossing_mode
+                                  ? "two_stage_stage_a_packet_pre_update_a"
+                                  : "single_packet_replay_not_supported")
+                          << " replay_requested_count="
+                          << replay_remove_slots_sorted.size()
+                          << " replay_valid_count=" << replay_valid_slots.size()
+                          << " replay_invalid_count="
+                          << replay_invalid_slots.size()
+                          << " replay_requested_slots="
+                          << sanitize_forensic_token(format_factor_slots_preview(
+                                 replay_remove_slots_sorted, 16u))
+                          << " replay_valid_slots="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(replay_valid_slots,
+                                                             16u))
+                          << " replay_sent_slots="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(replay_valid_slots,
+                                                             16u))
+                          << " replay_requested_slot_execution_diag="
+                          << sanitize_forensic_token(
+                                 format_replay_slot_execution_diag(
+                                     replay_remove_slots_sorted, 16u))
+                          << " replay_valid_slot_execution_diag="
+                          << sanitize_forensic_token(
+                                 format_replay_slot_execution_diag(
+                                     replay_valid_slots, 16u))
+                          << std::endl;
+                replay_remove_packet_diag_emitted_once = true;
+              }
+              if (replay_valid_slots_for_stage_a.empty()) {
+                cbs_phase2_summary_crossing_replay_skipped_due_to_no_valid_slots =
+                    true;
+                cbs_phase2_summary_covered_crossing_replay_stage =
+                    "two_stage_stage_a_replay_routed_outside_crossing_support";
+                cbs_phase2_summary_covered_crossing_replayed_count = 0u;
+                cbs_phase2_replayed_summary_crossing_count = 0u;
+              } else {
+                cbs_phase2_summary_covered_crossing_replay_stage =
+                    "two_stage_stage_a_packet_pending";
+                const size_t first_replayed_slot =
+                    replay_valid_slots_for_stage_a.front();
+                cbs_phase2_summary_crossing_replay_first_replayed_slot =
+                    static_cast<long long>(first_replayed_slot);
+                const auto first_metadata_it =
+                    cbs_phase2_summary_covered_crossing_replay_metadata_map.find(
+                        first_replayed_slot);
+                if (first_metadata_it !=
+                        cbs_phase2_summary_covered_crossing_replay_metadata_map
+                            .end() &&
+                    !first_metadata_it->second.factor_class.empty()) {
+                  cbs_phase2_summary_crossing_replay_first_replayed_slot_class =
+                      sanitize_forensic_token(
+                          first_metadata_it->second.factor_class);
+                  cbs_phase2_summary_crossing_replay_first_replayed_slot_keys =
+                      sanitize_forensic_token(
+                          first_metadata_it->second.factor_keys);
+                } else if (replay_factors.exists(first_replayed_slot) &&
+                           replay_factors.at(first_replayed_slot)) {
+                  cbs_phase2_summary_crossing_replay_first_replayed_slot_class =
+                      sanitize_forensic_token(
+                          classify_forensic_remove_factor_class(
+                              replay_factors.at(first_replayed_slot)));
+                  cbs_phase2_summary_crossing_replay_first_replayed_slot_keys =
+                      sanitize_forensic_token(format_factor_keys_for_slot(
+                          replay_factors, first_replayed_slot));
+                } else {
+                  cbs_phase2_summary_crossing_replay_first_replayed_slot_class =
+                      "missing_slot";
+                  cbs_phase2_summary_crossing_replay_first_replayed_slot_keys =
+                      "none";
+                }
+              }
+              replay_direct_local_pending_queue_size_before_diag =
+                  replay_direct_local_pending_queue_size_before;
+              replay_direct_local_removed_after_promotion_count_diag =
+                  replay_direct_local_removed_from_pending_after_promotion_count;
+              replay_direct_local_reinserted_same_identity_count_diag =
+                  replay_direct_local_reinserted_same_identity_count;
+              replay_direct_local_deduped_existing_pending_count_diag =
+                  replay_direct_local_deduped_existing_pending_count;
+              replay_direct_local_promoted_this_epoch_diag =
+                  replay_direct_local_promoted_this_epoch;
+              replay_direct_local_still_blocked_diag =
+                  replay_direct_local_still_blocked;
+              first_promoted_removed_slot_diag = first_promoted_removed_slot;
+              first_promoted_removed_slot_class_diag =
+                  first_promoted_removed_slot_class;
+              first_promoted_removed_slot_keys_diag =
+                  first_promoted_removed_slot_keys;
+            }
+            cbs_phase2_replay_into_stage_a_count =
+                replay_valid_slots_for_stage_a.size();
+
+            bool remove_update_attempted_this_attempt = false;
+            if (cbs_phase2_two_stage_summary_crossing_mode) {
+              cbs_phase2_two_stage_effective = true;
+              cbs::BPSAM::UpdateParams update_a_params = cbs_first_update_params;
+              cbs::BPSAM::UpdateParams update_b_params = cbs_first_update_params;
+              gtsam::FactorIndices update_a_remove_slots;
+              gtsam::FactorIndices update_b_remove_slots;
+              size_t summary_crossing_remove_candidate_count = 0u;
+              update_a_remove_slots.reserve(
+                  cbs_first_update_params.removeFactorIndices.size());
+              update_b_remove_slots.reserve(
+                  cbs_first_update_params.removeFactorIndices.size());
+              for (const size_t slot : cbs_first_update_params.removeFactorIndices) {
+                const bool is_summary_crossing =
+                    cbs_phase2_lag_apply_summary_covered_crossing_slots_set.count(
+                        slot) > 0u;
+                const bool is_direct_local_internal =
+                    cbs_phase2_lag_apply_direct_local_internal_slots_set.count(
+                        slot) > 0u;
+                const bool is_lag_derived =
+                    is_summary_crossing || is_direct_local_internal;
+                if (is_summary_crossing) {
+                  ++summary_crossing_remove_candidate_count;
+                  if (!cbs_phase2_stage_a_summary_only_mode) {
+                    update_a_remove_slots.push_back(slot);
+                  }
+                } else if (!is_lag_derived) {
+                  update_b_remove_slots.push_back(slot);
+                }
+              }
+              std::unordered_set<size_t> update_a_remove_slots_set(
+                  update_a_remove_slots.begin(), update_a_remove_slots.end());
+              std::unordered_set<size_t> update_b_remove_slots_set(
+                  update_b_remove_slots.begin(), update_b_remove_slots.end());
+              gtsam::NonlinearFactorGraph stage_a_summary_factors_for_update;
+              const gtsam::NonlinearFactorGraph*
+                  stage_a_summary_factors_for_update_ptr =
+                      &cbs_phase2_summary_only_factors;
+              const size_t stage_a_replay_descriptor_requested_count =
+                  cbs_phase2_summary_crossing_replay_requested_count;
+              size_t stage_a_replay_support_requested_count =
+                  replay_valid_slots_for_stage_a.size();
+              size_t stage_a_replay_support_supported_count = 0u;
+              size_t stage_a_replay_support_unsupported_count = 0u;
+              size_t stage_a_replay_support_augmented_required_count = 0u;
+              size_t stage_a_replay_support_augmented_covered_count = 0u;
+              size_t stage_a_replay_support_augmented_requested_count = 0u;
+              size_t
+                  stage_a_replay_support_augmented_supported_requested_count =
+                      0u;
+              std::string
+                  stage_a_replay_support_augmented_supported_requested_slots_first_few =
+                      "none";
+              std::string
+                  stage_a_replay_support_augmented_requested_slots_first_few =
+                      "none";
+              bool stage_a_replay_support_augmented_requested_supported_coherence_ok =
+                  true;
+              size_t stage_a_replay_support_caller_requested_count = 0u;
+              size_t stage_a_replay_support_caller_supported_count = 0u;
+              std::string stage_a_replay_support_caller_requested_slots_first_few =
+                  "none";
+              std::string stage_a_replay_support_caller_supported_slots_first_few =
+                  "none";
+              bool stage_a_replay_support_caller_domain_coherence_ok = true;
+              long long
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain =
+                      -1;
+              std::string
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_class =
+                      "none";
+              std::string
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_keys =
+                      "none";
+              size_t
+                  stage_a_replay_support_caller_missing_from_internal_domain_count =
+                      0u;
+              std::string
+                  stage_a_replay_support_caller_missing_from_internal_domain_first_few =
+                      "none";
+              std::string
+                  stage_a_replay_support_caller_slot_classification_first_few =
+                      "none";
+              std::string
+                  stage_a_replay_support_first_caller_requested_slot_exclusion_reason =
+                      "none";
+              bool stage_a_replay_support_aggregate_exact_mismatch = false;
+              bool stage_a_replay_applied_this_epoch = false;
+              bool stage_a_replay_deferred_again_this_epoch = false;
+              std::string stage_a_replay_support_mode = "not_requested";
+              std::string stage_a_replay_support_contract_mode = "not_requested";
+              long long stage_a_replay_first_unsupported_slot = -1;
+              std::string stage_a_replay_first_unsupported_slot_class = "none";
+              std::string stage_a_replay_first_unsupported_slot_keys = "none";
+              size_t stage_a_root_blocked_component_count = 0u;
+              gtsam::FactorIndices stage_a_root_blocked_component_member_slots;
+              size_t stage_a_root_bootstrap_support_factor_count = 0u;
+              size_t stage_a_root_bootstrap_remove_count = 0u;
+              bool stage_a_root_bootstrap_treatment_applied_this_epoch = false;
+              bool stage_a_root_bootstrap_treatment_deferred_this_epoch = false;
+              std::string stage_a_root_bootstrap_treatment_mode = "not_requested";
+              std::string stage_a_root_bootstrap_first_failure_reason = "none";
+              std::unordered_set<size_t>
+                  stage_a_root_bootstrap_supported_slots_set;
+              size_t
+                  stage_a_root_bootstrap_incident_crossing_support_slot_count =
+                      0u;
+              std::string
+                  stage_a_root_bootstrap_incident_crossing_support_slots_first_few =
+                      "none";
+              size_t stage_a_root_bootstrap_kept_target_key_count = 0u;
+              std::string
+                  stage_a_root_bootstrap_kept_target_keys_first_few = "none";
+              size_t stage_a_root_bootstrap_selected_graph_factor_count = 0u;
+              size_t stage_a_root_bootstrap_eliminate_key_count = 0u;
+              std::string stage_a_root_bootstrap_augment_mode = "none";
+              const size_t stage_a_direct_local_blocked_total_count =
+                  cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set
+                      .size();
+              const size_t stage_a_root_bootstrap_component_seed_count =
+                  cbs_phase2_root_bootstrap_component_seed_count;
+              const std::string stage_a_root_bootstrap_seed_slots_first_few =
+                  cbs_phase2_root_bootstrap_seed_slots_first_few;
+              std::string stage_a_root_bootstrap_blocking_incident_id =
+                  cbs_phase2_root_bootstrap_blocking_incident_id;
+              std::string stage_a_root_bootstrap_component_mode =
+                  cbs_phase2_root_bootstrap_component_closure_mode;
+              std::string stage_a_root_bootstrap_component_mismatch_reason =
+                  "none";
+              gtsam::FactorIndices stage_a_direct_local_packet_compatible_slots;
+              gtsam::FactorIndices stage_a_direct_local_packet_incompatible_slots;
+              gtsam::FactorIndices stage_b_direct_local_replay_apply_slots;
+              size_t stage_a_direct_local_packet_compatible_count = 0u;
+              size_t stage_a_direct_local_packet_incompatible_count = 0u;
+              std::string stage_a_direct_local_packet_shape_mode =
+                  "not_evaluated";
+              std::string stage_a_direct_local_packet_incompatibility_reason =
+                  "none";
+              long long
+                  stage_a_root_bootstrap_first_missing_blocked_slot_after_closure =
+                      -1;
+              std::string
+                  stage_a_root_bootstrap_first_missing_blocked_slot_class =
+                      "none";
+              std::string
+                  stage_a_root_bootstrap_first_missing_blocked_slot_keys =
+                      "none";
+              if (cbs_phase2_replay_into_stage_a_mode &&
+                  !replay_valid_slots_for_stage_a.empty()) {
+                for (const size_t slot : replay_valid_slots_for_stage_a) {
+                  if (update_a_remove_slots_set.insert(slot).second) {
+                    update_a_remove_slots.push_back(slot);
+                  }
+                }
+                cbs_phase2_summary_covered_crossing_replay_stage =
+                    "two_stage_stage_a_packet_pre_update_a";
+              }
+              if (cbs_phase2_replay_into_stage_a_mode &&
+                  stage_a_replay_descriptor_requested_count > 0u &&
+                  replay_valid_slots_for_stage_a.empty()) {
+                stage_a_replay_support_supported_count = 0u;
+                stage_a_replay_support_unsupported_count = 0u;
+                stage_a_replay_deferred_again_this_epoch = true;
+                stage_a_replay_support_mode =
+                    "no_crossing_replay_slots_after_partition_routing";
+                stage_a_replay_support_contract_mode =
+                    "partition_routed_outside_crossing_support";
+                cbs_phase2_summary_covered_crossing_replay_stage =
+                    "two_stage_stage_a_no_crossing_replay_after_partition_routing";
+                cbs_phase2_stage_a_replay_skipped_due_to_failure = false;
+              }
+
+              if (cbs_phase2_replay_into_stage_a_mode &&
+                  !replay_resolved_direct_local_internal.empty()) {
+                for (const size_t slot : replay_resolved_direct_local_internal) {
+                  if (cbs_phase2_root_bootstrap_blocked_component_slots_set.count(
+                          slot) > 0u) {
+                    stage_a_root_blocked_component_member_slots.push_back(slot);
+                  }
+                }
+                std::sort(stage_a_root_blocked_component_member_slots.begin(),
+                          stage_a_root_blocked_component_member_slots.end());
+                stage_a_root_blocked_component_member_slots.erase(
+                    std::unique(stage_a_root_blocked_component_member_slots.begin(),
+                                stage_a_root_blocked_component_member_slots.end()),
+                    stage_a_root_blocked_component_member_slots.end());
+                stage_a_root_blocked_component_count =
+                    stage_a_root_blocked_component_member_slots.empty() ? 0u : 1u;
+                if (stage_a_direct_local_blocked_total_count == 0u) {
+                  stage_a_root_bootstrap_component_mismatch_reason =
+                      "no_direct_local_blocked_replay_items";
+                } else if (stage_a_root_blocked_component_member_slots.empty()) {
+                  stage_a_root_bootstrap_component_mismatch_reason =
+                      "heart_root_blocked_component_empty";
+                } else if (stage_a_root_blocked_component_member_slots.size() <
+                           stage_a_direct_local_blocked_total_count) {
+                  stage_a_root_bootstrap_component_mismatch_reason =
+                      "root_component_missing_direct_local_blocked_members";
+                } else {
+                  stage_a_root_bootstrap_component_mismatch_reason = "none";
+                }
+                if (!cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set
+                         .empty()) {
+                  gtsam::FactorIndices blocked_slots_ordered(
+                      cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set
+                          .begin(),
+                      cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set
+                          .end());
+                  std::sort(blocked_slots_ordered.begin(),
+                            blocked_slots_ordered.end());
+                  const auto& replay_factors = cbs_optimizer_->getFactorsUnsafe();
+                  for (const size_t blocked_slot : blocked_slots_ordered) {
+                    if (cbs_phase2_root_bootstrap_blocked_component_slots_set.count(
+                            blocked_slot) > 0u) {
+                      continue;
+                    }
+                    stage_a_root_bootstrap_first_missing_blocked_slot_after_closure =
+                        static_cast<long long>(blocked_slot);
+                    const auto metadata_it =
+                        cbs_phase2_summary_covered_crossing_replay_metadata_map.find(
+                            blocked_slot);
+                    if (metadata_it !=
+                            cbs_phase2_summary_covered_crossing_replay_metadata_map
+                                .end() &&
+                        !metadata_it->second.factor_class.empty()) {
+                      stage_a_root_bootstrap_first_missing_blocked_slot_class =
+                          metadata_it->second.factor_class;
+                      stage_a_root_bootstrap_first_missing_blocked_slot_keys =
+                          metadata_it->second.factor_keys;
+                    } else if (replay_factors.exists(blocked_slot) &&
+                               replay_factors.at(blocked_slot)) {
+                      stage_a_root_bootstrap_first_missing_blocked_slot_class =
+                          classify_forensic_remove_factor_class(
+                              replay_factors.at(blocked_slot));
+                      stage_a_root_bootstrap_first_missing_blocked_slot_keys =
+                          format_factor_keys_for_slot(replay_factors,
+                                                      blocked_slot);
+                    } else {
+                      stage_a_root_bootstrap_first_missing_blocked_slot_class =
+                          "missing_slot";
+                      stage_a_root_bootstrap_first_missing_blocked_slot_keys =
+                          "none";
+                    }
+                    break;
+                  }
+                }
+                if (!stage_a_root_blocked_component_member_slots.empty()) {
+                  std::unordered_set<gtsam::FactorIndex>
+                      root_component_slots_for_support;
+                  root_component_slots_for_support.reserve(
+                      stage_a_root_blocked_component_member_slots.size());
+                  for (const size_t slot :
+                       stage_a_root_blocked_component_member_slots) {
+                    root_component_slots_for_support.insert(
+                        static_cast<gtsam::FactorIndex>(slot));
+                  }
+
+                  auto defer_root_blocked_slot = [&](const size_t slot,
+                                                     const std::string& reason) {
+                    CbsSummaryCoveredCrossingReplayMetadata metadata;
+                    const auto metadata_it =
+                        cbs_phase2_summary_covered_crossing_replay_metadata_map.find(
+                            slot);
+                    if (metadata_it !=
+                        cbs_phase2_summary_covered_crossing_replay_metadata_map
+                            .end()) {
+                      metadata = metadata_it->second;
+                    }
+                    if (metadata.slot_id == 0u) {
+                      metadata.slot_id = slot;
+                    }
+                    if (metadata.factor_class.empty() ||
+                        metadata.factor_class == "none") {
+                      const auto& replay_factors =
+                          cbs_optimizer_->getFactorsUnsafe();
+                      if (replay_factors.exists(slot) &&
+                          replay_factors.at(slot)) {
+                        metadata.factor_class =
+                            classify_forensic_remove_factor_class(
+                                replay_factors.at(slot));
+                        metadata.factor_keys =
+                            format_factor_keys_for_slot(replay_factors, slot);
+                      } else {
+                        metadata.factor_class = "missing_slot";
+                        metadata.factor_keys = "none";
+                      }
+                    }
+                    if (metadata.factor_keys.empty()) {
+                      metadata.factor_keys = "none";
+                    }
+                    std::string block_key = cbs_phase2_root_bootstrap_blocking_key;
+                    long long block_support_slot =
+                        cbs_phase2_root_bootstrap_blocking_support_slot;
+                    std::string block_support_slot_class =
+                        cbs_phase2_root_bootstrap_blocking_support_slot_class;
+                    std::string block_support_slot_keys =
+                        cbs_phase2_root_bootstrap_blocking_support_slot_keys;
+                    if (block_key == "none" && metadata.blocking_key != "none") {
+                      block_key = metadata.blocking_key;
+                    }
+                    if (block_support_slot < 0 &&
+                        metadata.blocking_support_slot >= 0) {
+                      block_support_slot = metadata.blocking_support_slot;
+                    }
+                    if (block_support_slot_class == "none" &&
+                        metadata.blocking_support_slot_class != "none") {
+                      block_support_slot_class =
+                          metadata.blocking_support_slot_class;
+                    }
+                    if (block_support_slot_keys == "none" &&
+                        metadata.blocking_support_slot_keys != "none") {
+                      block_support_slot_keys = metadata.blocking_support_slot_keys;
+                    }
+                    if (metadata.first_defer_epoch == 0u) {
+                      metadata.first_defer_epoch =
+                          metadata.defer_epoch == 0u ? curr_kf_id_
+                                                     : metadata.defer_epoch;
+                    }
+                    metadata.defer_epoch = curr_kf_id_;
+                    metadata.replay_path = "direct_local_pending";
+                    metadata.pending_reason = reason;
+                    metadata.blocking_key =
+                        block_key.empty() ? "none" : block_key;
+                    metadata.blocking_support_slot = block_support_slot;
+                    metadata.blocking_support_slot_class =
+                        block_support_slot_class.empty()
+                            ? "none"
+                            : block_support_slot_class;
+                    metadata.blocking_support_slot_keys =
+                        block_support_slot_keys.empty()
+                            ? "none"
+                            : block_support_slot_keys;
+                    std::ostringstream blocking_incident_id_oss;
+                    if (cbs_phase2_root_bootstrap_blocking_incident_id !=
+                        "none") {
+                      metadata.blocking_incident_id =
+                          cbs_phase2_root_bootstrap_blocking_incident_id;
+                    } else {
+                      blocking_incident_id_oss
+                          << "key="
+                          << (metadata.blocking_key.empty() ? "none"
+                                                            : metadata.blocking_key)
+                          << "|slot=" << metadata.blocking_support_slot;
+                      metadata.blocking_incident_id =
+                          blocking_incident_id_oss.str();
+                    }
+                    metadata.blocking_incident_member_slots =
+                        cbs_phase2_root_bootstrap_blocked_component_slots_set.empty()
+                            ? "none"
+                            : format_slot_set_preview(
+                                  cbs_phase2_root_bootstrap_blocked_component_slots_set,
+                                  16u);
+                    if (is_replay_identity_consumed_this_epoch(metadata)) {
+                      ++replay_blocked_reenqueue_same_epoch_count_diag;
+                      return;
+                    }
+                    cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                        [metadata.slot_id] = metadata;
+                  };
+
+                  if (!cbs_phase2_heart_ || !phase2_plan_ready) {
+                    stage_a_root_bootstrap_treatment_deferred_this_epoch = true;
+                    stage_a_root_bootstrap_treatment_mode =
+                        "root_bootstrap_support_unavailable";
+                    stage_a_root_bootstrap_first_failure_reason =
+                        "heart_or_plan_unavailable";
+                    for (const size_t slot :
+                         stage_a_root_blocked_component_member_slots) {
+                      defer_root_blocked_slot(
+                          slot,
+                          "root_bootstrap_support_unavailable_this_epoch");
+                    }
+                  } else {
+                    gtsam::NonlinearFactorGraph root_bootstrap_support_factors;
+                    std::unordered_set<gtsam::FactorIndex>
+                        root_bootstrap_supported_slots;
+                    std::string root_bootstrap_support_failure_reason = "none";
+                    CbsFixedLagBpsamHeart::RootBootstrapSupportBuildStats
+                        root_bootstrap_support_stats;
+                    const bool root_bootstrap_support_built =
+                        cbs_phase2_heart_
+                            ->appendRootBootstrapDirectLocalSupportFactors(
+                                phase2_incremental_plan,
+                                root_component_slots_for_support,
+                                &root_bootstrap_support_factors,
+                                &root_bootstrap_supported_slots,
+                                &root_bootstrap_support_failure_reason,
+                                &root_bootstrap_support_stats);
+                    stage_a_root_bootstrap_incident_crossing_support_slot_count =
+                        root_bootstrap_support_stats
+                            .incident_crossing_support_slot_count;
+                    stage_a_root_bootstrap_incident_crossing_support_slots_first_few =
+                        sanitize_forensic_token(
+                            root_bootstrap_support_stats
+                                .incident_crossing_support_slots_first_few);
+                    stage_a_root_bootstrap_kept_target_key_count =
+                        root_bootstrap_support_stats.kept_target_key_count;
+                    stage_a_root_bootstrap_kept_target_keys_first_few =
+                        sanitize_forensic_token(root_bootstrap_support_stats
+                                                    .kept_target_keys_first_few);
+                    stage_a_root_bootstrap_selected_graph_factor_count =
+                        root_bootstrap_support_stats.selected_graph_factor_count;
+                    stage_a_root_bootstrap_eliminate_key_count =
+                        root_bootstrap_support_stats.eliminate_key_count;
+                    stage_a_root_bootstrap_augment_mode =
+                        sanitize_forensic_token(
+                            root_bootstrap_support_stats.augment_mode);
+                    stage_a_root_bootstrap_support_factor_count =
+                        count_nonnull_factors(root_bootstrap_support_factors);
+                    stage_a_root_bootstrap_remove_count =
+                        root_bootstrap_supported_slots.size();
+                    const bool full_root_component_supported =
+                        root_bootstrap_supported_slots.size() ==
+                        root_component_slots_for_support.size();
+                    if (root_bootstrap_support_built &&
+                        stage_a_root_bootstrap_support_factor_count > 0u &&
+                        full_root_component_supported) {
+                      stage_a_root_bootstrap_treatment_applied_this_epoch = true;
+                      stage_a_root_bootstrap_treatment_mode =
+                          "root_bootstrap_support_plus_remove_same_stage_a";
+                      stage_a_summary_factors_for_update =
+                          *stage_a_summary_factors_for_update_ptr;
+                      for (const auto& factor_ptr :
+                           root_bootstrap_support_factors) {
+                        if (factor_ptr) {
+                          stage_a_summary_factors_for_update.push_back(factor_ptr);
+                        }
+                      }
+                      stage_a_summary_factors_for_update_ptr =
+                          &stage_a_summary_factors_for_update;
+                      for (const auto slot : root_bootstrap_supported_slots) {
+                        const size_t slot_id = static_cast<size_t>(slot);
+                        stage_a_root_bootstrap_supported_slots_set.insert(slot_id);
+                        if (update_a_remove_slots_set.insert(slot_id).second) {
+                          update_a_remove_slots.push_back(slot_id);
+                        }
+                        CbsSummaryCoveredCrossingReplayMetadata metadata;
+                        const auto metadata_it =
+                            cbs_phase2_summary_covered_crossing_replay_metadata_map
+                                .find(slot_id);
+                        if (metadata_it !=
+                            cbs_phase2_summary_covered_crossing_replay_metadata_map
+                                .end()) {
+                          metadata = metadata_it->second;
+                        }
+                        if (metadata.slot_id == 0u) {
+                          metadata.slot_id = slot_id;
+                        }
+                        if (metadata.factor_class.empty() ||
+                            metadata.factor_class == "none" ||
+                            metadata.factor_keys.empty() ||
+                            metadata.factor_keys == "none") {
+                          const auto& replay_factors =
+                              cbs_optimizer_->getFactorsUnsafe();
+                          if (replay_factors.exists(slot_id) &&
+                              replay_factors.at(slot_id)) {
+                            metadata.factor_class =
+                                classify_forensic_remove_factor_class(
+                                    replay_factors.at(slot_id));
+                            metadata.factor_keys = format_factor_keys_for_slot(
+                                replay_factors, slot_id);
+                          } else {
+                            metadata.factor_class = "missing_slot";
+                            metadata.factor_keys = "none";
+                          }
+                        }
+                        const size_t removed_from_pending_before =
+                            replay_removed_from_direct_local_pending_queue_count_diag;
+                        consume_replay_identity_from_all_stores(slot_id, metadata);
+                        const size_t removed_from_pending_now =
+                            replay_removed_from_direct_local_pending_queue_count_diag -
+                            removed_from_pending_before;
+                        if (removed_from_pending_now > 0u) {
+                          replay_direct_local_removed_after_promotion_count_diag +=
+                              removed_from_pending_now;
+                          if (first_promoted_removed_slot_diag < 0) {
+                            first_promoted_removed_slot_diag =
+                                static_cast<long long>(
+                                    metadata.slot_id == 0u ? slot_id
+                                                           : metadata.slot_id);
+                            first_promoted_removed_slot_class_diag =
+                                sanitize_forensic_token(metadata.factor_class);
+                            first_promoted_removed_slot_keys_diag =
+                                sanitize_forensic_token(metadata.factor_keys);
+                          }
+                        }
+                      }
+                    } else {
+                      stage_a_root_bootstrap_treatment_deferred_this_epoch = true;
+                      stage_a_root_bootstrap_treatment_mode =
+                          "root_bootstrap_support_unavailable_fail_closed";
+                      if (!root_bootstrap_support_built) {
+                        stage_a_root_bootstrap_first_failure_reason =
+                            root_bootstrap_support_failure_reason.empty()
+                                ? "support_build_failed"
+                                : root_bootstrap_support_failure_reason;
+                      } else if (stage_a_root_bootstrap_support_factor_count == 0u) {
+                        stage_a_root_bootstrap_first_failure_reason =
+                            "support_build_emitted_zero_factors";
+                      } else if (!full_root_component_supported) {
+                        stage_a_root_bootstrap_first_failure_reason =
+                            "support_partial_slot_coverage";
+                      } else {
+                        stage_a_root_bootstrap_first_failure_reason = "unknown";
+                      }
+                      for (const size_t slot :
+                           stage_a_root_blocked_component_member_slots) {
+                        defer_root_blocked_slot(
+                            slot,
+                            "root_bootstrap_support_not_realized_this_epoch");
+                      }
+                    }
+                  }
+                }
+              }
+
+              if (!replay_valid_slots_for_stage_a.empty()) {
+                std::unordered_set<gtsam::FactorIndex>
+                    augmented_required_crossing_slots;
+                augmented_required_crossing_slots.reserve(
+                    cbs_phase2_lag_apply_summary_covered_crossing_slots_set.size() +
+                    replay_valid_slots_for_stage_a.size());
+                for (const size_t slot :
+                     cbs_phase2_lag_apply_summary_covered_crossing_slots_set) {
+                  augmented_required_crossing_slots.insert(
+                      static_cast<gtsam::FactorIndex>(slot));
+                }
+                for (const size_t slot : replay_valid_slots_for_stage_a) {
+                  augmented_required_crossing_slots.insert(
+                      static_cast<gtsam::FactorIndex>(slot));
+                }
+                stage_a_replay_support_augmented_required_count =
+                    augmented_required_crossing_slots.size();
+                stage_a_replay_support_augmented_requested_slots_first_few =
+                    sanitize_forensic_token(
+                        format_slot_set_preview(augmented_required_crossing_slots,
+                                                16u));
+
+                auto note_first_unsupported_replay_slot =
+                    [&](const size_t slot) {
+                      if (stage_a_replay_first_unsupported_slot >= 0) {
+                        return;
+                      }
+                      stage_a_replay_first_unsupported_slot =
+                          static_cast<long long>(slot);
+                      const auto metadata_it =
+                          cbs_phase2_summary_covered_crossing_replay_metadata_map
+                              .find(slot);
+                      if (metadata_it !=
+                              cbs_phase2_summary_covered_crossing_replay_metadata_map
+                                  .end() &&
+                          !metadata_it->second.factor_class.empty()) {
+                        stage_a_replay_first_unsupported_slot_class =
+                            sanitize_forensic_token(
+                                metadata_it->second.factor_class);
+                        stage_a_replay_first_unsupported_slot_keys =
+                            sanitize_forensic_token(
+                                metadata_it->second.factor_keys);
+                        return;
+                      }
+                      const auto& support_factors = cbs_optimizer_->getFactorsUnsafe();
+                      if (support_factors.exists(slot) && support_factors.at(slot)) {
+                        stage_a_replay_first_unsupported_slot_class =
+                            sanitize_forensic_token(
+                                classify_forensic_remove_factor_class(
+                                    support_factors.at(slot)));
+                        stage_a_replay_first_unsupported_slot_keys =
+                            sanitize_forensic_token(format_factor_keys_for_slot(
+                                support_factors, slot));
+                      } else {
+                        stage_a_replay_first_unsupported_slot_class = "missing_slot";
+                        stage_a_replay_first_unsupported_slot_keys = "none";
+                      }
+                    };
+
+                if (cbs_use_phase2_summary_prior_bridge && cbs_phase2_heart_ &&
+                    phase2_plan_ready) {
+                  CbsFixedLagBpsamHeart::LagWindowPlan replay_support_plan =
+                      phase2_incremental_plan;
+                  gtsam::NonlinearFactorGraph replay_support_summary_factors;
+                  CbsFixedLagBpsamHeart::SummaryBuildStats replay_support_stats;
+                  const bool replay_support_emitted =
+                      cbs_phase2_heart_->appendLagEdgeSummaryFactors(
+                          &replay_support_plan,
+                          &replay_support_summary_factors,
+                          &replay_support_stats,
+                          &augmented_required_crossing_slots);
+                  std::unordered_set<size_t>
+                      replay_caller_supported_requested_slots_set;
+                  for (const auto slot :
+                       replay_support_stats
+                           .caller_requested_supported_crossing_slots_exact) {
+                    replay_caller_supported_requested_slots_set.insert(
+                        static_cast<size_t>(slot));
+                  }
+                  stage_a_replay_support_caller_requested_count =
+                      replay_support_stats
+                          .caller_requested_crossing_slots_count;
+                  stage_a_replay_support_caller_supported_count =
+                      replay_support_stats
+                          .caller_requested_supported_crossing_slots_count;
+                  stage_a_replay_support_caller_requested_slots_first_few =
+                      replay_support_stats
+                          .caller_requested_crossing_slots_first_few;
+                  stage_a_replay_support_caller_supported_slots_first_few =
+                      replay_support_stats
+                          .caller_requested_supported_crossing_slots_first_few;
+                  stage_a_replay_support_caller_domain_coherence_ok =
+                      replay_support_stats
+                          .caller_requested_domain_coherence_ok;
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain =
+                      replay_support_stats
+                          .first_caller_requested_slot_missing_from_internal_crossing_domain;
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_class =
+                      replay_support_stats
+                          .first_caller_requested_slot_missing_from_internal_crossing_domain_class;
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_keys =
+                      replay_support_stats
+                          .first_caller_requested_slot_missing_from_internal_crossing_domain_keys;
+                  stage_a_replay_support_caller_missing_from_internal_domain_count =
+                      replay_support_stats
+                          .caller_requested_missing_from_internal_domain_count;
+                  stage_a_replay_support_caller_missing_from_internal_domain_first_few =
+                      replay_support_stats
+                          .caller_requested_missing_from_internal_domain_first_few;
+                  stage_a_replay_support_caller_slot_classification_first_few =
+                      replay_support_stats
+                          .caller_requested_slot_classification_first_few;
+                  stage_a_replay_support_first_caller_requested_slot_exclusion_reason =
+                      replay_support_stats
+                          .first_caller_requested_slot_exclusion_reason;
+                  stage_a_replay_support_augmented_requested_count =
+                      stage_a_replay_support_caller_requested_count;
+                  stage_a_replay_support_augmented_covered_count =
+                      replay_support_stats.summary_covered_crossing_slots_count;
+                  stage_a_replay_support_augmented_supported_requested_count =
+                      stage_a_replay_support_caller_supported_count;
+                  stage_a_replay_support_augmented_supported_requested_slots_first_few =
+                      stage_a_replay_support_caller_supported_slots_first_few;
+                  stage_a_replay_support_augmented_requested_slots_first_few =
+                      stage_a_replay_support_caller_requested_slots_first_few;
+                  stage_a_replay_support_augmented_requested_supported_coherence_ok =
+                      stage_a_replay_support_caller_domain_coherence_ok;
+                  for (const size_t slot : replay_valid_slots_for_stage_a) {
+                    if (replay_caller_supported_requested_slots_set.count(slot) >
+                        0u) {
+                      ++stage_a_replay_support_supported_count;
+                    } else {
+                      ++stage_a_replay_support_unsupported_count;
+                      note_first_unsupported_replay_slot(slot);
+                    }
+                  }
+                  const bool replay_support_complete =
+                      stage_a_replay_support_unsupported_count == 0u;
+                  stage_a_replay_support_aggregate_exact_mismatch =
+                      stage_a_replay_support_augmented_required_count > 0u &&
+                      stage_a_replay_support_augmented_required_count ==
+                          stage_a_replay_support_augmented_covered_count &&
+                      stage_a_replay_support_supported_count == 0u;
+                  const size_t replay_support_factor_count =
+                      count_nonnull_factors(replay_support_summary_factors);
+                  if (stage_a_replay_support_aggregate_exact_mismatch) {
+                    stage_a_replay_support_contract_mode =
+                        "aggregate_equal_exact_zero_fail_closed";
+                  } else if (!stage_a_replay_support_augmented_requested_supported_coherence_ok) {
+                    stage_a_replay_support_contract_mode =
+                        "heart_requested_supported_incoherent";
+                  } else if (replay_support_complete) {
+                    stage_a_replay_support_contract_mode =
+                        "exact_replay_supported";
+                  } else {
+                    stage_a_replay_support_contract_mode =
+                        "exact_replay_partial_or_none";
+                  }
+                  if (replay_support_complete &&
+                      replay_support_stats.summary_implemented_this_epoch &&
+                      replay_support_emitted && replay_support_factor_count > 0u) {
+                    stage_a_summary_factors_for_update =
+                        replay_support_summary_factors;
+                    stage_a_summary_factors_for_update_ptr =
+                        &stage_a_summary_factors_for_update;
+                    stage_a_replay_applied_this_epoch = true;
+                    stage_a_replay_support_mode =
+                        "augmented_replay_support_ready";
+                  } else {
+                    stage_a_replay_deferred_again_this_epoch = true;
+                    if (stage_a_replay_support_aggregate_exact_mismatch) {
+                      stage_a_replay_support_mode =
+                          "augmented_count_match_exact_slot_mismatch";
+                      stage_a_replay_support_contract_mode =
+                          "aggregate_equal_exact_zero_fail_closed";
+                    } else if (replay_support_complete) {
+                      stage_a_replay_support_mode =
+                          "augmented_support_not_realized";
+                      stage_a_replay_support_contract_mode =
+                          "exact_supported_not_realized";
+                    } else {
+                      stage_a_replay_support_mode =
+                          "augmented_support_incomplete";
+                      if (!stage_a_replay_support_augmented_requested_supported_coherence_ok) {
+                        stage_a_replay_support_contract_mode =
+                            "heart_requested_supported_incoherent";
+                      } else {
+                        stage_a_replay_support_contract_mode =
+                            "exact_replay_partial_or_none";
+                      }
+                    }
+                  }
+                } else {
+                  stage_a_replay_support_supported_count = 0u;
+                  stage_a_replay_support_unsupported_count =
+                      replay_valid_slots_for_stage_a.size();
+                  stage_a_replay_support_caller_requested_count =
+                      stage_a_replay_support_augmented_required_count;
+                  stage_a_replay_support_caller_supported_count = 0u;
+                  stage_a_replay_support_caller_requested_slots_first_few =
+                      stage_a_replay_support_augmented_requested_slots_first_few;
+                  stage_a_replay_support_caller_supported_slots_first_few =
+                      "none";
+                  stage_a_replay_support_caller_domain_coherence_ok = false;
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain =
+                      -1;
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_class =
+                      "none";
+                  stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_keys =
+                      "none";
+                  stage_a_replay_support_caller_missing_from_internal_domain_count =
+                      stage_a_replay_support_caller_requested_count;
+                  stage_a_replay_support_caller_missing_from_internal_domain_first_few =
+                      stage_a_replay_support_augmented_requested_slots_first_few;
+                  stage_a_replay_support_caller_slot_classification_first_few =
+                      "none";
+                  stage_a_replay_support_first_caller_requested_slot_exclusion_reason =
+                      "support_unavailable";
+                  stage_a_replay_support_augmented_requested_count =
+                      stage_a_replay_support_augmented_required_count;
+                  stage_a_replay_support_augmented_covered_count =
+                      cbs_phase2_summary_covered_crossing_slots_set.size();
+                  stage_a_replay_support_augmented_supported_requested_count = 0u;
+                  stage_a_replay_support_augmented_supported_requested_slots_first_few =
+                      "none";
+                  stage_a_replay_support_augmented_requested_supported_coherence_ok =
+                      false;
+                  stage_a_replay_deferred_again_this_epoch = true;
+                  stage_a_replay_support_mode = "augmented_support_unavailable";
+                  stage_a_replay_support_contract_mode =
+                      "support_unavailable_fail_closed";
+                  if (!replay_valid_slots_for_stage_a.empty()) {
+                    note_first_unsupported_replay_slot(
+                        replay_valid_slots_for_stage_a.front());
+                  }
+                }
+
+                if (stage_a_replay_deferred_again_this_epoch) {
+                  gtsam::FactorIndices filtered_stage_a_remove_slots;
+                  filtered_stage_a_remove_slots.reserve(
+                      update_a_remove_slots.size());
+                  for (const size_t slot : update_a_remove_slots) {
+                    if (replay_valid_slots_for_stage_a_set.count(slot) == 0u) {
+                      filtered_stage_a_remove_slots.push_back(slot);
+                    }
+                  }
+                  update_a_remove_slots.swap(filtered_stage_a_remove_slots);
+                  update_a_remove_slots_set.clear();
+                  update_a_remove_slots_set.insert(update_a_remove_slots.begin(),
+                                                   update_a_remove_slots.end());
+                  for (const size_t slot : replay_valid_slots_for_stage_a) {
+                    CbsSummaryCoveredCrossingReplayMetadata metadata;
+                    const auto metadata_it =
+                        cbs_phase2_summary_covered_crossing_replay_metadata_map.find(
+                            slot);
+                    if (metadata_it !=
+                        cbs_phase2_summary_covered_crossing_replay_metadata_map
+                            .end()) {
+                      metadata = metadata_it->second;
+                    } else {
+                      metadata.slot_id = slot;
+                      const auto& support_factors =
+                          cbs_optimizer_->getFactorsUnsafe();
+                      if (support_factors.exists(slot) &&
+                          support_factors.at(slot)) {
+                        metadata.factor_class =
+                            classify_forensic_remove_factor_class(
+                                support_factors.at(slot));
+                        metadata.factor_keys =
+                            format_factor_keys_for_slot(support_factors, slot);
+                      } else {
+                        metadata.factor_class = "missing_slot";
+                        metadata.factor_keys = "none";
+                      }
+                    }
+                    metadata.defer_epoch = curr_kf_id_;
+                    cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_
+                        [slot] = metadata;
+                  }
+                  cbs_phase2_summary_covered_crossing_replay_stage =
+                      "two_stage_stage_a_replay_deferred_missing_support";
+                  cbs_phase2_stage_a_replay_skipped_due_to_failure = true;
+                  cbs_phase2_summary_covered_crossing_replayed_count = 0u;
+                  cbs_phase2_replayed_summary_crossing_count = 0u;
+                }
+                cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count +=
+                    stage_a_replay_deferred_again_this_epoch
+                        ? replay_valid_slots_for_stage_a.size()
+                        : 0u;
+              }
+
+              if (!replay_direct_local_apply_candidate_slots.empty()) {
+                const size_t stage_a_summary_factor_count_for_packet =
+                    count_nonnull_factors(*stage_a_summary_factors_for_update_ptr);
+                const size_t stage_a_values_count_for_packet = 0u;
+                const bool stage_a_packet_is_summary_only =
+                    stage_a_values_count_for_packet == 0u &&
+                    stage_a_summary_factor_count_for_packet > 0u;
+                if (stage_a_packet_is_summary_only) {
+                  stage_a_direct_local_packet_shape_mode =
+                      stage_a_root_bootstrap_support_factor_count > 0u
+                          ? "summary_only_with_root_bootstrap_support"
+                          : "summary_only_without_direct_local_support";
+                } else if (stage_a_values_count_for_packet > 0u) {
+                  stage_a_direct_local_packet_shape_mode = "stage_a_has_values";
+                } else {
+                  stage_a_direct_local_packet_shape_mode = "non_summary_stage_a";
+                }
+                stage_a_direct_local_packet_compatible_slots.reserve(
+                    replay_direct_local_apply_candidate_slots.size());
+                stage_a_direct_local_packet_incompatible_slots.reserve(
+                    replay_direct_local_apply_candidate_slots.size());
+                for (const size_t slot : replay_direct_local_apply_candidate_slots) {
+                  const bool slot_has_root_bootstrap_support =
+                      stage_a_root_bootstrap_treatment_applied_this_epoch &&
+                      stage_a_root_bootstrap_supported_slots_set.count(slot) > 0u;
+                  const bool slot_packet_compatible =
+                      !stage_a_packet_is_summary_only ||
+                      slot_has_root_bootstrap_support;
+                  if (slot_packet_compatible) {
+                    stage_a_direct_local_packet_compatible_slots.push_back(slot);
+                    if (update_a_remove_slots_set.insert(slot).second) {
+                      update_a_remove_slots.push_back(slot);
+                    }
+                    continue;
+                  }
+                  stage_a_direct_local_packet_incompatible_slots.push_back(slot);
+                  CbsSummaryCoveredCrossingReplayMetadata metadata;
+                  const auto metadata_it =
+                      replay_direct_local_apply_candidates_metadata.find(slot);
+                  if (metadata_it !=
+                      replay_direct_local_apply_candidates_metadata.end()) {
+                    metadata = metadata_it->second;
+                  }
+                  if (metadata.slot_id == 0u) {
+                    metadata.slot_id = slot;
+                  }
+                  if (metadata.first_defer_epoch == 0u) {
+                    metadata.first_defer_epoch =
+                        metadata.defer_epoch == 0u ? curr_kf_id_
+                                                   : metadata.defer_epoch;
+                  }
+                  metadata.defer_epoch = curr_kf_id_;
+                  metadata.replay_path = "direct_local_pending";
+                  metadata.pending_reason =
+                      "direct_local_stage_a_packet_shape_incompatible";
+                  if (metadata.blocking_key.empty()) {
+                    metadata.blocking_key = "none";
+                  }
+                  if (metadata.blocking_support_slot_class.empty()) {
+                    metadata.blocking_support_slot_class = "none";
+                  }
+                  if (metadata.blocking_support_slot_keys.empty()) {
+                    metadata.blocking_support_slot_keys = "none";
+                  }
+                  if (metadata.blocking_incident_id.empty()) {
+                    metadata.blocking_incident_id = "none";
+                  }
+                  cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                      [metadata.slot_id] = metadata;
+                  ++replay_direct_local_policy_deferred_count_diag;
+                  if (replay_direct_local_first_policy_deferred_slot_diag < 0) {
+                    replay_direct_local_first_policy_deferred_slot_diag =
+                        static_cast<long long>(metadata.slot_id);
+                    replay_direct_local_first_policy_deferred_slot_class_diag =
+                        sanitize_forensic_token(metadata.factor_class);
+                    replay_direct_local_first_policy_deferred_slot_keys_diag =
+                        sanitize_forensic_token(metadata.factor_keys);
+                  }
+                }
+                std::sort(stage_a_direct_local_packet_compatible_slots.begin(),
+                          stage_a_direct_local_packet_compatible_slots.end());
+                stage_a_direct_local_packet_compatible_slots.erase(
+                    std::unique(stage_a_direct_local_packet_compatible_slots.begin(),
+                                stage_a_direct_local_packet_compatible_slots.end()),
+                    stage_a_direct_local_packet_compatible_slots.end());
+                std::sort(stage_a_direct_local_packet_incompatible_slots.begin(),
+                          stage_a_direct_local_packet_incompatible_slots.end());
+                stage_a_direct_local_packet_incompatible_slots.erase(
+                    std::unique(
+                        stage_a_direct_local_packet_incompatible_slots.begin(),
+                        stage_a_direct_local_packet_incompatible_slots.end()),
+                    stage_a_direct_local_packet_incompatible_slots.end());
+                stage_a_direct_local_packet_compatible_count =
+                    stage_a_direct_local_packet_compatible_slots.size();
+                stage_a_direct_local_packet_incompatible_count =
+                    stage_a_direct_local_packet_incompatible_slots.size();
+                if (stage_a_direct_local_packet_incompatible_count > 0u) {
+                  stage_a_direct_local_packet_incompatibility_reason =
+                      "direct_local_stage_a_packet_shape_incompatible";
+                  replay_direct_local_apply_policy_mode_diag =
+                      "route_direct_local_stage_a_incompatible_to_stage_b_packet_remove_contract";
+                  for (const size_t slot :
+                       stage_a_direct_local_packet_incompatible_slots) {
+                    if (update_b_remove_slots_set.insert(slot).second) {
+                      update_b_remove_slots.push_back(slot);
+                    }
+                    stage_b_direct_local_replay_apply_slots.push_back(slot);
+                  }
+                  std::sort(stage_b_direct_local_replay_apply_slots.begin(),
+                            stage_b_direct_local_replay_apply_slots.end());
+                  stage_b_direct_local_replay_apply_slots.erase(
+                      std::unique(stage_b_direct_local_replay_apply_slots.begin(),
+                                  stage_b_direct_local_replay_apply_slots.end()),
+                      stage_b_direct_local_replay_apply_slots.end());
+                }
+              } else {
+                stage_a_direct_local_packet_shape_mode =
+                    "no_direct_local_removable_candidates";
+              }
+
+              update_a_params.removeFactorIndices = update_a_remove_slots;
+              update_b_params.removeFactorIndices = update_b_remove_slots;
+              replay_direct_local_apply_stage_a_remove_slots_first_few_diag =
+                  sanitize_forensic_token(format_factor_slots_preview(
+                      update_a_params.removeFactorIndices, 16u));
+              const size_t stage_a_original_remove_count =
+                  update_a_params.removeFactorIndices.size();
+              size_t stage_a_replay_remove_count = 0u;
+              for (const size_t slot : update_a_params.removeFactorIndices) {
+                if (replay_valid_slots_for_stage_a_set.count(slot) > 0u) {
+                  ++stage_a_replay_remove_count;
+                }
+              }
+              const size_t stage_a_fresh_remove_count =
+                  stage_a_original_remove_count >= stage_a_replay_remove_count
+                      ? (stage_a_original_remove_count -
+                         stage_a_replay_remove_count)
+                      : 0u;
+              const bool cbs_phase2_stage_a_zero_remove_first_boundary_epoch_mode =
+                  cbs_phase2_diag_stage_a_zero_remove_first_boundary_epoch;
+              const bool cbs_phase2_stage_a_zero_remove_first_boundary_epoch_effective =
+                  cbs_phase2_stage_a_zero_remove_first_boundary_epoch_mode &&
+                  cbs_phase2_replay_into_stage_a_mode &&
+                  !stage_a_zero_remove_boundary_diag_emitted_once &&
+                  stage_a_original_remove_count > 0u;
+              if (cbs_phase2_stage_a_zero_remove_first_boundary_epoch_effective) {
+                update_a_params.removeFactorIndices.clear();
+                stage_a_zero_remove_boundary_diag_emitted_once = true;
+              }
+              remove_update_attempted_this_attempt =
+                  !update_a_params.removeFactorIndices.empty() ||
+                  !update_b_params.removeFactorIndices.empty();
+              if (enable_remove_factor_indices &&
+                  remove_update_attempted_this_attempt) {
+                lag_boundary_remove_update_attempted = true;
+              }
+              cbs_phase2_two_stage_update_a_summary_factor_count =
+                  count_nonnull_factors(*stage_a_summary_factors_for_update_ptr);
+              cbs_phase2_two_stage_update_b_new_factor_count =
+                  count_nonnull_factors(cbs_current_epoch_new_vio_factors);
+              cbs_phase2_two_stage_update_b_new_value_count = new_values.size();
+              cbs_phase2_stage_a_summary_factor_count =
+                  cbs_phase2_two_stage_update_a_summary_factor_count;
+              cbs_phase2_stage_a_remove_count =
+                  update_a_params.removeFactorIndices.size();
+              cbs_phase2_stage_a_summary_crossing_remove_count =
+                  cbs_phase2_stage_a_remove_count;
+              cbs_phase2_stage_a_summary_crossing_remove_deferred_count =
+                  cbs_phase2_stage_a_summary_only_mode
+                      ? summary_crossing_remove_candidate_count
+                      : 0u;
+
+              gtsam::ISAM2Result update_a_result;
+              gtsam::ISAM2Result update_b_result;
+              gtsam::FactorIndices update_a_effective_remove_slots;
+              gtsam::FactorIndices update_b_effective_remove_slots;
+              bool update_a_retry_attempted = false;
+              bool update_a_retry_succeeded = false;
+              bool update_b_retry_attempted = false;
+              bool update_b_retry_succeeded = false;
+              bool stage_a_completed_successfully = false;
+              std::string stage_a_failure_reason = "none";
+              bool stage_a_replay_subset_probe_ran = false;
+              size_t stage_a_replay_subset_probe_slot_count = 0u;
+              std::string stage_a_replay_subset_probe_slots_first_few = "none";
+              std::string stage_a_replay_subset_probe_first_slot_class = "none";
+              std::string stage_a_replay_subset_probe_first_slot_keys = "none";
+              std::string stage_a_replay_subset_probe_full_result = "not_run";
+              std::string stage_a_replay_subset_probe_per_slot_results = "none";
+              std::string stage_a_replay_subset_probe_per_class_results = "none";
+              long long stage_a_replay_subset_probe_minimal_bad_slot = -1;
+              std::string stage_a_replay_subset_probe_minimal_bad_class = "none";
+              bool stage_a_replay_ordering_probe_ran = false;
+              size_t stage_a_replay_ordering_probe_slot_count = 0u;
+              size_t stage_a_replay_ordering_probe_binary_slot_count = 0u;
+              size_t stage_a_replay_ordering_probe_imu_like_slot_count = 0u;
+              std::string stage_a_replay_ordering_probe_binary_then_imu_result =
+                  "not_run";
+              std::string stage_a_replay_ordering_probe_imu_then_binary_result =
+                  "not_run";
+              std::string stage_a_replay_ordering_probe_first_working_order =
+                  "none";
+              bool stage_a_replay_ordering_probe_full_combined_failed = false;
+              cbs_phase2_stage_a_skip_epoch_on_initial_failure_mode =
+                  cbs_phase2_diag_stage_a_skip_epoch_on_initial_failure;
+              cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure = false;
+              cbs_phase2_stage_a_skipped_kf = -1;
+              cbs_phase2_stage_a_skip_reason = "none";
+
+              cbs_phase2_two_stage_update_a_executed = true;
+              cbs_phase2_summary_crossing_replay_stage_executed =
+                  stage_a_replay_applied_this_epoch;
+              const bool stage_a_with_replay_attempted =
+                  cbs_phase2_summary_crossing_replay_stage_executed;
+              const gtsam::Values stage_a_values;
+              if (cbs_phase2_replay_into_stage_a_mode &&
+                  stage_a_replay_descriptor_requested_count > 0u) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageAReplayAwareSupportDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " replay_requested_count="
+                          << stage_a_replay_support_requested_count
+                          << " replay_supported_count="
+                          << stage_a_replay_support_supported_count
+                          << " replay_unsupported_count="
+                          << stage_a_replay_support_unsupported_count
+                          << " augmented_required_crossing_count="
+                          << stage_a_replay_support_augmented_required_count
+                          << " augmented_covered_crossing_count="
+                          << stage_a_replay_support_augmented_covered_count
+                          << " stage_a_summary_factor_count="
+                          << cbs_phase2_two_stage_update_a_summary_factor_count
+                          << " replay_applied_this_epoch="
+                          << (stage_a_replay_applied_this_epoch ? 1 : 0)
+                          << " replay_deferred_again_this_epoch="
+                          << (stage_a_replay_deferred_again_this_epoch ? 1 : 0)
+                          << " support_mode="
+                          << sanitize_forensic_token(stage_a_replay_support_mode)
+                          << " first_unsupported_replay_slot="
+                          << stage_a_replay_first_unsupported_slot
+                          << " first_unsupported_replay_slot_class="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_first_unsupported_slot_class)
+                          << " first_unsupported_replay_slot_keys="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_first_unsupported_slot_keys)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageAReplaySupportContractDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " augmented_requested_crossing_count="
+                          << stage_a_replay_support_augmented_requested_count
+                          << " augmented_supported_requested_crossing_count="
+                          << stage_a_replay_support_augmented_supported_requested_count
+                          << " augmented_supported_requested_crossing_slots_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_augmented_supported_requested_slots_first_few)
+                          << " augmented_requested_crossing_slots_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_augmented_requested_slots_first_few)
+                          << " augmented_requested_supported_coherence_ok="
+                          << (stage_a_replay_support_augmented_requested_supported_coherence_ok
+                                  ? 1
+                                  : 0)
+                          << " replay_requested_count="
+                          << stage_a_replay_support_requested_count
+                          << " replay_supported_count="
+                          << stage_a_replay_support_supported_count
+                          << " replay_unsupported_count="
+                          << stage_a_replay_support_unsupported_count
+                          << " first_unsupported_replay_slot="
+                          << stage_a_replay_first_unsupported_slot
+                          << " first_unsupported_replay_slot_class="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_first_unsupported_slot_class)
+                          << " first_unsupported_replay_slot_keys="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_first_unsupported_slot_keys)
+                          << " contract_mode="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_contract_mode)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageAReplayRequestDomainDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " replay_requested_slots_first_few="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(
+                                     replay_valid_slots_for_stage_a, 16u))
+                          << " caller_requested_crossing_slots_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_caller_requested_slots_first_few)
+                          << " caller_requested_supported_crossing_slots_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_caller_supported_slots_first_few)
+                          << " caller_requested_domain_coherence_ok="
+                          << (stage_a_replay_support_caller_domain_coherence_ok
+                                  ? 1
+                                  : 0)
+                          << " first_caller_requested_slot_missing_from_internal_crossing_domain="
+                          << stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain
+                          << " first_caller_requested_slot_missing_from_internal_crossing_domain_class="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_class)
+                          << " first_caller_requested_slot_missing_from_internal_crossing_domain_keys="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_keys)
+                          << " request_domain_mode="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_contract_mode)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageAReplayDomainClassificationDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " replay_requested_slots_first_few="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(
+                                     replay_valid_slots_for_stage_a, 16u))
+                          << " caller_requested_crossing_slots_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_caller_requested_slots_first_few)
+                          << " caller_requested_missing_from_internal_domain_count="
+                          << stage_a_replay_support_caller_missing_from_internal_domain_count
+                          << " caller_requested_missing_from_internal_domain_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_caller_missing_from_internal_domain_first_few)
+                          << " caller_requested_slot_classification_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_caller_slot_classification_first_few)
+                          << " first_caller_requested_slot_missing_from_internal_crossing_domain="
+                          << stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain
+                          << " first_caller_requested_slot_missing_from_internal_crossing_domain_class="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_class)
+                          << " first_caller_requested_slot_missing_from_internal_crossing_domain_keys="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_first_caller_requested_slot_missing_from_internal_domain_keys)
+                          << " first_caller_requested_slot_exclusion_reason="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_first_caller_requested_slot_exclusion_reason)
+                          << " domain_classification_mode="
+                          << sanitize_forensic_token(
+                                 stage_a_replay_support_contract_mode)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageARootBootstrapComponentDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " root_bootstrap_blocking_incident_id="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_blocking_incident_id)
+                          << " root_blocked_component_member_count="
+                          << stage_a_root_blocked_component_member_slots.size()
+                          << " root_blocked_component_member_slots_first_few="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(
+                                     stage_a_root_blocked_component_member_slots,
+                                     16u))
+                          << " root_blocked_component_complete_vs_direct_local_blocked_count="
+                          << sanitize_forensic_token(
+                                 std::to_string(
+                                     stage_a_root_blocked_component_member_slots
+                                         .size()) +
+                                 "/" +
+                                 std::to_string(
+                                     stage_a_direct_local_blocked_total_count))
+                          << " direct_local_blocked_total_count="
+                          << stage_a_direct_local_blocked_total_count
+                          << " component_mode="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_component_mode)
+                          << " first_component_mismatch_reason="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_component_mismatch_reason)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageARootBootstrapClosureDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " root_bootstrap_seed_slots_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_seed_slots_first_few)
+                          << " root_bootstrap_component_member_slots_first_few="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(
+                                     stage_a_root_blocked_component_member_slots,
+                                     16u))
+                          << " root_bootstrap_component_member_count="
+                          << stage_a_root_blocked_component_member_slots.size()
+                          << " direct_local_blocked_total_count="
+                          << stage_a_direct_local_blocked_total_count
+                          << " closure_complete_vs_direct_local_blocked_count="
+                          << sanitize_forensic_token(
+                                 std::to_string(
+                                     stage_a_root_blocked_component_member_slots
+                                         .size()) +
+                                 "/" +
+                                 std::to_string(
+                                     stage_a_direct_local_blocked_total_count))
+                          << " component_closure_mode="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_component_mode)
+                          << " root_bootstrap_component_seed_count="
+                          << stage_a_root_bootstrap_component_seed_count
+                          << " first_missing_blocked_slot_after_closure="
+                          << stage_a_root_bootstrap_first_missing_blocked_slot_after_closure
+                          << " first_missing_blocked_slot_class="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_first_missing_blocked_slot_class)
+                          << " first_missing_blocked_slot_keys="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_first_missing_blocked_slot_keys)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageARootBootstrapAugmentDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " root_blocked_component_member_slots_first_few="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(
+                                     stage_a_root_blocked_component_member_slots,
+                                     16u))
+                          << " incident_crossing_support_slot_count="
+                          << stage_a_root_bootstrap_incident_crossing_support_slot_count
+                          << " incident_crossing_support_slots_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_incident_crossing_support_slots_first_few)
+                          << " kept_target_key_count="
+                          << stage_a_root_bootstrap_kept_target_key_count
+                          << " kept_target_keys_first_few="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_kept_target_keys_first_few)
+                          << " selected_graph_factor_count="
+                          << stage_a_root_bootstrap_selected_graph_factor_count
+                          << " eliminate_key_count="
+                          << stage_a_root_bootstrap_eliminate_key_count
+                          << " augment_mode="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_augment_mode)
+                          << " first_failure_reason="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_first_failure_reason)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageARootBootstrapTreatmentDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " root_blocked_component_count="
+                          << stage_a_root_blocked_component_count
+                          << " root_blocked_component_member_slots_first_few="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(
+                                     stage_a_root_blocked_component_member_slots,
+                                     16u))
+                          << " root_blocked_component_member_count="
+                          << stage_a_root_blocked_component_member_slots.size()
+                          << " root_bootstrap_support_factor_count="
+                          << stage_a_root_bootstrap_support_factor_count
+                          << " root_bootstrap_remove_count="
+                          << stage_a_root_bootstrap_remove_count
+                          << " root_bootstrap_treatment_applied_this_epoch="
+                          << (stage_a_root_bootstrap_treatment_applied_this_epoch
+                                  ? 1
+                                  : 0)
+                          << " root_bootstrap_treatment_deferred_this_epoch="
+                          << (stage_a_root_bootstrap_treatment_deferred_this_epoch
+                                  ? 1
+                                  : 0)
+                          << " blocking_key="
+                          << sanitize_forensic_token(
+                                 cbs_phase2_root_bootstrap_blocking_key)
+                          << " blocking_support_slot="
+                          << cbs_phase2_root_bootstrap_blocking_support_slot
+                          << " blocking_support_slot_class="
+                          << sanitize_forensic_token(
+                                 cbs_phase2_root_bootstrap_blocking_support_slot_class)
+                          << " blocking_support_slot_keys="
+                          << sanitize_forensic_token(
+                                 cbs_phase2_root_bootstrap_blocking_support_slot_keys)
+                          << " blocking_incident_id="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_blocking_incident_id)
+                          << " treatment_mode="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_treatment_mode)
+                          << " first_failure_reason="
+                          << sanitize_forensic_token(
+                                 stage_a_root_bootstrap_first_failure_reason)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageAReplayDirectLocalPacketCompatibilityDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " direct_local_removable_classified_count="
+                          << replay_direct_local_removable_classified_count_diag
+                          << " direct_local_stage_a_packet_compatible_count="
+                          << stage_a_direct_local_packet_compatible_count
+                          << " direct_local_stage_a_packet_incompatible_count="
+                          << stage_a_direct_local_packet_incompatible_count
+                          << " direct_local_stage_a_packet_incompatible_first_few="
+                          << sanitize_forensic_token(
+                                 format_factor_slots_preview(
+                                     stage_a_direct_local_packet_incompatible_slots,
+                                     16u))
+                          << " summary_factor_count="
+                          << cbs_phase2_two_stage_update_a_summary_factor_count
+                          << " root_bootstrap_support_factor_count="
+                          << stage_a_root_bootstrap_support_factor_count
+                          << " stage_a_values_count=" << stage_a_values.size()
+                          << " packet_shape_mode="
+                          << sanitize_forensic_token(
+                                 stage_a_direct_local_packet_shape_mode)
+                          << " incompatibility_reason="
+                          << sanitize_forensic_token(
+                                 stage_a_direct_local_packet_incompatibility_reason)
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageAReplayDirectLocalQueueLifecycleDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " pending_queue_size_before="
+                          << replay_direct_local_pending_queue_size_before_diag
+                          << " pending_queue_size_after="
+                          << cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                                 .size()
+                          << " promoted_this_epoch_count="
+                          << replay_direct_local_promoted_this_epoch_diag.size()
+                          << " removed_from_pending_after_promotion_count="
+                          << replay_direct_local_removed_after_promotion_count_diag
+                          << " reinserted_same_identity_count="
+                          << replay_direct_local_reinserted_same_identity_count_diag
+                          << " deduped_existing_pending_count="
+                          << replay_direct_local_deduped_existing_pending_count_diag
+                          << " still_blocked_count="
+                          << replay_direct_local_still_blocked_diag.size()
+                          << " first_promoted_removed_slot="
+                          << first_promoted_removed_slot_diag
+                          << " first_promoted_removed_slot_class="
+                          << sanitize_forensic_token(
+                                 first_promoted_removed_slot_class_diag)
+                          << " first_promoted_removed_slot_keys="
+                          << sanitize_forensic_token(
+                                 first_promoted_removed_slot_keys_diag)
+                          << " lifecycle_mode="
+                          << "semantic_identity_dedupe_promotion_cleanup"
+                          << std::endl;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageAReplayConsumeStateDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " consumed_identity_count_this_epoch="
+                          << replay_consumed_identity_set_epoch.size()
+                          << " consumed_identity_first_few="
+                          << format_replay_identity_preview(
+                                 replay_consumed_identity_first_few_diag, 8u)
+                          << " removed_from_summary_replay_metadata_count="
+                          << replay_removed_from_summary_replay_metadata_count_diag
+                          << " removed_from_summary_replay_queue_count="
+                          << replay_removed_from_summary_replay_queue_count_diag
+                          << " removed_from_direct_local_pending_queue_count="
+                          << replay_removed_from_direct_local_pending_queue_count_diag
+                          << " blocked_reenqueue_same_epoch_count="
+                          << replay_blocked_reenqueue_same_epoch_count_diag
+                          << " pending_queue_size_before="
+                          << replay_direct_local_pending_queue_size_before_diag
+                          << " pending_queue_size_after="
+                          << cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                                 .size()
+                          << " consume_mode="
+                          << "semantic_identity_terminal_consume_all_replay_stores"
+                          << std::endl;
+              }
+              if (cbs_phase2_stage_a_zero_remove_first_boundary_epoch_effective) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageARemoveBypassDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " original_stage_a_remove_count="
+                          << stage_a_original_remove_count
+                          << " replay_stage_a_remove_count="
+                          << stage_a_replay_remove_count
+                          << " fresh_stage_a_remove_count="
+                          << stage_a_fresh_remove_count
+                          << " stage_a_factor_count="
+                          << cbs_phase2_two_stage_update_a_summary_factor_count
+                          << " stage_a_new_value_count="
+                          << stage_a_values.size() << std::endl;
+              }
+              const bool stage_a_replay_subset_probe_requested =
+                  stage_a_with_replay_attempted &&
+                  stage_a_replay_remove_count > 0u &&
+                  !cbs_phase2_diag_stage_a_zero_remove_first_boundary_epoch &&
+                  !stage_a_replay_subset_probe_diag_emitted_once;
+              if (stage_a_replay_subset_probe_requested) {
+                stage_a_replay_subset_probe_ran = true;
+                stage_a_replay_ordering_probe_ran = true;
+                const gtsam::NonlinearFactorGraph& stage_a_probe_factors =
+                    cbs_optimizer_->getFactorsUnsafe();
+                gtsam::FactorIndices replay_probe_slots =
+                    replay_valid_slots_for_stage_a;
+                std::sort(replay_probe_slots.begin(), replay_probe_slots.end());
+                stage_a_replay_subset_probe_slot_count =
+                    replay_probe_slots.size();
+                stage_a_replay_ordering_probe_slot_count =
+                    replay_probe_slots.size();
+                stage_a_replay_subset_probe_slots_first_few =
+                    sanitize_forensic_token(
+                        format_factor_slots_preview(replay_probe_slots, 16u));
+                if (!replay_probe_slots.empty()) {
+                  const size_t first_probe_slot = replay_probe_slots.front();
+                  const auto first_metadata_it =
+                      cbs_phase2_summary_covered_crossing_replay_metadata_map.find(
+                          first_probe_slot);
+                  if (first_metadata_it !=
+                          cbs_phase2_summary_covered_crossing_replay_metadata_map
+                              .end() &&
+                      !first_metadata_it->second.factor_class.empty()) {
+                    stage_a_replay_subset_probe_first_slot_class =
+                        sanitize_forensic_token(
+                            first_metadata_it->second.factor_class);
+                    stage_a_replay_subset_probe_first_slot_keys =
+                        sanitize_forensic_token(
+                            first_metadata_it->second.factor_keys);
+                  } else if (stage_a_probe_factors.exists(first_probe_slot) &&
+                             stage_a_probe_factors.at(first_probe_slot)) {
+                    stage_a_replay_subset_probe_first_slot_class =
+                        sanitize_forensic_token(
+                            classify_forensic_remove_factor_class(
+                                stage_a_probe_factors.at(first_probe_slot)));
+                    stage_a_replay_subset_probe_first_slot_keys =
+                        sanitize_forensic_token(format_factor_keys_for_slot(
+                            stage_a_probe_factors, first_probe_slot));
+                  }
+                }
+
+                const auto normalize_probe_result =
+                    [&](std::string token) -> std::string {
+                  if (token.empty()) {
+                    token = "unknown";
+                  }
+                  token = sanitize_forensic_token(std::move(token));
+                  const size_t kMaxProbeResultChars = 160u;
+                  if (token.size() > kMaxProbeResultChars) {
+                    token.resize(kMaxProbeResultChars);
+                  }
+                  return token;
+                };
+
+                const cbs::BaseSAM pre_stage_a_probe_snapshot(
+                    static_cast<const cbs::BaseSAM&>(*cbs_optimizer_));
+                const auto run_stage_a_replay_probe =
+                    [&](const gtsam::FactorIndices& probe_remove_slots) {
+                      try {
+                        cbs::BaseSAM probe_isam(pre_stage_a_probe_snapshot);
+                        gtsam::ISAM2UpdateParams probe_params =
+                            static_cast<const gtsam::ISAM2UpdateParams&>(
+                                update_a_params);
+                        probe_params.removeFactorIndices = probe_remove_slots;
+                        (void)probe_isam.update(
+                            *stage_a_summary_factors_for_update_ptr,
+                            stage_a_values,
+                            probe_params);
+                        return std::string("ok");
+                      } catch (const std::exception& e) {
+                        const std::string probe_error =
+                            e.what() ? std::string(e.what())
+                                     : std::string("unknown_exception");
+                        return std::string("fail:") +
+                               normalize_probe_result(probe_error);
+                      } catch (...) {
+                        return std::string("fail:unknown_exception");
+                      }
+                    };
+
+                stage_a_replay_subset_probe_full_result =
+                    run_stage_a_replay_probe(replay_probe_slots);
+
+                std::ostringstream per_slot_probe_oss;
+                bool per_slot_probe_has_entries = false;
+                std::map<std::string, gtsam::FactorIndices>
+                    replay_probe_slots_by_class;
+                gtsam::FactorIndices replay_probe_binary_slots;
+                gtsam::FactorIndices replay_probe_imu_like_slots;
+                replay_probe_binary_slots.reserve(replay_probe_slots.size());
+                replay_probe_imu_like_slots.reserve(replay_probe_slots.size());
+                for (const size_t slot : replay_probe_slots) {
+                  gtsam::FactorIndices single_slot_probe{slot};
+                  const std::string single_probe_result =
+                      run_stage_a_replay_probe(single_slot_probe);
+                  if (per_slot_probe_has_entries) {
+                    per_slot_probe_oss << ";";
+                  }
+                  per_slot_probe_has_entries = true;
+                  per_slot_probe_oss << slot << ":" << single_probe_result;
+                  if (stage_a_replay_subset_probe_minimal_bad_slot < 0 &&
+                      single_probe_result.rfind("fail:", 0u) == 0u) {
+                    stage_a_replay_subset_probe_minimal_bad_slot =
+                        static_cast<long long>(slot);
+                  }
+
+                  std::string slot_class = "unknown";
+                  const auto metadata_it =
+                      cbs_phase2_summary_covered_crossing_replay_metadata_map.find(
+                          slot);
+                  if (metadata_it !=
+                          cbs_phase2_summary_covered_crossing_replay_metadata_map
+                              .end() &&
+                      !metadata_it->second.factor_class.empty()) {
+                    slot_class =
+                        sanitize_forensic_token(metadata_it->second.factor_class);
+                  } else if (stage_a_probe_factors.exists(slot) &&
+                             stage_a_probe_factors.at(slot)) {
+                    slot_class = sanitize_forensic_token(
+                        classify_forensic_remove_factor_class(
+                            stage_a_probe_factors.at(slot)));
+                  }
+                  replay_probe_slots_by_class[slot_class].push_back(slot);
+                  if (slot_class == "binary") {
+                    replay_probe_binary_slots.push_back(slot);
+                  } else if (slot_class == "imu_like") {
+                    replay_probe_imu_like_slots.push_back(slot);
+                  }
+                }
+                stage_a_replay_ordering_probe_binary_slot_count =
+                    replay_probe_binary_slots.size();
+                stage_a_replay_ordering_probe_imu_like_slot_count =
+                    replay_probe_imu_like_slots.size();
+                if (per_slot_probe_has_entries) {
+                  stage_a_replay_subset_probe_per_slot_results =
+                      sanitize_forensic_token(per_slot_probe_oss.str());
+                }
+
+                std::ostringstream per_class_probe_oss;
+                bool per_class_probe_has_entries = false;
+                for (const auto& class_probe_pair : replay_probe_slots_by_class) {
+                  const std::string class_probe_result =
+                      run_stage_a_replay_probe(class_probe_pair.second);
+                  if (per_class_probe_has_entries) {
+                    per_class_probe_oss << ";";
+                  }
+                  per_class_probe_has_entries = true;
+                  per_class_probe_oss << class_probe_pair.first << "("
+                                      << class_probe_pair.second.size() << "):"
+                                      << class_probe_result;
+                  if (stage_a_replay_subset_probe_minimal_bad_class == "none" &&
+                      class_probe_result.rfind("fail:", 0u) == 0u) {
+                    stage_a_replay_subset_probe_minimal_bad_class =
+                        sanitize_forensic_token(class_probe_pair.first);
+                  }
+                }
+                if (per_class_probe_has_entries) {
+                  stage_a_replay_subset_probe_per_class_results =
+                      sanitize_forensic_token(per_class_probe_oss.str());
+                }
+                stage_a_replay_subset_probe_full_result =
+                    sanitize_forensic_token(
+                        stage_a_replay_subset_probe_full_result);
+                stage_a_replay_ordering_probe_full_combined_failed =
+                    stage_a_replay_subset_probe_full_result.rfind("fail:", 0u) ==
+                    0u;
+
+                const auto run_stage_a_replay_ordered_probe =
+                    [&](const gtsam::FactorIndices& first_remove_slots,
+                        const gtsam::FactorIndices& second_remove_slots) {
+                      try {
+                        cbs::BaseSAM ordered_probe_isam(pre_stage_a_probe_snapshot);
+                        gtsam::ISAM2UpdateParams first_step_params =
+                            static_cast<const gtsam::ISAM2UpdateParams&>(
+                                update_a_params);
+                        first_step_params.removeFactorIndices = first_remove_slots;
+                        (void)ordered_probe_isam.update(
+                            *stage_a_summary_factors_for_update_ptr,
+                            stage_a_values,
+                            first_step_params);
+                        gtsam::ISAM2UpdateParams second_step_params =
+                            static_cast<const gtsam::ISAM2UpdateParams&>(
+                                update_a_params);
+                        second_step_params.removeFactorIndices = second_remove_slots;
+                        const gtsam::NonlinearFactorGraph empty_factors;
+                        const gtsam::Values empty_values;
+                        (void)ordered_probe_isam.update(empty_factors,
+                                                        empty_values,
+                                                        second_step_params);
+                        return std::string("ok");
+                      } catch (const std::exception& e) {
+                        const std::string probe_error =
+                            e.what() ? std::string(e.what())
+                                     : std::string("unknown_exception");
+                        return std::string("fail:") +
+                               normalize_probe_result(probe_error);
+                      } catch (...) {
+                        return std::string("fail:unknown_exception");
+                      }
+                    };
+
+                if (replay_probe_binary_slots.empty() ||
+                    replay_probe_imu_like_slots.empty()) {
+                  stage_a_replay_ordering_probe_binary_then_imu_result =
+                      "not_applicable_missing_subset";
+                  stage_a_replay_ordering_probe_imu_then_binary_result =
+                      "not_applicable_missing_subset";
+                  stage_a_replay_ordering_probe_first_working_order = "none";
+                } else {
+                  stage_a_replay_ordering_probe_binary_then_imu_result =
+                      run_stage_a_replay_ordered_probe(
+                          replay_probe_binary_slots, replay_probe_imu_like_slots);
+                  stage_a_replay_ordering_probe_imu_then_binary_result =
+                      run_stage_a_replay_ordered_probe(
+                          replay_probe_imu_like_slots, replay_probe_binary_slots);
+                  const bool binary_then_imu_ok =
+                      stage_a_replay_ordering_probe_binary_then_imu_result ==
+                      "ok";
+                  const bool imu_then_binary_ok =
+                      stage_a_replay_ordering_probe_imu_then_binary_result == "ok";
+                  if (binary_then_imu_ok) {
+                    stage_a_replay_ordering_probe_first_working_order =
+                        "binary_then_imu";
+                  } else if (imu_then_binary_ok) {
+                    stage_a_replay_ordering_probe_first_working_order =
+                        "imu_then_binary";
+                  } else {
+                    stage_a_replay_ordering_probe_first_working_order = "none";
+                  }
+                }
+                const auto truncate_probe_field =
+                    [](std::string* field, const size_t max_chars) {
+                      CHECK_NOTNULL(field);
+                      if (field->size() > max_chars) {
+                        field->resize(max_chars);
+                      }
+                    };
+                truncate_probe_field(
+                    &stage_a_replay_subset_probe_slots_first_few, 256u);
+                truncate_probe_field(
+                    &stage_a_replay_subset_probe_first_slot_class, 128u);
+                truncate_probe_field(
+                    &stage_a_replay_subset_probe_first_slot_keys, 256u);
+                truncate_probe_field(
+                    &stage_a_replay_subset_probe_full_result, 256u);
+                truncate_probe_field(
+                    &stage_a_replay_subset_probe_per_slot_results, 768u);
+                truncate_probe_field(
+                    &stage_a_replay_subset_probe_per_class_results, 768u);
+                truncate_probe_field(
+                    &stage_a_replay_ordering_probe_binary_then_imu_result, 256u);
+                truncate_probe_field(
+                    &stage_a_replay_ordering_probe_imu_then_binary_result, 256u);
+                truncate_probe_field(
+                    &stage_a_replay_ordering_probe_first_working_order, 128u);
+              }
+              const StageBPacketSnapshot stage_a_packet_snapshot =
+                  build_stage_b_packet_snapshot(*stage_a_summary_factors_for_update_ptr,
+                                                stage_a_values,
+                                                update_a_params);
+              const PreStageAStateSnapshot pre_stage_a_state_snapshot =
+                  build_pre_stage_a_state_snapshot(*stage_a_summary_factors_for_update_ptr,
+                                                   stage_a_values);
+              const LagBoundaryStateCardinalitySnapshot
+                  lag_boundary_state_cardinality_snapshot =
+                      build_lag_boundary_state_cardinality_snapshot();
+              const size_t replay_direct_local_pending_queue_size_before_apply_attempt =
+                  cbs_phase2_direct_local_pending_one_epoch_replay_queue_.size();
+              const bool stage_a_boundary_advanced_this_epoch =
+                  lag_window_state.oldest_active_frame_id >
+                  lag_window_state.prev_oldest_active_frame_id;
+              const bool stage_a_summary_singleton_no_values =
+                  cbs_phase2_two_stage_update_a_summary_factor_count == 1u &&
+                  stage_a_values.size() == 0u;
+              const bool stage_a_boundary_underconstrained_guard =
+                  !stage_a_boundary_support_guard_triggered_once &&
+                  stage_a_boundary_advanced_this_epoch &&
+                  stage_a_summary_singleton_no_values &&
+                  stage_a_root_bootstrap_support_factor_count == 0u &&
+                  update_a_params.removeFactorIndices.empty() &&
+                  replay_valid_slots_for_stage_a.empty() &&
+                  stage_a_root_blocked_component_member_slots.empty();
+              if (stage_a_boundary_underconstrained_guard) {
+                stage_a_boundary_support_guard_triggered_once = true;
+                cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure = true;
+                cbs_phase2_stage_a_skipped_kf = static_cast<long long>(curr_kf_id_);
+                cbs_phase2_stage_a_skip_reason =
+                    "boundary_underconstrained_stage_a_packet_guard";
+                stage_a_failure_reason = cbs_phase2_stage_a_skip_reason;
+                cbs_note_stage_a_failure_exception(
+                    enable_remove_factor_indices,
+                    "two_stage_update_a_boundary_underconstrained_guard",
+                    stage_a_failure_reason);
+                cbs_stage_a_failure_sequence_final_failure_stage =
+                    "two_stage_update_a_boundary_underconstrained_guard_skipped_epoch";
+                cbs_two_stage_current_update_stage =
+                    "two_stage_update_a_boundary_underconstrained_guard";
+                update_a_result = gtsam::ISAM2Result();
+                update_a_effective_remove_slots.clear();
+                update_a_retry_attempted = false;
+                update_a_retry_succeeded = false;
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageABoundarySupportGuardDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " oldest_active_frame_id_before="
+                    << lag_window_state.prev_oldest_active_frame_id
+                    << " oldest_active_frame_id_after="
+                    << lag_window_state.oldest_active_frame_id
+                    << " stage_a_summary_factor_count="
+                    << cbs_phase2_two_stage_update_a_summary_factor_count
+                    << " stage_a_values_count=" << stage_a_values.size()
+                    << " stage_a_remove_count="
+                    << update_a_params.removeFactorIndices.size()
+                    << " stage_a_root_bootstrap_support_factor_count="
+                    << stage_a_root_bootstrap_support_factor_count
+                    << " stale_local_state_key_count_below_oldest_active="
+                    << lag_boundary_state_cardinality_snapshot
+                           .stale_local_state_key_count_below_oldest_active
+                    << " guard_applied=1"
+                    << " guard_reason="
+                    << sanitize_forensic_token(cbs_phase2_stage_a_skip_reason)
+                    << std::endl;
+              } else {
+                try {
+                  run_update_stage_with_retry(
+                      "two_stage_update_a",
+                      *stage_a_summary_factors_for_update_ptr,
+                      stage_a_values,
+                      update_a_params,
+                      &update_a_result,
+                      &update_a_effective_remove_slots,
+                      &update_a_retry_attempted,
+                      &update_a_retry_succeeded);
+                } catch (const std::exception& stage_a_error) {
+                const std::string stage_a_error_msg =
+                    stage_a_error.what() ? std::string(stage_a_error.what())
+                                         : std::string();
+                stage_a_failure_reason =
+                    stage_a_error_msg.empty() ? std::string("unknown")
+                                              : stage_a_error_msg;
+                cbs_note_stage_a_failure_exception(
+                    enable_remove_factor_indices,
+                    "bpsam_update_call_two_stage_update_a",
+                    stage_a_error_msg);
+                const bool has_map_at =
+                    stage_a_error_msg.find("map::at") != std::string::npos;
+                const bool has_ils =
+                    stage_a_error_msg.find("IndeterminantLinearSystemException") !=
+                    std::string::npos;
+                if (!stage_a_direct_local_packet_incompatible_slots.empty()) {
+                  replay_direct_local_apply_failure_audit_triggered_diag = true;
+                  replay_direct_local_apply_failure_stage_diag =
+                      "bpsam_update_call_two_stage_update_a";
+                  replay_direct_local_apply_failure_reason_diag =
+                      sanitize_forensic_token(stage_a_failure_reason);
+                  replay_direct_local_apply_failure_apply_stage_remove_slots_first_few_diag =
+                      "none";
+                  replay_direct_local_apply_failure_pending_queue_size_before_diag =
+                      replay_direct_local_pending_queue_size_before_apply_attempt;
+                  replay_direct_local_apply_failure_pending_queue_size_after_diag =
+                      cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                          .size();
+                }
+                if (!stage_a_replay_ordering_probe_diag_emitted_once &&
+                    stage_a_replay_ordering_probe_ran &&
+                    stage_a_with_replay_attempted) {
+                  std::cerr << std::setprecision(12)
+                            << "[CBS][StageAReplayOrderingProbeDiag]"
+                            << " curr_kf_id=" << curr_kf_id_
+                            << " replay_slot_count="
+                            << stage_a_replay_ordering_probe_slot_count
+                            << " replay_binary_slot_count="
+                            << stage_a_replay_ordering_probe_binary_slot_count
+                            << " replay_imu_like_slot_count="
+                            << stage_a_replay_ordering_probe_imu_like_slot_count
+                            << " order_binary_then_imu_result="
+                            << stage_a_replay_ordering_probe_binary_then_imu_result
+                            << " order_imu_then_binary_result="
+                            << stage_a_replay_ordering_probe_imu_then_binary_result
+                            << " first_working_order="
+                            << stage_a_replay_ordering_probe_first_working_order
+                            << " full_combined_replay_failed="
+                            << (stage_a_replay_ordering_probe_full_combined_failed
+                                    ? 1
+                                    : 0)
+                            << std::endl;
+                  stage_a_replay_ordering_probe_diag_emitted_once = true;
+                }
+                if (!stage_a_replay_subset_probe_diag_emitted_once &&
+                    stage_a_replay_subset_probe_ran &&
+                    stage_a_with_replay_attempted) {
+                  std::cerr << std::setprecision(12)
+                            << "[CBS][StageAReplaySubsetProbeDiag]"
+                            << " curr_kf_id=" << curr_kf_id_
+                            << " replay_slot_count="
+                            << stage_a_replay_subset_probe_slot_count
+                            << " replay_slots_first_few="
+                            << stage_a_replay_subset_probe_slots_first_few
+                            << " replay_first_slot_class="
+                            << stage_a_replay_subset_probe_first_slot_class
+                            << " replay_first_slot_keys="
+                            << stage_a_replay_subset_probe_first_slot_keys
+                            << " full_replay_probe_result="
+                            << stage_a_replay_subset_probe_full_result
+                            << " per_slot_probe_results="
+                            << stage_a_replay_subset_probe_per_slot_results
+                            << " per_class_probe_results="
+                            << stage_a_replay_subset_probe_per_class_results
+                            << " minimal_bad_slot="
+                            << stage_a_replay_subset_probe_minimal_bad_slot
+                            << " minimal_bad_class="
+                            << stage_a_replay_subset_probe_minimal_bad_class
+                            << std::endl;
+                  stage_a_replay_subset_probe_diag_emitted_once = true;
+                }
+                if (!stage_a_first_failure_diag_emitted) {
+                  const StageBPacketSnapshot clean_stage_a_packet_snapshot =
+                      stage_a_last_clean_snapshot_valid
+                          ? stage_a_last_clean_snapshot
+                          : StageBPacketSnapshot();
+                  const PreStageAStateSnapshot clean_pre_stage_a_snapshot =
+                      pre_stage_a_last_clean_snapshot_valid
+                          ? pre_stage_a_last_clean_snapshot
+                          : PreStageAStateSnapshot();
+                  const LagBoundaryStateCardinalitySnapshot
+                      clean_lag_boundary_state_cardinality_snapshot =
+                          lag_boundary_state_cardinality_last_clean_snapshot_valid
+                              ? lag_boundary_state_cardinality_last_clean_snapshot
+                              : LagBoundaryStateCardinalitySnapshot();
+                  const std::string pre_stage_a_first_inconsistency =
+                      classify_pre_stage_a_inconsistency(
+                          clean_pre_stage_a_snapshot,
+                          pre_stage_a_last_clean_snapshot_valid,
+                          clean_stage_a_packet_snapshot,
+                          stage_a_last_clean_snapshot_valid,
+                          pre_stage_a_state_snapshot,
+                          stage_a_packet_snapshot);
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][PreStageAStateDiag]"
+                      << " curr_kf_id=" << pre_stage_a_state_snapshot.curr_kf_id
+                      << " active_key_count="
+                      << pre_stage_a_state_snapshot.active_key_count
+                      << " active_factor_count="
+                      << pre_stage_a_state_snapshot.active_factor_count
+                      << " newest_local_frame_id="
+                      << pre_stage_a_state_snapshot.newest_local_frame_id
+                      << " oldest_active_frame_id="
+                      << pre_stage_a_state_snapshot.oldest_active_frame_id
+                      << " stage_a_new_value_keys="
+                      << sanitize_forensic_token(
+                             pre_stage_a_state_snapshot.stage_a_value_keys)
+                      << " stage_a_value_keys_in_estimate="
+                      << sanitize_forensic_token(
+                             pre_stage_a_state_snapshot
+                                 .stage_a_value_keys_in_estimate)
+                      << " stage_a_value_keys_in_variable_index="
+                      << sanitize_forensic_token(
+                             pre_stage_a_state_snapshot
+                                 .stage_a_value_keys_in_variable_index)
+                      << " stage_a_factor_key_missing_count="
+                      << pre_stage_a_state_snapshot
+                             .stage_a_factor_keys_missing_from_current_optimizer_state_count
+                      << " first_missing_stage_a_factor_key="
+                      << sanitize_forensic_token(
+                             pre_stage_a_state_snapshot
+                                 .first_missing_stage_a_factor_key)
+                      << " stage_a_factor_count="
+                      << stage_a_packet_snapshot.factor_count
+                      << " stage_a_smart_factor_count="
+                      << stage_a_packet_snapshot.smart_factor_count
+                      << " stage_a_imu_factor_count="
+                      << stage_a_packet_snapshot.imu_factor_count
+                      << " stage_a_prior_factor_count="
+                      << stage_a_packet_snapshot.prior_factor_count
+                      << " stage_a_between_factor_count="
+                      << stage_a_packet_snapshot.between_factor_count
+                      << " clean_snapshot_available="
+                      << (pre_stage_a_last_clean_snapshot_valid ? 1 : 0)
+                      << " clean_curr_kf_id="
+                      << clean_pre_stage_a_snapshot.curr_kf_id
+                      << " clean_active_key_count="
+                      << clean_pre_stage_a_snapshot.active_key_count
+                      << " clean_active_factor_count="
+                      << clean_pre_stage_a_snapshot.active_factor_count
+                      << " clean_newest_local_frame_id="
+                      << clean_pre_stage_a_snapshot.newest_local_frame_id
+                      << " clean_oldest_active_frame_id="
+                      << clean_pre_stage_a_snapshot.oldest_active_frame_id
+                      << " clean_stage_a_new_value_keys="
+                      << sanitize_forensic_token(
+                             clean_pre_stage_a_snapshot.stage_a_value_keys)
+                      << " clean_stage_a_value_keys_in_estimate="
+                      << sanitize_forensic_token(
+                             clean_pre_stage_a_snapshot
+                                 .stage_a_value_keys_in_estimate)
+                      << " clean_stage_a_value_keys_in_variable_index="
+                      << sanitize_forensic_token(
+                             clean_pre_stage_a_snapshot
+                                 .stage_a_value_keys_in_variable_index)
+                      << " clean_stage_a_factor_key_missing_count="
+                      << clean_pre_stage_a_snapshot
+                             .stage_a_factor_keys_missing_from_current_optimizer_state_count
+                      << " clean_first_missing_stage_a_factor_key="
+                      << sanitize_forensic_token(
+                             clean_pre_stage_a_snapshot
+                                 .first_missing_stage_a_factor_key)
+                      << " clean_stage_a_factor_count="
+                      << clean_stage_a_packet_snapshot.factor_count
+                      << " clean_stage_a_smart_factor_count="
+                      << clean_stage_a_packet_snapshot.smart_factor_count
+                      << " clean_stage_a_imu_factor_count="
+                      << clean_stage_a_packet_snapshot.imu_factor_count
+                      << " clean_stage_a_prior_factor_count="
+                      << clean_stage_a_packet_snapshot.prior_factor_count
+                      << " clean_stage_a_between_factor_count="
+                      << clean_stage_a_packet_snapshot.between_factor_count
+                      << " first_inconsistency="
+                      << sanitize_forensic_token(pre_stage_a_first_inconsistency)
+                      << std::endl;
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][LagBoundaryStateCardinalityDiag]"
+                      << " curr_kf_id="
+                      << lag_boundary_state_cardinality_snapshot.curr_kf_id
+                      << " newest_local_frame_id="
+                      << lag_boundary_state_cardinality_snapshot
+                             .newest_local_frame_id
+                      << " oldest_active_frame_id="
+                      << lag_boundary_state_cardinality_snapshot
+                             .oldest_active_frame_id
+                      << " expected_active_local_state_key_count="
+                      << lag_boundary_state_cardinality_snapshot
+                             .expected_active_local_state_key_count
+                      << " actual_active_local_state_key_count="
+                      << lag_boundary_state_cardinality_snapshot
+                             .actual_active_local_state_key_count
+                      << " stale_local_state_key_count_below_oldest_active="
+                      << lag_boundary_state_cardinality_snapshot
+                             .stale_local_state_key_count_below_oldest_active
+                      << " stale_pose_key_count_below_oldest_active="
+                      << lag_boundary_state_cardinality_snapshot
+                             .stale_pose_key_count_below_oldest_active
+                      << " stale_vel_key_count_below_oldest_active="
+                      << lag_boundary_state_cardinality_snapshot
+                             .stale_vel_key_count_below_oldest_active
+                      << " stale_bias_key_count_below_oldest_active="
+                      << lag_boundary_state_cardinality_snapshot
+                             .stale_bias_key_count_below_oldest_active
+                      << " first_stale_pose_key="
+                      << sanitize_forensic_token(
+                             lag_boundary_state_cardinality_snapshot
+                                 .first_stale_pose_key)
+                      << " first_stale_vel_key="
+                      << sanitize_forensic_token(
+                             lag_boundary_state_cardinality_snapshot
+                                 .first_stale_vel_key)
+                      << " first_stale_bias_key="
+                      << sanitize_forensic_token(
+                             lag_boundary_state_cardinality_snapshot
+                                 .first_stale_bias_key)
+                      << " x_prev_exists_in_estimate="
+                      << (lag_boundary_state_cardinality_snapshot
+                                  .x_prev_exists_in_estimate
+                              ? 1
+                              : 0)
+                      << " v_prev_exists_in_estimate="
+                      << (lag_boundary_state_cardinality_snapshot
+                                  .v_prev_exists_in_estimate
+                              ? 1
+                              : 0)
+                      << " b_prev_exists_in_estimate="
+                      << (lag_boundary_state_cardinality_snapshot
+                                  .b_prev_exists_in_estimate
+                              ? 1
+                              : 0)
+                      << " x_prev_exists_in_variable_index="
+                      << (lag_boundary_state_cardinality_snapshot
+                                  .x_prev_exists_in_variable_index
+                              ? 1
+                              : 0)
+                      << " v_prev_exists_in_variable_index="
+                      << (lag_boundary_state_cardinality_snapshot
+                                  .v_prev_exists_in_variable_index
+                              ? 1
+                              : 0)
+                      << " b_prev_exists_in_variable_index="
+                      << (lag_boundary_state_cardinality_snapshot
+                                  .b_prev_exists_in_variable_index
+                              ? 1
+                              : 0)
+                      << " first_stale_frame_incident_factor_slot_count="
+                      << lag_boundary_state_cardinality_snapshot
+                             .first_stale_frame_incident_factor_slot_count
+                      << " clean_snapshot_available="
+                      << (lag_boundary_state_cardinality_last_clean_snapshot_valid
+                              ? 1
+                              : 0)
+                      << " clean_curr_kf_id="
+                      << clean_lag_boundary_state_cardinality_snapshot.curr_kf_id
+                      << " clean_newest_local_frame_id="
+                      << clean_lag_boundary_state_cardinality_snapshot
+                             .newest_local_frame_id
+                      << " clean_oldest_active_frame_id="
+                      << clean_lag_boundary_state_cardinality_snapshot
+                             .oldest_active_frame_id
+                      << " clean_expected_active_local_state_key_count="
+                      << clean_lag_boundary_state_cardinality_snapshot
+                             .expected_active_local_state_key_count
+                      << " clean_actual_active_local_state_key_count="
+                      << clean_lag_boundary_state_cardinality_snapshot
+                             .actual_active_local_state_key_count
+                      << " clean_stale_local_state_key_count_below_oldest_active="
+                      << clean_lag_boundary_state_cardinality_snapshot
+                             .stale_local_state_key_count_below_oldest_active
+                      << " clean_stale_pose_key_count_below_oldest_active="
+                      << clean_lag_boundary_state_cardinality_snapshot
+                             .stale_pose_key_count_below_oldest_active
+                      << " clean_stale_vel_key_count_below_oldest_active="
+                      << clean_lag_boundary_state_cardinality_snapshot
+                             .stale_vel_key_count_below_oldest_active
+                      << " clean_stale_bias_key_count_below_oldest_active="
+                      << clean_lag_boundary_state_cardinality_snapshot
+                             .stale_bias_key_count_below_oldest_active
+                      << std::endl;
+                  stage_a_first_failure_diag_emitted = true;
+                }
+                if (cbs_phase2_stage_a_skip_epoch_on_initial_failure_mode) {
+                  cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure = true;
+                  cbs_phase2_stage_a_skipped_kf =
+                      static_cast<long long>(curr_kf_id_);
+                  cbs_phase2_stage_a_skip_reason =
+                      "initial_stage_a_exception:" +
+                      sanitize_forensic_token(
+                          stage_a_error_msg.empty() ? std::string("unknown")
+                                                    : stage_a_error_msg);
+                  stage_a_failure_reason = cbs_phase2_stage_a_skip_reason;
+                  cbs_stage_a_failure_sequence_final_failure_stage =
+                      sanitize_forensic_token(
+                          "two_stage_update_a_initial_exception_skipped_epoch");
+                  if (has_map_at) {
+                    ++cbs_map_at_count_so_far_;
+                    cbs_crash_imminent_marker_epoch = true;
+                  }
+                  if (has_ils) {
+                    ++cbs_bpsam_ilsretry_count_so_far_;
+                    cbs_crash_imminent_marker_epoch = true;
+                  }
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][StageASkipEpochDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " cbs_phase2_stage_a_skip_epoch_on_initial_failure_mode="
+                      << (cbs_phase2_stage_a_skip_epoch_on_initial_failure_mode
+                              ? 1
+                              : 0)
+                      << " cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure="
+                      << (cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure
+                              ? 1
+                              : 0)
+                      << " cbs_phase2_stage_a_skipped_kf="
+                      << cbs_phase2_stage_a_skipped_kf
+                      << " cbs_phase2_stage_a_skip_reason="
+                      << sanitize_forensic_token(cbs_phase2_stage_a_skip_reason)
+                      << std::endl;
+                  update_a_result = gtsam::ISAM2Result();
+                  update_a_effective_remove_slots.clear();
+                  update_a_retry_attempted = false;
+                  update_a_retry_succeeded = false;
+                } else if (stage_a_with_replay_attempted &&
+                           (has_map_at || has_ils)) {
+                  cbs_phase2_stage_a_replay_skipped_due_to_failure = true;
+                  cbs_phase2_summary_covered_crossing_replay_stage =
+                      has_map_at ? "two_stage_stage_a_replay_skipped_map_at"
+                                 : "two_stage_stage_a_replay_skipped_ils";
+                  cbs_two_stage_current_update_stage =
+                      "two_stage_update_a_skip_replay_crossing_remove";
+                  cbs::BPSAM::UpdateParams stage_a_skip_replay_params =
+                      update_a_params;
+                  gtsam::FactorIndices stage_a_remove_without_replay;
+                  stage_a_remove_without_replay.reserve(
+                      update_a_params.removeFactorIndices.size());
+                  for (const size_t slot : update_a_params.removeFactorIndices) {
+                    if (replay_valid_slots_for_stage_a_set.count(slot) == 0u) {
+                      stage_a_remove_without_replay.push_back(slot);
+                    }
+                  }
+                  stage_a_skip_replay_params.removeFactorIndices =
+                      stage_a_remove_without_replay;
+                  run_update_stage_with_retry(
+                      "two_stage_update_a_skip_replay_crossing_remove",
+                      *stage_a_summary_factors_for_update_ptr,
+                      stage_a_values,
+                      stage_a_skip_replay_params,
+                      &update_a_result,
+                      &update_a_effective_remove_slots,
+                      &update_a_retry_attempted,
+                      &update_a_retry_succeeded);
+                } else {
+                  cbs_stage_a_failure_sequence_final_failure_stage =
+                      sanitize_forensic_token(
+                          "two_stage_update_a_initial_exception_unhandled");
+                  throw;
+                }
+                }
+              }
+              if (!cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure) {
+                stage_a_last_clean_snapshot = stage_a_packet_snapshot;
+                stage_a_last_clean_snapshot_valid = true;
+                pre_stage_a_last_clean_snapshot = pre_stage_a_state_snapshot;
+                pre_stage_a_last_clean_snapshot_valid = true;
+                lag_boundary_state_cardinality_last_clean_snapshot =
+                    lag_boundary_state_cardinality_snapshot;
+                lag_boundary_state_cardinality_last_clean_snapshot_valid = true;
+              }
+              cbs_phase2_two_stage_update_a_remove_count =
+                  update_a_effective_remove_slots.size();
+              cbs_phase2_stage_a_remove_count =
+                  cbs_phase2_two_stage_update_a_remove_count;
+              cbs_phase2_stage_a_summary_crossing_remove_count =
+                  cbs_phase2_two_stage_update_a_remove_count;
+              size_t replayed_summary_crossing_applied_count = 0u;
+              if (!replay_valid_slots_for_stage_a_set.empty()) {
+                for (const size_t slot : update_a_effective_remove_slots) {
+                  if (replay_valid_slots_for_stage_a_set.count(slot) > 0u) {
+                    ++replayed_summary_crossing_applied_count;
+                  }
+                }
+              }
+              cbs_phase2_summary_covered_crossing_replayed_count =
+                  replayed_summary_crossing_applied_count;
+              cbs_phase2_replayed_summary_crossing_count =
+                  replayed_summary_crossing_applied_count;
+              if (cbs_phase2_replay_into_stage_a_mode &&
+                  !replay_valid_slots_for_stage_a.empty() &&
+                  !cbs_phase2_stage_a_replay_skipped_due_to_failure) {
+                cbs_phase2_summary_covered_crossing_replay_stage =
+                    replayed_summary_crossing_applied_count > 0u
+                        ? "two_stage_stage_a_packet_applied"
+                        : "two_stage_stage_a_packet_no_effective_remove";
+              }
+              stage_a_completed_successfully =
+                  !cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure;
+              if (!stage_a_direct_local_packet_incompatible_slots.empty()) {
+                replay_direct_local_apply_candidate_count_diag =
+                    stage_a_direct_local_packet_incompatible_slots.size();
+                replay_direct_local_apply_stage_slots_first_few_diag =
+                    sanitize_forensic_token(format_factor_slots_preview(
+                        stage_a_direct_local_packet_incompatible_slots, 16u));
+              }
+              if (false && stage_a_completed_successfully &&
+                  !stage_a_direct_local_packet_incompatible_slots.empty()) {
+                replay_direct_local_apply_stage_mode_diag =
+                    "post_stage_a_pre_stage_b_direct_local_remove_micro_batch";
+                const gtsam::NonlinearFactorGraph direct_local_apply_factors;
+                const gtsam::Values direct_local_apply_values;
+                constexpr size_t kDirectLocalApplyBatchSize = 1u;
+                gtsam::FactorIndices direct_local_apply_ordered_slots =
+                    stage_a_direct_local_packet_incompatible_slots;
+                std::sort(direct_local_apply_ordered_slots.begin(),
+                          direct_local_apply_ordered_slots.end());
+                direct_local_apply_ordered_slots.erase(
+                    std::unique(direct_local_apply_ordered_slots.begin(),
+                                direct_local_apply_ordered_slots.end()),
+                    direct_local_apply_ordered_slots.end());
+                replay_direct_local_apply_attempted_count_diag = 0u;
+                replay_direct_local_apply_succeeded_count_diag = 0u;
+                replay_direct_local_apply_failed_count_diag = 0u;
+                const size_t direct_local_pending_queue_size_before_apply_stage =
+                    cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                        .size();
+                size_t direct_local_apply_batch_index = 0u;
+                bool direct_local_apply_stop_after_first_failure = false;
+                for (size_t batch_begin = 0u;
+                     batch_begin < direct_local_apply_ordered_slots.size() &&
+                     !direct_local_apply_stop_after_first_failure;
+                     batch_begin += kDirectLocalApplyBatchSize,
+                            ++direct_local_apply_batch_index) {
+                  const size_t batch_end = std::min(
+                      batch_begin + kDirectLocalApplyBatchSize,
+                      direct_local_apply_ordered_slots.size());
+                  gtsam::FactorIndices batch_slots;
+                  batch_slots.reserve(batch_end - batch_begin);
+                  for (size_t idx = batch_begin; idx < batch_end; ++idx) {
+                    batch_slots.push_back(direct_local_apply_ordered_slots[idx]);
+                  }
+                  const std::string batch_slots_first_few =
+                      sanitize_forensic_token(
+                          format_factor_slots_preview(batch_slots, 16u));
+                  replay_direct_local_apply_failure_apply_stage_remove_slots_first_few_diag =
+                      batch_slots_first_few;
+                  bool batch_apply_attempted = false;
+                  bool batch_apply_succeeded = false;
+                  bool batch_apply_failed = false;
+                  std::string batch_failure_reason = "none";
+                  long long eligibility_slot = batch_slots.empty()
+                                                   ? -1
+                                                   : static_cast<long long>(
+                                                         batch_slots.front());
+                  std::string eligibility_slot_class = "none";
+                  std::string eligibility_slot_keys = "none";
+                  bool eligibility_passed = true;
+                  std::string eligibility_reason = "passed";
+                  const std::string eligibility_preflight_mode =
+                      "structural_graph_and_key_presence_gate";
+                  if (batch_slots.size() != 1u) {
+                    eligibility_passed = false;
+                    eligibility_reason =
+                        "unexpected_batch_size_for_single_slot_preflight";
+                  } else {
+                    const size_t slot = batch_slots.front();
+                    const auto metadata_it =
+                        replay_direct_local_apply_candidates_metadata.find(slot);
+                    CbsSummaryCoveredCrossingReplayMetadata metadata;
+                    if (metadata_it !=
+                        replay_direct_local_apply_candidates_metadata.end()) {
+                      metadata = metadata_it->second;
+                    } else {
+                      metadata.slot_id = slot;
+                    }
+                    if (metadata.slot_id == 0u) {
+                      metadata.slot_id = slot;
+                    }
+                    const auto& direct_local_apply_optimizer_factors =
+                        cbs_optimizer_->getFactorsUnsafe();
+                    if (direct_local_apply_optimizer_factors.exists(slot) &&
+                        direct_local_apply_optimizer_factors.at(slot)) {
+                      eligibility_slot_class = sanitize_forensic_token(
+                          classify_forensic_remove_factor_class(
+                              direct_local_apply_optimizer_factors.at(slot)));
+                      eligibility_slot_keys = sanitize_forensic_token(
+                          format_factor_keys_for_slot(
+                              direct_local_apply_optimizer_factors, slot));
+                    } else {
+                      eligibility_slot_class =
+                          sanitize_forensic_token(metadata.factor_class.empty()
+                                                      ? std::string("missing_slot")
+                                                      : metadata.factor_class);
+                      eligibility_slot_keys = sanitize_forensic_token(
+                          metadata.factor_keys.empty() ? std::string("none")
+                                                       : metadata.factor_keys);
+                    }
+                    if (is_replay_identity_consumed_this_epoch(metadata)) {
+                      eligibility_passed = false;
+                      eligibility_reason =
+                          "identity_already_consumed_this_epoch";
+                    }
+                    if (eligibility_passed &&
+                        (!direct_local_apply_optimizer_factors.exists(slot) ||
+                         !direct_local_apply_optimizer_factors.at(slot))) {
+                      eligibility_passed = false;
+                      eligibility_reason = "slot_missing_or_null_in_graph";
+                    }
+                    if (eligibility_passed &&
+                        cbs_phase2_directly_removable_local_internal_slots_set.count(
+                            slot) == 0u) {
+                      eligibility_passed = false;
+                      eligibility_reason =
+                          "slot_not_in_direct_local_removable_set";
+                    }
+                    if (eligibility_passed &&
+                        cbs_phase2_direct_local_rejected_due_to_retained_support_slots_set
+                                .count(slot) > 0u) {
+                      eligibility_passed = false;
+                      eligibility_reason =
+                          "slot_blocked_by_retained_protected_support";
+                    }
+                    if (eligibility_passed &&
+                        direct_local_apply_optimizer_factors.exists(slot) &&
+                        direct_local_apply_optimizer_factors.at(slot)) {
+                      const auto& direct_local_apply_variable_index =
+                          cbs_optimizer_->getVariableIndex();
+                      for (const gtsam::Key key :
+                           direct_local_apply_optimizer_factors.at(slot)->keys()) {
+                        if (direct_local_apply_variable_index.find(key) ==
+                                direct_local_apply_variable_index.end() &&
+                            !cbs_optimizer_->valueExists(key)) {
+                          eligibility_passed = false;
+                          eligibility_reason =
+                              std::string("slot_factor_key_missing_in_optimizer_state:") +
+                              gtsam::DefaultKeyFormatter(key);
+                          break;
+                        }
+                      }
+                    }
+                    if (eligibility_slot_class == "none") {
+                      eligibility_slot_class = sanitize_forensic_token(
+                          metadata.factor_class.empty() ? std::string("none")
+                                                       : metadata.factor_class);
+                    }
+                    if (eligibility_slot_keys == "none") {
+                      eligibility_slot_keys = sanitize_forensic_token(
+                          metadata.factor_keys.empty() ? std::string("none")
+                                                       : metadata.factor_keys);
+                    }
+                  }
+                  std::cerr << std::setprecision(12)
+                            << "[CBS][StageADirectLocalReplayApplyEligibilityDiag]"
+                            << " curr_kf_id=" << curr_kf_id_
+                            << " slot=" << eligibility_slot
+                            << " slot_class="
+                            << sanitize_forensic_token(eligibility_slot_class)
+                            << " slot_keys="
+                            << sanitize_forensic_token(eligibility_slot_keys)
+                            << " eligibility_passed="
+                            << (eligibility_passed ? 1 : 0)
+                            << " eligibility_reason="
+                            << sanitize_forensic_token(eligibility_reason)
+                            << " preflight_mode="
+                            << sanitize_forensic_token(eligibility_preflight_mode)
+                            << std::endl;
+                  if (!eligibility_passed) {
+                    replay_direct_local_apply_stage_mode_diag =
+                        "post_stage_a_pre_stage_b_direct_local_remove_micro_batch_ineligible_quarantine";
+                    replay_direct_local_apply_stage_first_failure_reason_diag =
+                        sanitize_forensic_token(eligibility_reason);
+                    replay_direct_local_apply_failure_audit_triggered_diag = true;
+                    replay_direct_local_apply_failure_stage_diag =
+                        "stage_a_direct_local_replay_apply_eligibility";
+                    replay_direct_local_apply_failure_reason_diag =
+                        sanitize_forensic_token(eligibility_reason);
+                    replay_direct_local_apply_failure_pending_queue_size_before_diag =
+                        direct_local_pending_queue_size_before_apply_stage;
+                    replay_direct_local_apply_failure_apply_stage_remove_slots_first_few_diag =
+                        batch_slots_first_few;
+                    replay_direct_local_apply_ineligible_count_diag +=
+                        batch_slots.size();
+                    replay_direct_local_apply_quarantined_count_diag +=
+                        batch_slots.size();
+                    replay_direct_local_quarantine_reason_diag =
+                        sanitize_forensic_token(eligibility_reason);
+                    replay_direct_local_quarantine_mode_diag =
+                        "fail_closed_quarantine_ineligible_batch_stop_on_first_ineligible";
+                    for (const size_t slot : batch_slots) {
+                      CbsSummaryCoveredCrossingReplayMetadata metadata;
+                      const auto metadata_it =
+                          replay_direct_local_apply_candidates_metadata.find(slot);
+                      if (metadata_it !=
+                          replay_direct_local_apply_candidates_metadata.end()) {
+                        metadata = metadata_it->second;
+                      } else {
+                        metadata.slot_id = slot;
+                        const auto& replay_factors_on_quarantine =
+                            cbs_optimizer_->getFactorsUnsafe();
+                        if (replay_factors_on_quarantine.exists(slot) &&
+                            replay_factors_on_quarantine.at(slot)) {
+                          metadata.factor_class =
+                              classify_forensic_remove_factor_class(
+                                  replay_factors_on_quarantine.at(slot));
+                          metadata.factor_keys = format_factor_keys_for_slot(
+                              replay_factors_on_quarantine, slot);
+                        } else {
+                          metadata.factor_class = "missing_slot";
+                          metadata.factor_keys = "none";
+                        }
+                      }
+                      if (metadata.slot_id == 0u) {
+                        metadata.slot_id = slot;
+                      }
+                      if (metadata.first_defer_epoch == 0u) {
+                        metadata.first_defer_epoch =
+                            metadata.defer_epoch == 0u ? curr_kf_id_
+                                                       : metadata.defer_epoch;
+                      }
+                      metadata.defer_epoch = curr_kf_id_;
+                      metadata.replay_path = "direct_local_pending";
+                      metadata.pending_reason =
+                          "direct_local_apply_ineligible_quarantine";
+                      if (metadata.blocking_key.empty()) {
+                        metadata.blocking_key = "none";
+                      }
+                      if (metadata.blocking_support_slot_class.empty()) {
+                        metadata.blocking_support_slot_class = "none";
+                      }
+                      if (metadata.blocking_support_slot_keys.empty()) {
+                        metadata.blocking_support_slot_keys = "none";
+                      }
+                      if (metadata.blocking_incident_id.empty()) {
+                        metadata.blocking_incident_id = "none";
+                      }
+                      cbs_phase2_summary_covered_crossing_replay_metadata_map.erase(
+                          slot);
+                      cbs_phase2_summary_covered_crossing_replay_metadata_map.erase(
+                          metadata.slot_id);
+                      cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_
+                          .erase(slot);
+                      cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_
+                          .erase(metadata.slot_id);
+                      cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                          [metadata.slot_id] = metadata;
+                      if (replay_direct_local_first_quarantined_slot_diag < 0) {
+                        replay_direct_local_first_quarantined_slot_diag =
+                            static_cast<long long>(metadata.slot_id);
+                        replay_direct_local_first_quarantined_slot_class_diag =
+                            sanitize_forensic_token(metadata.factor_class);
+                        replay_direct_local_first_quarantined_slot_keys_diag =
+                            sanitize_forensic_token(metadata.factor_keys);
+                      }
+                    }
+                    replay_direct_local_apply_failure_pending_queue_size_after_diag =
+                        cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                            .size();
+                    std::cerr
+                        << std::setprecision(12)
+                        << "[CBS][StageADirectLocalReplayApplyQuarantineDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " quarantined_slot="
+                        << replay_direct_local_first_quarantined_slot_diag
+                        << " quarantined_slot_class="
+                        << sanitize_forensic_token(
+                               replay_direct_local_first_quarantined_slot_class_diag)
+                        << " quarantined_slot_keys="
+                        << sanitize_forensic_token(
+                               replay_direct_local_first_quarantined_slot_keys_diag)
+                        << " quarantine_reason="
+                        << sanitize_forensic_token(
+                               replay_direct_local_quarantine_reason_diag)
+                        << " quarantine_mode="
+                        << sanitize_forensic_token(
+                               replay_direct_local_quarantine_mode_diag)
+                        << std::endl;
+                    direct_local_apply_stop_after_first_failure = true;
+                    batch_failure_reason = sanitize_forensic_token(eligibility_reason);
+                    std::cerr
+                        << std::setprecision(12)
+                        << "[CBS][StageADirectLocalReplayApplyBatchDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " batch_index=" << direct_local_apply_batch_index
+                        << " batch_size=" << batch_slots.size()
+                        << " batch_slots_first_few="
+                        << batch_slots_first_few
+                        << " batch_apply_attempted="
+                        << (batch_apply_attempted ? 1 : 0)
+                        << " batch_apply_succeeded="
+                        << (batch_apply_succeeded ? 1 : 0)
+                        << " batch_apply_failed="
+                        << (batch_apply_failed ? 1 : 0)
+                        << " batch_failure_reason="
+                        << sanitize_forensic_token(batch_failure_reason)
+                        << " cumulative_applied_count="
+                        << replay_direct_local_apply_succeeded_count_diag
+                        << " cumulative_failed_count="
+                        << replay_direct_local_apply_failed_count_diag
+                        << " batch_mode="
+                        << "direct_local_remove_only_micro_batch_size_1_stop_on_first_failure"
+                        << std::endl;
+                    continue;
+                  }
+
+                  replay_direct_local_apply_attempted_count_diag +=
+                      batch_slots.size();
+                  batch_apply_attempted = true;
+
+                  cbs::BPSAM::UpdateParams direct_local_apply_batch_params =
+                      cbs_first_update_params;
+                  direct_local_apply_batch_params.removeFactorIndices = batch_slots;
+                  gtsam::ISAM2Result direct_local_apply_batch_result;
+                  gtsam::FactorIndices direct_local_apply_batch_effective_remove_slots;
+                  bool direct_local_apply_batch_retry_attempted = false;
+                  bool direct_local_apply_batch_retry_succeeded = false;
+                  try {
+                    run_update_stage_with_retry(
+                        "stage_a_direct_local_replay_apply",
+                        direct_local_apply_factors,
+                        direct_local_apply_values,
+                        direct_local_apply_batch_params,
+                        &direct_local_apply_batch_result,
+                        &direct_local_apply_batch_effective_remove_slots,
+                        &direct_local_apply_batch_retry_attempted,
+                        &direct_local_apply_batch_retry_succeeded);
+                    std::unordered_set<size_t>
+                        direct_local_apply_batch_effective_remove_slots_set(
+                            direct_local_apply_batch_effective_remove_slots.begin(),
+                            direct_local_apply_batch_effective_remove_slots.end());
+                    for (const size_t slot : batch_slots) {
+                      if (direct_local_apply_batch_effective_remove_slots_set.count(
+                              slot) == 0u) {
+                        continue;
+                      }
+                      const auto metadata_it =
+                          replay_direct_local_apply_candidates_metadata.find(slot);
+                      if (metadata_it ==
+                          replay_direct_local_apply_candidates_metadata.end()) {
+                        continue;
+                      }
+                      const CbsSummaryCoveredCrossingReplayMetadata metadata =
+                          metadata_it->second;
+                      replay_direct_local_applied_and_consumed_this_epoch_diag
+                          .push_back(slot);
+                      const bool already_consumed =
+                          is_replay_identity_consumed_this_epoch(metadata);
+                      const size_t removed_from_pending_before =
+                          replay_removed_from_direct_local_pending_queue_count_diag;
+                      consume_replay_identity_from_all_stores(slot, metadata);
+                      const size_t removed_from_pending_now =
+                          replay_removed_from_direct_local_pending_queue_count_diag -
+                          removed_from_pending_before;
+                      if (removed_from_pending_now > 0u) {
+                        replay_direct_local_removed_after_promotion_count_diag +=
+                            removed_from_pending_now;
+                        if (first_promoted_removed_slot_diag < 0) {
+                          first_promoted_removed_slot_diag =
+                              static_cast<long long>(
+                                  metadata.slot_id == 0u ? slot
+                                                         : metadata.slot_id);
+                          first_promoted_removed_slot_class_diag =
+                              sanitize_forensic_token(metadata.factor_class);
+                          first_promoted_removed_slot_keys_diag =
+                              sanitize_forensic_token(metadata.factor_keys);
+                        }
+                      }
+                      if (already_consumed) {
+                        replay_direct_local_applied_and_consumed_this_epoch_diag
+                            .pop_back();
+                      }
+                    }
+                    batch_apply_succeeded = true;
+                    replay_direct_local_apply_succeeded_count_diag =
+                        replay_direct_local_applied_and_consumed_this_epoch_diag
+                            .size();
+                  } catch (const std::exception& direct_local_apply_error) {
+                    const std::string direct_local_apply_error_msg =
+                        direct_local_apply_error.what()
+                            ? std::string(direct_local_apply_error.what())
+                            : std::string("unknown");
+                    const bool direct_local_apply_map_at_failure =
+                        direct_local_apply_error_msg.find("map::at") !=
+                        std::string::npos;
+                    batch_apply_failed = true;
+                    batch_failure_reason =
+                        sanitize_forensic_token(direct_local_apply_error_msg);
+                    replay_direct_local_apply_stage_mode_diag =
+                        "post_stage_a_pre_stage_b_direct_local_remove_micro_batch_failed";
+                    replay_direct_local_apply_stage_first_failure_reason_diag =
+                        batch_failure_reason;
+                    replay_direct_local_apply_failure_audit_triggered_diag = true;
+                    replay_direct_local_apply_failure_stage_diag =
+                        "stage_a_direct_local_replay_apply";
+                    replay_direct_local_apply_failure_reason_diag =
+                        batch_failure_reason;
+                    replay_direct_local_apply_failure_pending_queue_size_before_diag =
+                        direct_local_pending_queue_size_before_apply_stage;
+                    replay_direct_local_requeue_reason_diag = batch_failure_reason;
+                    replay_direct_local_requeue_mode_diag =
+                        direct_local_apply_map_at_failure
+                            ? "fail_closed_requeue_failed_batch_only_hard_quarantine_identity"
+                            : "fail_closed_requeue_failed_batch_only";
+                    replay_direct_local_failed_apply_candidate_count_diag +=
+                        batch_slots.size();
+                    replay_direct_local_apply_failed_count_diag +=
+                        batch_slots.size();
+                    for (const size_t slot : batch_slots) {
+                      CbsSummaryCoveredCrossingReplayMetadata metadata;
+                      const auto metadata_it =
+                          replay_direct_local_apply_candidates_metadata.find(slot);
+                      if (metadata_it !=
+                          replay_direct_local_apply_candidates_metadata.end()) {
+                        metadata = metadata_it->second;
+                      } else {
+                        metadata.slot_id = slot;
+                        const auto& replay_factors_on_failure =
+                            cbs_optimizer_->getFactorsUnsafe();
+                        if (replay_factors_on_failure.exists(slot) &&
+                            replay_factors_on_failure.at(slot)) {
+                          metadata.factor_class =
+                              classify_forensic_remove_factor_class(
+                                  replay_factors_on_failure.at(slot));
+                          metadata.factor_keys = format_factor_keys_for_slot(
+                              replay_factors_on_failure, slot);
+                        } else {
+                          metadata.factor_class = "missing_slot";
+                          metadata.factor_keys = "none";
+                        }
+                      }
+                      if (metadata.slot_id == 0u) {
+                        metadata.slot_id = slot;
+                      }
+                      metadata.defer_epoch = curr_kf_id_;
+                      metadata.replay_path = "direct_local_pending";
+                      metadata.pending_reason =
+                          direct_local_apply_map_at_failure
+                              ? "direct_local_apply_live_map_at_incompatible_slot"
+                              : "direct_local_apply_failed_requeue";
+                      if (metadata.blocking_key.empty()) {
+                        metadata.blocking_key = "none";
+                      }
+                      if (metadata.blocking_support_slot_class.empty()) {
+                        metadata.blocking_support_slot_class = "none";
+                      }
+                      if (metadata.blocking_support_slot_keys.empty()) {
+                        metadata.blocking_support_slot_keys = "none";
+                      }
+                      if (metadata.blocking_incident_id.empty()) {
+                        metadata.blocking_incident_id = "none";
+                      }
+                      normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                      const std::string metadata_identity =
+                          build_replay_lifecycle_identity(metadata);
+                      if (direct_local_apply_map_at_failure) {
+                        const auto quarantine_insert_it =
+                            cbs_phase2_direct_local_hard_quarantine_identity_store
+                                .find(metadata_identity);
+                        if (quarantine_insert_it ==
+                            cbs_phase2_direct_local_hard_quarantine_identity_store
+                                .end()) {
+                          cbs_phase2_direct_local_hard_quarantine_identity_store
+                              .emplace(metadata_identity, metadata);
+                          ++replay_direct_local_hard_quarantined_identity_count_diag;
+                          if (replay_direct_local_hard_quarantined_identity_first_few_diag
+                                  .size() < 8u) {
+                            replay_direct_local_hard_quarantined_identity_first_few_diag
+                                .push_back(metadata_identity);
+                          }
+                        } else {
+                          auto& existing_quarantine_md =
+                              quarantine_insert_it->second;
+                          if (existing_quarantine_md.first_defer_epoch == 0u) {
+                            existing_quarantine_md.first_defer_epoch =
+                                metadata.first_defer_epoch;
+                          } else {
+                            existing_quarantine_md.first_defer_epoch = std::min(
+                                existing_quarantine_md.first_defer_epoch,
+                                metadata.first_defer_epoch);
+                          }
+                          existing_quarantine_md.defer_epoch = curr_kf_id_;
+                          existing_quarantine_md.slot_id = metadata.slot_id;
+                          existing_quarantine_md.factor_class =
+                              metadata.factor_class;
+                          existing_quarantine_md.factor_keys = metadata.factor_keys;
+                          existing_quarantine_md.replay_path =
+                              "direct_local_pending";
+                          existing_quarantine_md.pending_reason =
+                              "direct_local_apply_live_map_at_incompatible_slot";
+                          existing_quarantine_md.blocking_key =
+                              metadata.blocking_key;
+                          existing_quarantine_md.blocking_support_slot =
+                              metadata.blocking_support_slot;
+                          existing_quarantine_md.blocking_support_slot_class =
+                              metadata.blocking_support_slot_class;
+                          existing_quarantine_md.blocking_support_slot_keys =
+                              metadata.blocking_support_slot_keys;
+                          existing_quarantine_md.blocking_incident_id =
+                              metadata.blocking_incident_id;
+                          existing_quarantine_md.blocking_incident_member_slots =
+                              metadata.blocking_incident_member_slots;
+                        }
+                        replay_direct_local_hard_quarantine_reason_diag =
+                            "direct_local_apply_live_map_at_incompatible_slot";
+                        if (replay_direct_local_hard_quarantined_slot_diag < 0) {
+                          replay_direct_local_hard_quarantined_slot_diag =
+                              static_cast<long long>(metadata.slot_id);
+                          replay_direct_local_hard_quarantined_slot_class_diag =
+                              sanitize_forensic_token(metadata.factor_class);
+                          replay_direct_local_hard_quarantined_slot_keys_diag =
+                              sanitize_forensic_token(metadata.factor_keys);
+                        }
+                      }
+                      replay_consumed_identity_set_epoch.erase(metadata_identity);
+                      size_t removed_from_summary_metadata_cleanup = 0u;
+                      size_t removed_from_summary_queue_cleanup = 0u;
+                      erase_replay_identity_from_store(
+                          &cbs_phase2_summary_covered_crossing_replay_metadata_map,
+                          metadata_identity,
+                          slot,
+                          metadata.slot_id,
+                          &removed_from_summary_metadata_cleanup);
+                      erase_replay_identity_from_store(
+                          &cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_,
+                          metadata_identity,
+                          slot,
+                          metadata.slot_id,
+                          &removed_from_summary_queue_cleanup);
+                      bool pending_metadata_upserted = false;
+                      for (auto& pending_kv :
+                           cbs_phase2_direct_local_pending_one_epoch_replay_queue_) {
+                        CbsSummaryCoveredCrossingReplayMetadata pending_md =
+                            pending_kv.second;
+                        normalize_replay_metadata_for_lifecycle_identity(
+                            &pending_md);
+                        if (build_replay_lifecycle_identity(pending_md) !=
+                            metadata_identity) {
+                          continue;
+                        }
+                        auto& existing = pending_kv.second;
+                        if (existing.first_defer_epoch == 0u) {
+                          existing.first_defer_epoch = metadata.first_defer_epoch;
+                        } else {
+                          existing.first_defer_epoch = std::min(
+                              existing.first_defer_epoch,
+                              metadata.first_defer_epoch);
+                        }
+                        existing.defer_epoch = curr_kf_id_;
+                        existing.factor_class = metadata.factor_class;
+                        existing.factor_keys = metadata.factor_keys;
+                        existing.replay_path = "direct_local_pending";
+                        existing.pending_reason = metadata.pending_reason;
+                        existing.blocking_key = metadata.blocking_key;
+                        existing.blocking_support_slot =
+                            metadata.blocking_support_slot;
+                        existing.blocking_support_slot_class =
+                            metadata.blocking_support_slot_class;
+                        existing.blocking_support_slot_keys =
+                            metadata.blocking_support_slot_keys;
+                        existing.blocking_incident_id =
+                            metadata.blocking_incident_id;
+                        existing.blocking_incident_member_slots =
+                            metadata.blocking_incident_member_slots;
+                        pending_metadata_upserted = true;
+                        break;
+                      }
+                      if (!pending_metadata_upserted) {
+                        auto existing_it =
+                            cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                                .find(metadata.slot_id);
+                        if (existing_it !=
+                            cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                                .end()) {
+                          auto& existing = existing_it->second;
+                          if (existing.first_defer_epoch == 0u) {
+                            existing.first_defer_epoch =
+                                metadata.first_defer_epoch;
+                          } else {
+                            existing.first_defer_epoch = std::min(
+                                existing.first_defer_epoch,
+                                metadata.first_defer_epoch);
+                          }
+                          existing.defer_epoch = curr_kf_id_;
+                          existing.factor_class = metadata.factor_class;
+                          existing.factor_keys = metadata.factor_keys;
+                          existing.replay_path = "direct_local_pending";
+                          existing.pending_reason = metadata.pending_reason;
+                          existing.blocking_key = metadata.blocking_key;
+                          existing.blocking_support_slot =
+                              metadata.blocking_support_slot;
+                          existing.blocking_support_slot_class =
+                              metadata.blocking_support_slot_class;
+                          existing.blocking_support_slot_keys =
+                              metadata.blocking_support_slot_keys;
+                          existing.blocking_incident_id =
+                              metadata.blocking_incident_id;
+                          existing.blocking_incident_member_slots =
+                              metadata.blocking_incident_member_slots;
+                        } else {
+                          cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                              [metadata.slot_id] = metadata;
+                        }
+                      }
+                      bool preserved_in_pending = false;
+                      for (const auto& pending_kv :
+                           cbs_phase2_direct_local_pending_one_epoch_replay_queue_) {
+                        CbsSummaryCoveredCrossingReplayMetadata pending_md =
+                            pending_kv.second;
+                        normalize_replay_metadata_for_lifecycle_identity(
+                            &pending_md);
+                        if (build_replay_lifecycle_identity(pending_md) ==
+                            metadata_identity) {
+                          preserved_in_pending = true;
+                          break;
+                        }
+                      }
+                      if (preserved_in_pending) {
+                        ++replay_direct_local_requeued_after_failed_apply_count_diag;
+                        if (replay_direct_local_first_requeued_slot_diag < 0) {
+                          replay_direct_local_first_requeued_slot_diag =
+                              static_cast<long long>(metadata.slot_id);
+                          replay_direct_local_first_requeued_slot_class_diag =
+                              sanitize_forensic_token(metadata.factor_class);
+                          replay_direct_local_first_requeued_slot_keys_diag =
+                              sanitize_forensic_token(metadata.factor_keys);
+                        }
+                      } else {
+                        ++replay_direct_local_dropped_after_failed_apply_count_diag;
+                      }
+                    }
+                    replay_direct_local_apply_requeue_diag_triggered =
+                        replay_direct_local_failed_apply_candidate_count_diag > 0u;
+                    replay_direct_local_apply_failure_pending_queue_size_after_diag =
+                        cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                            .size();
+                    direct_local_apply_stop_after_first_failure = true;
+                  }
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][StageADirectLocalReplayApplyBatchDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " batch_index=" << direct_local_apply_batch_index
+                      << " batch_size=" << batch_slots.size()
+                      << " batch_slots_first_few="
+                      << batch_slots_first_few
+                      << " batch_apply_attempted="
+                      << (batch_apply_attempted ? 1 : 0)
+                      << " batch_apply_succeeded="
+                      << (batch_apply_succeeded ? 1 : 0)
+                      << " batch_apply_failed="
+                      << (batch_apply_failed ? 1 : 0)
+                      << " batch_failure_reason="
+                      << sanitize_forensic_token(batch_failure_reason)
+                      << " cumulative_applied_count="
+                      << replay_direct_local_apply_succeeded_count_diag
+                      << " cumulative_failed_count="
+                      << replay_direct_local_apply_failed_count_diag
+                      << " batch_mode="
+                      << "direct_local_remove_only_micro_batch_size_1_stop_on_first_failure"
+                      << std::endl;
+                }
+              } else if (!stage_a_completed_successfully &&
+                         !stage_a_direct_local_packet_incompatible_slots.empty()) {
+                replay_direct_local_apply_stage_mode_diag =
+                    "stage_a_not_completed_skip_direct_local_apply";
+                replay_direct_local_apply_stage_first_failure_reason_diag =
+                    sanitize_forensic_token(
+                        stage_a_failure_reason.empty() ? std::string("none")
+                                                       : stage_a_failure_reason);
+                replay_direct_local_apply_failure_audit_triggered_diag = true;
+                replay_direct_local_apply_failure_stage_diag =
+                    "stage_a_not_completed_skip_direct_local_apply";
+                replay_direct_local_apply_failure_reason_diag =
+                    sanitize_forensic_token(
+                        stage_a_failure_reason.empty() ? std::string("none")
+                                                       : stage_a_failure_reason);
+                replay_direct_local_apply_failure_pending_queue_size_before_diag =
+                    replay_direct_local_pending_queue_size_before_apply_attempt;
+                replay_direct_local_apply_failure_pending_queue_size_after_diag =
+                    cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                        .size();
+              }
+              if (!replay_direct_local_apply_candidate_slots.empty()) {
+                std::unordered_set<size_t> update_a_effective_remove_slots_set(
+                    update_a_effective_remove_slots.begin(),
+                    update_a_effective_remove_slots.end());
+                for (const size_t slot : replay_direct_local_apply_candidate_slots) {
+                  const auto metadata_it =
+                      replay_direct_local_apply_candidates_metadata.find(slot);
+                  if (metadata_it ==
+                      replay_direct_local_apply_candidates_metadata.end()) {
+                    continue;
+                  }
+                  CbsSummaryCoveredCrossingReplayMetadata metadata =
+                      metadata_it->second;
+                  if (metadata.slot_id == 0u) {
+                    metadata.slot_id = slot;
+                  }
+                  if (!stage_a_completed_successfully ||
+                      update_a_effective_remove_slots_set.count(slot) == 0u) {
+                    continue;
+                  }
+                  const bool already_consumed =
+                      is_replay_identity_consumed_this_epoch(metadata);
+                  const size_t removed_from_pending_before =
+                      replay_removed_from_direct_local_pending_queue_count_diag;
+                  consume_replay_identity_from_all_stores(slot, metadata);
+                  const size_t removed_from_pending_now =
+                      replay_removed_from_direct_local_pending_queue_count_diag -
+                      removed_from_pending_before;
+                  if (removed_from_pending_now > 0u) {
+                    replay_direct_local_removed_after_promotion_count_diag +=
+                        removed_from_pending_now;
+                    if (first_promoted_removed_slot_diag < 0) {
+                      first_promoted_removed_slot_diag = static_cast<long long>(
+                          metadata.slot_id == 0u ? slot : metadata.slot_id);
+                      first_promoted_removed_slot_class_diag =
+                          sanitize_forensic_token(metadata.factor_class);
+                      first_promoted_removed_slot_keys_diag =
+                          sanitize_forensic_token(metadata.factor_keys);
+                    }
+                  }
+                  if (!already_consumed) {
+                    replay_direct_local_applied_and_consumed_this_epoch_diag
+                        .push_back(slot);
+                  }
+                }
+              }
+              std::sort(replay_direct_local_applied_and_consumed_this_epoch_diag
+                            .begin(),
+                        replay_direct_local_applied_and_consumed_this_epoch_diag
+                            .end());
+              replay_direct_local_applied_and_consumed_this_epoch_diag.erase(
+                  std::unique(
+                      replay_direct_local_applied_and_consumed_this_epoch_diag
+                          .begin(),
+                      replay_direct_local_applied_and_consumed_this_epoch_diag
+                          .end()),
+                  replay_direct_local_applied_and_consumed_this_epoch_diag.end());
+              replay_direct_local_applied_and_consumed_count_diag =
+                  replay_direct_local_applied_and_consumed_this_epoch_diag.size();
+              const bool emit_direct_local_apply_policy_diag =
+                  cbs_phase2_replay_into_stage_a_mode &&
+                  (replay_direct_local_removable_classified_count_diag > 0u ||
+                   replay_direct_local_applied_and_consumed_count_diag > 0u ||
+                   replay_direct_local_policy_deferred_count_diag > 0u);
+              if (emit_direct_local_apply_policy_diag) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageAReplayDirectLocalApplyPolicyDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " direct_local_removable_classified_count="
+                          << replay_direct_local_removable_classified_count_diag
+                          << " direct_local_applied_and_consumed_count="
+                          << replay_direct_local_applied_and_consumed_count_diag
+                          << " direct_local_policy_deferred_count="
+                          << replay_direct_local_policy_deferred_count_diag
+                          << " direct_local_apply_allowed_this_epoch="
+                          << (replay_direct_local_apply_allowed_this_epoch_diag
+                                  ? 1
+                                  : 0)
+                          << " two_stage_summary_crossing_mode="
+                          << (replay_direct_local_two_stage_summary_crossing_mode_diag
+                                  ? 1
+                                  : 0)
+                          << " first_policy_deferred_slot="
+                          << replay_direct_local_first_policy_deferred_slot_diag
+                          << " first_policy_deferred_slot_class="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_first_policy_deferred_slot_class_diag)
+                          << " first_policy_deferred_slot_keys="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_first_policy_deferred_slot_keys_diag)
+                          << " policy_mode="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_apply_policy_mode_diag)
+                          << std::endl;
+              }
+              const bool emit_direct_local_apply_stage_diag =
+                  cbs_phase2_replay_into_stage_a_mode &&
+                  (replay_direct_local_apply_candidate_count_diag > 0u ||
+                   replay_direct_local_apply_attempted_count_diag > 0u ||
+                   replay_direct_local_apply_succeeded_count_diag > 0u ||
+                   replay_direct_local_apply_failed_count_diag > 0u);
+              if (emit_direct_local_apply_stage_diag) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageADirectLocalReplayApplyStageDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " direct_local_apply_candidate_count="
+                          << replay_direct_local_apply_candidate_count_diag
+                          << " direct_local_apply_attempted_count="
+                          << replay_direct_local_apply_attempted_count_diag
+                          << " direct_local_apply_succeeded_count="
+                          << replay_direct_local_apply_succeeded_count_diag
+                          << " direct_local_apply_failed_count="
+                          << replay_direct_local_apply_failed_count_diag
+                          << " direct_local_apply_ineligible_count="
+                          << replay_direct_local_apply_ineligible_count_diag
+                          << " direct_local_apply_quarantined_count="
+                          << replay_direct_local_apply_quarantined_count_diag
+                          << " direct_local_apply_slots_first_few="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_apply_stage_slots_first_few_diag)
+                          << " apply_stage_mode="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_apply_stage_mode_diag)
+                          << " first_failure_reason="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_apply_stage_first_failure_reason_diag)
+                          << std::endl;
+              }
+              const bool emit_direct_local_apply_failure_audit_diag =
+                  cbs_phase2_replay_into_stage_a_mode &&
+                  replay_direct_local_apply_failure_audit_triggered_diag;
+              if (emit_direct_local_apply_failure_audit_diag) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageADirectLocalReplayApplyFailureAuditDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " direct_local_apply_candidate_count="
+                    << replay_direct_local_apply_candidate_count_diag
+                    << " direct_local_apply_attempted_count="
+                    << replay_direct_local_apply_attempted_count_diag
+                    << " direct_local_apply_slots_first_few="
+                    << sanitize_forensic_token(
+                           replay_direct_local_apply_stage_slots_first_few_diag)
+                    << " stage_a_summary_factor_count="
+                    << cbs_phase2_two_stage_update_a_summary_factor_count
+                    << " stage_a_root_bootstrap_support_factor_count="
+                    << stage_a_root_bootstrap_support_factor_count
+                    << " stage_a_remove_slots_first_few="
+                    << sanitize_forensic_token(
+                           replay_direct_local_apply_stage_a_remove_slots_first_few_diag)
+                    << " apply_stage_remove_slots_first_few="
+                    << sanitize_forensic_token(
+                           replay_direct_local_apply_failure_apply_stage_remove_slots_first_few_diag)
+                    << " pending_queue_size_before="
+                    << replay_direct_local_apply_failure_pending_queue_size_before_diag
+                    << " pending_queue_size_after="
+                    << replay_direct_local_apply_failure_pending_queue_size_after_diag
+                    << " summary_replay_metadata_size="
+                    << cbs_phase2_summary_covered_crossing_replay_metadata_map
+                           .size()
+                    << " summary_replay_queue_size="
+                    << cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_
+                           .size()
+                    << " direct_local_pending_queue_size="
+                    << cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                           .size()
+                    << " failure_stage="
+                    << sanitize_forensic_token(
+                           replay_direct_local_apply_failure_stage_diag)
+                    << " first_failure_reason="
+                    << sanitize_forensic_token(
+                           replay_direct_local_apply_failure_reason_diag)
+                    << " audit_mode=stage_a_direct_local_replay_apply_failure_transition"
+                    << std::endl;
+              }
+              const bool emit_direct_local_apply_requeue_diag =
+                  cbs_phase2_replay_into_stage_a_mode &&
+                  replay_direct_local_apply_requeue_diag_triggered;
+              if (emit_direct_local_apply_requeue_diag) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageADirectLocalReplayApplyRequeueDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " failed_apply_candidate_count="
+                    << replay_direct_local_failed_apply_candidate_count_diag
+                    << " requeued_after_failed_apply_count="
+                    << replay_direct_local_requeued_after_failed_apply_count_diag
+                    << " dropped_after_failed_apply_count="
+                    << replay_direct_local_dropped_after_failed_apply_count_diag
+                    << " first_requeued_slot="
+                    << replay_direct_local_first_requeued_slot_diag
+                    << " first_requeued_slot_class="
+                    << sanitize_forensic_token(
+                           replay_direct_local_first_requeued_slot_class_diag)
+                    << " first_requeued_slot_keys="
+                    << sanitize_forensic_token(
+                           replay_direct_local_first_requeued_slot_keys_diag)
+                    << " requeue_reason="
+                    << sanitize_forensic_token(replay_direct_local_requeue_reason_diag)
+                    << " requeue_mode="
+                    << sanitize_forensic_token(replay_direct_local_requeue_mode_diag)
+                    << std::endl;
+              }
+              const bool emit_direct_local_hard_quarantine_diag =
+                  cbs_phase2_replay_into_stage_a_mode &&
+                  replay_direct_local_hard_quarantined_identity_count_diag > 0u;
+              if (emit_direct_local_hard_quarantine_diag) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageADirectLocalReplayHardQuarantineDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " quarantined_identity_count_this_epoch="
+                    << replay_direct_local_hard_quarantined_identity_count_diag
+                    << " quarantined_identity_first_few="
+                    << sanitize_forensic_token(format_replay_identity_preview(
+                           replay_direct_local_hard_quarantined_identity_first_few_diag,
+                           8u))
+                    << " quarantined_slot="
+                    << replay_direct_local_hard_quarantined_slot_diag
+                    << " quarantined_slot_class="
+                    << sanitize_forensic_token(
+                           replay_direct_local_hard_quarantined_slot_class_diag)
+                    << " quarantined_slot_keys="
+                    << sanitize_forensic_token(
+                           replay_direct_local_hard_quarantined_slot_keys_diag)
+                    << " quarantine_reason="
+                    << sanitize_forensic_token(
+                           replay_direct_local_hard_quarantine_reason_diag)
+                    << " quarantine_store_size="
+                    << cbs_phase2_direct_local_hard_quarantine_identity_store.size()
+                    << " quarantine_mode=semantic_identity_hard_quarantine_after_first_live_map_at_failure"
+                    << std::endl;
+              }
+              const bool emit_direct_local_hard_quarantine_skip_diag =
+                  cbs_phase2_replay_into_stage_a_mode &&
+                  replay_direct_local_skipped_due_to_hard_quarantine_count_diag >
+                      0u;
+              if (emit_direct_local_hard_quarantine_skip_diag) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageADirectLocalReplayQuarantineSkipDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " skipped_due_to_hard_quarantine_count="
+                    << replay_direct_local_skipped_due_to_hard_quarantine_count_diag
+                    << " skipped_due_to_hard_quarantine_first_few="
+                    << sanitize_forensic_token(format_factor_slots_preview(
+                           replay_direct_local_skipped_due_to_hard_quarantine_slots_diag,
+                           16u))
+                    << " quarantine_skip_mode=semantic_identity_skip_live_apply"
+                    << std::endl;
+              }
+
+              cbs_phase2_stage_b_defer_delete_slots_mode =
+                  cbs_phase2_diag_stage_b_defer_delete_slots;
+              cbs_phase2_stage_b_filter_invalid_smart_factors_mode =
+                  cbs_phase2_diag_stage_b_filter_invalid_smart_factors;
+              cbs_phase2_stage_b_skip_smart_updates_one_epoch_mode =
+                  cbs_phase2_diag_stage_b_skip_smart_updates_one_epoch_after_lag_boundary;
+              cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective =
+                  cbs_phase2_stage_b_skip_smart_updates_one_epoch_mode &&
+                  cbs_phase2_first_post_boundary_epoch;
+              cbs_phase2_stage_b_skip_epoch_on_initial_failure_mode =
+                  cbs_phase2_diag_stage_b_skip_epoch_on_initial_failure;
+              cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure = false;
+              cbs_phase2_stage_b_skipped_kf = -1;
+              cbs_phase2_stage_b_skip_reason = "none";
+              cbs_phase2_stage_b_delete_slots_raw_count = 0u;
+              cbs_phase2_stage_b_delete_slots_applied_count = 0u;
+              cbs_phase2_stage_b_delete_slots_deferred_count = 0u;
+              cbs_phase2_stage_b_smart_factor_raw_count = 0u;
+              cbs_phase2_stage_b_smart_factor_kept_count = 0u;
+              cbs_phase2_stage_b_smart_factor_dropped_count = 0u;
+              cbs_phase2_stage_b_smart_factor_skipped_count = 0u;
+              cbs_phase2_stage_b_smart_factor_reused_count = 0u;
+              cbs_phase2_stage_b_map_at_thrown = false;
+              cbs_phase2_stage_b_first_dropped_smart_factor_keys = "none";
+              cbs_phase2_stage_b_first_dropped_smart_factor_reason = "none";
+              std::unordered_set<size_t> stage_b_delete_slot_set(
+                  delete_slots_forensic.begin(), delete_slots_forensic.end());
+              const gtsam::NonlinearFactorGraph& stage_b_optimizer_factors =
+                  cbs_optimizer_->getFactorsUnsafe();
+              gtsam::FactorIndices stage_b_remove_filtered;
+              bool stage_b_remove_slots_filtered = false;
+              stage_b_remove_filtered.reserve(
+                  update_b_params.removeFactorIndices.size());
+              for (const size_t slot : update_b_params.removeFactorIndices) {
+                const bool is_delete_slot =
+                    stage_b_delete_slot_set.count(slot) > 0u;
+                if (is_delete_slot) {
+                  ++cbs_phase2_stage_b_delete_slots_raw_count;
+                  if (cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective &&
+                      stage_b_optimizer_factors.exists(slot) &&
+                      stage_b_optimizer_factors.at(slot) &&
+                      classify_forensic_factor_type(
+                          stage_b_optimizer_factors.at(slot).get()) ==
+                          "smart") {
+                    ++cbs_phase2_stage_b_smart_factor_reused_count;
+                    stage_b_remove_slots_filtered = true;
+                    continue;
+                  }
+                  if (cbs_phase2_stage_b_defer_delete_slots_mode) {
+                    ++cbs_phase2_stage_b_delete_slots_deferred_count;
+                    stage_b_remove_slots_filtered = true;
+                    continue;
+                  }
+                  ++cbs_phase2_stage_b_delete_slots_applied_count;
+                }
+                stage_b_remove_filtered.push_back(slot);
+              }
+              if (stage_b_remove_slots_filtered) {
+                update_b_params.removeFactorIndices = stage_b_remove_filtered;
+              }
+              gtsam::NonlinearFactorGraph stage_b_factors_for_update;
+              const gtsam::NonlinearFactorGraph* stage_b_factors_for_update_ptr =
+                  &cbs_current_epoch_new_vio_factors;
+              bool stage_b_smart_preflight_key_check_active =
+                  cbs_phase2_stage_b_filter_invalid_smart_factors_mode;
+              std::unordered_set<gtsam::Key> stage_b_available_keys;
+              if (stage_b_smart_preflight_key_check_active) {
+                try {
+                  const gtsam::Values stage_a_post_update_values =
+                      cbs_optimizer_->calculateEstimate();
+                  stage_b_available_keys.reserve(stage_a_post_update_values.size() +
+                                                 new_values.size());
+                  for (const auto& kv : stage_a_post_update_values) {
+                    stage_b_available_keys.insert(kv.key);
+                  }
+                  for (const auto& kv : new_values) {
+                    stage_b_available_keys.insert(kv.key);
+                  }
+                } catch (const std::exception& estimate_error) {
+                  stage_b_smart_preflight_key_check_active = false;
+                  const std::string estimate_error_msg =
+                      estimate_error.what() ? std::string(estimate_error.what())
+                                           : std::string("unknown");
+                  cbs_phase2_stage_b_first_dropped_smart_factor_reason =
+                      "preflight_key_query_failed:" + estimate_error_msg;
+                }
+              }
+              stage_b_factors_for_update.reserve(
+                  cbs_current_epoch_new_vio_factors.size());
+              for (size_t idx = 0u; idx < cbs_current_epoch_new_vio_factors.size();
+                   ++idx) {
+                const auto& factor_ptr = cbs_current_epoch_new_vio_factors.at(idx);
+                if (!factor_ptr) {
+                  continue;
+                }
+                const bool is_smart_factor =
+                    classify_forensic_factor_type(factor_ptr.get()) == "smart";
+                if (!is_smart_factor) {
+                  stage_b_factors_for_update.push_back(factor_ptr);
+                  continue;
+                }
+                ++cbs_phase2_stage_b_smart_factor_raw_count;
+                bool drop_factor = false;
+                std::string drop_reason = "none";
+                if (cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective) {
+                  drop_factor = true;
+                  drop_reason = "skip_smart_update_first_post_boundary_epoch";
+                  ++cbs_phase2_stage_b_smart_factor_skipped_count;
+                }
+                if (!drop_factor && stage_b_smart_preflight_key_check_active) {
+                  for (const gtsam::Key key : factor_ptr->keys()) {
+                    if (stage_b_available_keys.count(key) == 0u) {
+                      drop_factor = true;
+                      drop_reason = "missing_stage_b_key:" +
+                                    gtsam::DefaultKeyFormatter(key);
+                      break;
+                    }
+                  }
+                }
+                if (drop_factor) {
+                  ++cbs_phase2_stage_b_smart_factor_dropped_count;
+                  if (cbs_phase2_stage_b_first_dropped_smart_factor_keys ==
+                      "none") {
+                    cbs_phase2_stage_b_first_dropped_smart_factor_keys =
+                        format_stage_factor_keys(factor_ptr);
+                    cbs_phase2_stage_b_first_dropped_smart_factor_reason =
+                        drop_reason;
+                  }
+                  continue;
+                }
+                ++cbs_phase2_stage_b_smart_factor_kept_count;
+                stage_b_factors_for_update.push_back(factor_ptr);
+              }
+              if (cbs_phase2_stage_b_filter_invalid_smart_factors_mode ||
+                  cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective) {
+                stage_b_factors_for_update_ptr = &stage_b_factors_for_update;
+              }
+              cbs_phase2_two_stage_update_b_new_factor_count =
+                  count_nonnull_factors(*stage_b_factors_for_update_ptr);
+
+              const StageBPacketSnapshot stage_b_packet_snapshot =
+                  build_stage_b_packet_snapshot(*stage_b_factors_for_update_ptr,
+                                                new_values,
+                                                update_b_params);
+              const PostStageAPreStageBStateSnapshot
+                  post_stage_a_pre_stage_b_state_snapshot =
+                      build_post_stage_a_pre_stage_b_state_snapshot(
+                          stage_a_completed_successfully,
+                          *stage_b_factors_for_update_ptr,
+                          new_values);
+              bool stage_b_completed_successfully = false;
+              cbs_phase2_two_stage_update_b_executed =
+                  stage_a_completed_successfully;
+              if (!stage_a_completed_successfully) {
+                cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure = true;
+                cbs_phase2_stage_b_skipped_kf =
+                    static_cast<long long>(curr_kf_id_);
+                cbs_phase2_stage_b_skip_reason =
+                    "skipped_due_to_stage_a_not_completed:" +
+                    sanitize_forensic_token(
+                        stage_a_failure_reason.empty()
+                            ? std::string("none")
+                            : stage_a_failure_reason);
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageBSkippedDueToStageA]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " stage_a_completed_successfully="
+                    << (stage_a_completed_successfully ? 1 : 0)
+                    << " stage_a_failure_reason="
+                    << sanitize_forensic_token(
+                           stage_a_failure_reason.empty()
+                               ? std::string("none")
+                               : stage_a_failure_reason)
+                    << " stage_b_factor_count="
+                    << stage_b_packet_snapshot.factor_count
+                    << " stage_b_smart_factor_count="
+                    << stage_b_packet_snapshot.smart_factor_count
+                    << " stage_b_imu_factor_count="
+                    << stage_b_packet_snapshot.imu_factor_count
+                    << " stage_b_between_factor_count="
+                    << stage_b_packet_snapshot.between_factor_count
+                    << std::endl;
+                update_b_result = update_a_result;
+                update_b_effective_remove_slots.clear();
+                update_b_retry_attempted = false;
+                update_b_retry_succeeded = false;
+              } else try {
+                run_update_stage_with_retry("two_stage_update_b",
+                                            *stage_b_factors_for_update_ptr,
+                                            new_values,
+                                            update_b_params,
+                                            &update_b_result,
+                                            &update_b_effective_remove_slots,
+                                            &update_b_retry_attempted,
+                                            &update_b_retry_succeeded);
+                stage_b_completed_successfully = true;
+                stage_b_last_clean_snapshot = stage_b_packet_snapshot;
+                stage_b_last_clean_snapshot_valid = true;
+                post_stage_a_pre_stage_b_last_clean_snapshot =
+                    post_stage_a_pre_stage_b_state_snapshot;
+                post_stage_a_pre_stage_b_last_clean_snapshot_valid = true;
+              } catch (const std::exception& stage_b_error) {
+                const std::string stage_b_error_message =
+                    stage_b_error.what() ? std::string(stage_b_error.what())
+                                         : std::string("unknown");
+                cbs_phase2_stage_b_map_at_thrown =
+                    stage_b_error_message.find("map::at") != std::string::npos;
+                if (!stage_b_first_failure_diag_emitted) {
+                  const StageBPacketSnapshot clean_snapshot =
+                      stage_b_last_clean_snapshot_valid
+                          ? stage_b_last_clean_snapshot
+                          : StageBPacketSnapshot();
+                  const PostStageAPreStageBStateSnapshot clean_pre_stage_b_snapshot =
+                      post_stage_a_pre_stage_b_last_clean_snapshot_valid
+                          ? post_stage_a_pre_stage_b_last_clean_snapshot
+                          : PostStageAPreStageBStateSnapshot();
+                  const std::string post_stage_a_pre_stage_b_first_inconsistency =
+                      classify_post_stage_a_pre_stage_b_inconsistency(
+                          clean_pre_stage_b_snapshot,
+                          post_stage_a_pre_stage_b_last_clean_snapshot_valid,
+                          clean_snapshot,
+                          stage_b_last_clean_snapshot_valid,
+                          post_stage_a_pre_stage_b_state_snapshot,
+                          stage_b_packet_snapshot);
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][PostStageAPreStageBStateDiag]"
+                      << " curr_kf_id="
+                      << post_stage_a_pre_stage_b_state_snapshot.curr_kf_id
+                      << " stage_a_completed_successfully="
+                      << (post_stage_a_pre_stage_b_state_snapshot
+                                  .stage_a_completed_successfully
+                              ? 1
+                              : 0)
+                      << " active_key_count="
+                      << post_stage_a_pre_stage_b_state_snapshot
+                             .active_key_count_after_stage_a
+                      << " active_factor_count="
+                      << post_stage_a_pre_stage_b_state_snapshot
+                             .active_factor_count_after_stage_a
+                      << " newest_local_frame_id="
+                      << post_stage_a_pre_stage_b_state_snapshot
+                             .newest_local_frame_id
+                      << " oldest_active_frame_id="
+                      << post_stage_a_pre_stage_b_state_snapshot
+                             .oldest_active_frame_id
+                      << " stage_b_new_value_keys="
+                      << sanitize_forensic_token(
+                             post_stage_a_pre_stage_b_state_snapshot
+                                 .stage_b_value_keys)
+                      << " stage_b_value_keys_in_estimate="
+                      << sanitize_forensic_token(
+                             post_stage_a_pre_stage_b_state_snapshot
+                                 .stage_b_value_keys_in_estimate)
+                      << " stage_b_value_keys_in_variable_index="
+                      << sanitize_forensic_token(
+                             post_stage_a_pre_stage_b_state_snapshot
+                                 .stage_b_value_keys_in_variable_index)
+                      << " stage_b_factor_key_missing_count="
+                      << post_stage_a_pre_stage_b_state_snapshot
+                             .stage_b_factor_keys_missing_from_current_optimizer_state_count
+                      << " first_missing_stage_b_factor_key="
+                      << sanitize_forensic_token(
+                             post_stage_a_pre_stage_b_state_snapshot
+                                 .first_missing_stage_b_factor_key)
+                      << " stage_b_factor_count="
+                      << stage_b_packet_snapshot.factor_count
+                      << " stage_b_smart_factor_count="
+                      << stage_b_packet_snapshot.smart_factor_count
+                      << " stage_b_imu_factor_count="
+                      << stage_b_packet_snapshot.imu_factor_count
+                      << " stage_b_prior_factor_count="
+                      << stage_b_packet_snapshot.prior_factor_count
+                      << " stage_b_between_factor_count="
+                      << stage_b_packet_snapshot.between_factor_count
+                      << " clean_snapshot_available="
+                      << (post_stage_a_pre_stage_b_last_clean_snapshot_valid ? 1 : 0)
+                      << " clean_curr_kf_id="
+                      << clean_pre_stage_b_snapshot.curr_kf_id
+                      << " clean_stage_a_completed_successfully="
+                      << (clean_pre_stage_b_snapshot.stage_a_completed_successfully
+                              ? 1
+                              : 0)
+                      << " clean_active_key_count="
+                      << clean_pre_stage_b_snapshot.active_key_count_after_stage_a
+                      << " clean_active_factor_count="
+                      << clean_pre_stage_b_snapshot.active_factor_count_after_stage_a
+                      << " clean_newest_local_frame_id="
+                      << clean_pre_stage_b_snapshot.newest_local_frame_id
+                      << " clean_oldest_active_frame_id="
+                      << clean_pre_stage_b_snapshot.oldest_active_frame_id
+                      << " clean_stage_b_new_value_keys="
+                      << sanitize_forensic_token(
+                             clean_pre_stage_b_snapshot.stage_b_value_keys)
+                      << " clean_stage_b_value_keys_in_estimate="
+                      << sanitize_forensic_token(
+                             clean_pre_stage_b_snapshot
+                                 .stage_b_value_keys_in_estimate)
+                      << " clean_stage_b_value_keys_in_variable_index="
+                      << sanitize_forensic_token(
+                             clean_pre_stage_b_snapshot
+                                 .stage_b_value_keys_in_variable_index)
+                      << " clean_stage_b_factor_key_missing_count="
+                      << clean_pre_stage_b_snapshot
+                             .stage_b_factor_keys_missing_from_current_optimizer_state_count
+                      << " clean_first_missing_stage_b_factor_key="
+                      << sanitize_forensic_token(
+                             clean_pre_stage_b_snapshot
+                                 .first_missing_stage_b_factor_key)
+                      << " clean_stage_b_factor_count="
+                      << clean_snapshot.factor_count
+                      << " clean_stage_b_smart_factor_count="
+                      << clean_snapshot.smart_factor_count
+                      << " clean_stage_b_imu_factor_count="
+                      << clean_snapshot.imu_factor_count
+                      << " clean_stage_b_prior_factor_count="
+                      << clean_snapshot.prior_factor_count
+                      << " clean_stage_b_between_factor_count="
+                      << clean_snapshot.between_factor_count
+                      << " first_inconsistency="
+                      << sanitize_forensic_token(
+                             post_stage_a_pre_stage_b_first_inconsistency)
+                      << std::endl;
+                  const std::string first_structural_difference =
+                      stage_b_last_clean_snapshot_valid
+                          ? describe_first_stage_b_difference(
+                                clean_snapshot, stage_b_packet_snapshot)
+                          : std::string("no_previous_clean_stage_b_snapshot");
+                  const std::string dominant_cause =
+                      stage_b_last_clean_snapshot_valid
+                          ? classify_stage_b_failure_cause(clean_snapshot,
+                                                           stage_b_packet_snapshot)
+                          : std::string("unknown_no_clean_baseline");
+                  const std::string composition_factor_class_count_diff =
+                      stage_b_last_clean_snapshot_valid
+                          ? format_stage_b_factor_class_count_diff(
+                                clean_snapshot, stage_b_packet_snapshot)
+                          : std::string("unknown");
+                  const long long composition_smart_factor_diff =
+                      stage_b_last_clean_snapshot_valid
+                          ? stage_b_signed_count_diff("smart",
+                                                      clean_snapshot,
+                                                      stage_b_packet_snapshot)
+                          : 0ll;
+                  const long long composition_imu_factor_diff =
+                      stage_b_last_clean_snapshot_valid
+                          ? stage_b_signed_count_diff("imu",
+                                                      clean_snapshot,
+                                                      stage_b_packet_snapshot)
+                          : 0ll;
+                  const long long composition_between_factor_diff =
+                      stage_b_last_clean_snapshot_valid
+                          ? stage_b_signed_count_diff("between",
+                                                      clean_snapshot,
+                                                      stage_b_packet_snapshot)
+                          : 0ll;
+                  const long long composition_prior_factor_diff =
+                      stage_b_last_clean_snapshot_valid
+                          ? stage_b_signed_count_diff("prior",
+                                                      clean_snapshot,
+                                                      stage_b_packet_snapshot)
+                          : 0ll;
+                  const std::string first_missing_factor_class =
+                      stage_b_last_clean_snapshot_valid
+                          ? first_stage_b_diff_class(clean_snapshot,
+                                                     stage_b_packet_snapshot,
+                                                     true)
+                          : std::string("unknown");
+                  const std::string first_extra_factor_class =
+                      stage_b_last_clean_snapshot_valid
+                          ? first_stage_b_diff_class(clean_snapshot,
+                                                     stage_b_packet_snapshot,
+                                                     false)
+                          : std::string("unknown");
+                  const std::string first_missing_factor_keys =
+                      stage_b_last_clean_snapshot_valid
+                          ? stage_b_class_keys_preview(clean_snapshot,
+                                                       first_missing_factor_class)
+                          : std::string("unknown");
+                  const std::string first_extra_factor_keys =
+                      stage_b_last_clean_snapshot_valid
+                          ? stage_b_class_keys_preview(stage_b_packet_snapshot,
+                                                       first_extra_factor_class)
+                          : std::string("unknown");
+                  const std::string composition_dominant_cause =
+                      stage_b_last_clean_snapshot_valid
+                          ? classify_stage_b_composition_dominant_cause(
+                                clean_snapshot, stage_b_packet_snapshot)
+                          : std::string("unknown_no_clean_baseline");
+                  const std::string stage_b_exception_message =
+                      stage_b_error_message;
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][StageBFirstFailurePacketDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " stage=two_stage_update_b"
+                      << " fail_factor_count="
+                      << stage_b_packet_snapshot.factor_count
+                      << " fail_value_count="
+                      << stage_b_packet_snapshot.value_count
+                      << " fail_remove_factor_indices_count="
+                      << stage_b_packet_snapshot.remove_count
+                      << " fail_delete_slots_count="
+                      << stage_b_packet_snapshot.delete_slots_count
+                      << " fail_remove_overlap_delete_slots_count="
+                      << stage_b_packet_snapshot.remove_overlap_delete_slots_count
+                      << " stage_b_defer_delete_slots_mode="
+                      << (cbs_phase2_stage_b_defer_delete_slots_mode ? 1 : 0)
+                      << " stage_b_filter_invalid_smart_factors_mode="
+                      << (cbs_phase2_stage_b_filter_invalid_smart_factors_mode
+                              ? 1
+                              : 0)
+                      << " stage_b_delete_slots_raw_count="
+                      << cbs_phase2_stage_b_delete_slots_raw_count
+                      << " stage_b_delete_slots_applied_count="
+                      << cbs_phase2_stage_b_delete_slots_applied_count
+                      << " stage_b_delete_slots_deferred_count="
+                      << cbs_phase2_stage_b_delete_slots_deferred_count
+                      << " stage_b_smart_factor_raw_count="
+                      << cbs_phase2_stage_b_smart_factor_raw_count
+                      << " stage_b_smart_factor_kept_count="
+                      << cbs_phase2_stage_b_smart_factor_kept_count
+                      << " stage_b_smart_factor_dropped_count="
+                      << cbs_phase2_stage_b_smart_factor_dropped_count
+                      << " stage_b_skip_smart_updates_one_epoch_mode="
+                      << (cbs_phase2_stage_b_skip_smart_updates_one_epoch_mode
+                              ? 1
+                              : 0)
+                      << " stage_b_skip_smart_updates_one_epoch_effective="
+                      << (cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective
+                              ? 1
+                              : 0)
+                      << " stage_b_smart_factor_skipped_count="
+                      << cbs_phase2_stage_b_smart_factor_skipped_count
+                      << " stage_b_smart_factor_reused_count="
+                      << cbs_phase2_stage_b_smart_factor_reused_count
+                      << " stage_b_map_at_thrown="
+                      << (cbs_phase2_stage_b_map_at_thrown ? 1 : 0)
+                      << " stage_b_first_dropped_smart_factor_keys="
+                      << sanitize_forensic_token(
+                             cbs_phase2_stage_b_first_dropped_smart_factor_keys)
+                      << " stage_b_first_dropped_smart_factor_reason="
+                      << sanitize_forensic_token(
+                             cbs_phase2_stage_b_first_dropped_smart_factor_reason)
+                      << " fail_factor_classes_first_few="
+                      << sanitize_forensic_token(
+                             stage_b_packet_snapshot.factor_classes_first_few)
+                      << " fail_factor_keys_first_few="
+                      << sanitize_forensic_token(
+                             stage_b_packet_snapshot.factor_keys_first_few)
+                      << " fail_value_keys_first_few="
+                      << sanitize_forensic_token(
+                             stage_b_packet_snapshot.value_keys_first_few)
+                      << " clean_snapshot_available="
+                      << (stage_b_last_clean_snapshot_valid ? 1 : 0)
+                      << " clean_curr_kf_id=" << clean_snapshot.curr_kf_id
+                      << " clean_factor_count=" << clean_snapshot.factor_count
+                      << " clean_value_count=" << clean_snapshot.value_count
+                      << " clean_remove_factor_indices_count="
+                      << clean_snapshot.remove_count
+                      << " clean_delete_slots_count="
+                      << clean_snapshot.delete_slots_count
+                      << " clean_remove_overlap_delete_slots_count="
+                      << clean_snapshot.remove_overlap_delete_slots_count
+                      << " clean_factor_classes_first_few="
+                      << sanitize_forensic_token(
+                             clean_snapshot.factor_classes_first_few)
+                      << " clean_factor_keys_first_few="
+                      << sanitize_forensic_token(
+                             clean_snapshot.factor_keys_first_few)
+                      << " clean_value_keys_first_few="
+                      << sanitize_forensic_token(
+                             clean_snapshot.value_keys_first_few)
+                      << " first_structural_difference="
+                      << sanitize_forensic_token(first_structural_difference)
+                      << " dominant_cause="
+                      << sanitize_forensic_token(dominant_cause)
+                      << " stage_b_exception_message="
+                      << sanitize_forensic_token(stage_b_exception_message)
+                      << std::endl;
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][StageBCompositionDiffDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " clean_kf_id=" << clean_snapshot.curr_kf_id
+                      << " factor_class_count_diff="
+                      << sanitize_forensic_token(
+                             composition_factor_class_count_diff)
+                      << " smart_factor_diff=" << composition_smart_factor_diff
+                      << " imu_factor_diff=" << composition_imu_factor_diff
+                      << " between_factor_diff="
+                      << composition_between_factor_diff
+                      << " prior_factor_diff=" << composition_prior_factor_diff
+                      << " first_missing_factor_class="
+                      << sanitize_forensic_token(first_missing_factor_class)
+                      << " first_extra_factor_class="
+                      << sanitize_forensic_token(first_extra_factor_class)
+                      << " first_missing_factor_keys="
+                      << sanitize_forensic_token(first_missing_factor_keys)
+                      << " first_extra_factor_keys="
+                      << sanitize_forensic_token(first_extra_factor_keys)
+                      << " dominant_cause="
+                      << sanitize_forensic_token(composition_dominant_cause)
+                      << std::endl;
+                  stage_b_first_failure_diag_emitted = true;
+                }
+                const bool skip_stage_b_on_initial_failure =
+                    cbs_phase2_stage_b_skip_epoch_on_initial_failure_mode &&
+                    !cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure;
+                if (skip_stage_b_on_initial_failure) {
+                  cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure = true;
+                  cbs_phase2_stage_b_skipped_kf =
+                      static_cast<long long>(curr_kf_id_);
+                  const std::string sanitized_stage_b_error_message =
+                      sanitize_forensic_token(
+                          stage_b_error_message.empty()
+                              ? std::string("unknown")
+                              : stage_b_error_message);
+                  cbs_phase2_stage_b_skip_reason =
+                      "initial_stage_b_exception:" +
+                      sanitized_stage_b_error_message;
+                  cbs_note_stage_b_failure_exception(
+                      enable_remove_factor_indices,
+                      "bpsam_update_call_two_stage_update_b",
+                      stage_b_error_message);
+                  cbs_stage_b_failure_sequence_final_failure_stage =
+                      sanitize_forensic_token(
+                          "two_stage_update_b_initial_exception_skipped_epoch");
+                  if (stage_b_error_message.find("map::at") !=
+                      std::string::npos) {
+                    ++cbs_map_at_count_so_far_;
+                    cbs_crash_imminent_marker_epoch = true;
+                  }
+                  if (stage_b_error_message.find(
+                          "IndeterminantLinearSystemException") !=
+                      std::string::npos) {
+                    ++cbs_bpsam_ilsretry_count_so_far_;
+                    cbs_crash_imminent_marker_epoch = true;
+                  }
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][StageBSkipEpochDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " cbs_phase2_stage_b_skip_epoch_on_initial_failure_mode="
+                      << (cbs_phase2_stage_b_skip_epoch_on_initial_failure_mode
+                              ? 1
+                              : 0)
+                      << " cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure="
+                      << (cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure
+                              ? 1
+                              : 0)
+                      << " cbs_phase2_stage_b_skipped_kf="
+                      << cbs_phase2_stage_b_skipped_kf
+                      << " cbs_phase2_stage_b_skip_reason="
+                      << sanitize_forensic_token(cbs_phase2_stage_b_skip_reason)
+                      << std::endl;
+                  update_b_result = update_a_result;
+                  update_b_effective_remove_slots.clear();
+                  update_b_retry_attempted = false;
+                  update_b_retry_succeeded = false;
+                } else {
+                  throw;
+                }
+              }
+
+              std::optional<gtsam::ISAM2Result>
+                  post_stage_direct_local_apply_result;
+              gtsam::FactorIndices post_stage_direct_local_effective_remove_slots;
+              if (cbs_phase2_replay_into_stage_a_mode) {
+                replay_direct_local_apply_contract_diag =
+                    "stage_b_packet_remove_with_new_vio_update";
+                replay_direct_local_contract_mode_diag =
+                    "authoritative_stage_b_packet_remove_contract";
+              }
+              if (false && stage_b_completed_successfully &&
+                  !stage_a_direct_local_packet_incompatible_slots.empty()) {
+                replay_direct_local_apply_stage_mode_diag =
+                    "post_stage_b_direct_local_remove_micro_batch";
+                replay_direct_local_apply_candidate_count_diag =
+                    stage_a_direct_local_packet_incompatible_slots.size();
+                replay_direct_local_apply_stage_slots_first_few_diag =
+                    sanitize_forensic_token(format_factor_slots_preview(
+                        stage_a_direct_local_packet_incompatible_slots, 16u));
+                const size_t direct_local_pending_queue_size_before_apply_stage =
+                    cbs_phase2_direct_local_pending_one_epoch_replay_queue_.size();
+                replay_direct_local_apply_failure_pending_queue_size_before_diag =
+                    direct_local_pending_queue_size_before_apply_stage;
+                const auto upsert_direct_local_pending_metadata_after_stage =
+                    [&](CbsSummaryCoveredCrossingReplayMetadata metadata) {
+                      if (metadata.slot_id == 0u) {
+                        return;
+                      }
+                      normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                      if (metadata.first_defer_epoch == 0u) {
+                        metadata.first_defer_epoch =
+                            metadata.defer_epoch == 0u ? curr_kf_id_
+                                                       : metadata.defer_epoch;
+                      }
+                      if (metadata.replay_path.empty() ||
+                          metadata.replay_path == "none") {
+                        metadata.replay_path = "direct_local_pending";
+                      }
+                      if (metadata.pending_reason.empty()) {
+                        metadata.pending_reason = "none";
+                      }
+                      const std::string metadata_identity =
+                          build_replay_lifecycle_identity(metadata);
+                      if (replay_consumed_identity_set_epoch.count(
+                              metadata_identity) > 0u ||
+                          cbs_phase2_direct_local_applied_consumed_terminal_identity_store
+                                  .count(metadata_identity) > 0u ||
+                          cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store
+                                  .count(metadata_identity) > 0u ||
+                          cbs_phase2_direct_local_hard_quarantine_identity_store
+                                  .count(metadata_identity) > 0u) {
+                        ++replay_blocked_reenqueue_same_epoch_count_diag;
+                        return;
+                      }
+                      for (auto it =
+                               cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                                   .begin();
+                           it !=
+                           cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                               .end();
+                           ++it) {
+                        const std::string queued_identity =
+                            build_replay_lifecycle_identity(it->second);
+                        if (queued_identity != metadata_identity) {
+                          continue;
+                        }
+                        auto& existing = it->second;
+                        existing.defer_epoch = curr_kf_id_;
+                        existing.first_defer_epoch =
+                            existing.first_defer_epoch == 0u
+                                ? metadata.first_defer_epoch
+                                : std::min(existing.first_defer_epoch,
+                                           metadata.first_defer_epoch);
+                        existing.factor_class = metadata.factor_class;
+                        existing.factor_keys = metadata.factor_keys;
+                        existing.replay_path = metadata.replay_path;
+                        existing.pending_reason = metadata.pending_reason;
+                        existing.blocking_key = metadata.blocking_key;
+                        existing.blocking_support_slot =
+                            metadata.blocking_support_slot;
+                        existing.blocking_support_slot_class =
+                            metadata.blocking_support_slot_class;
+                        existing.blocking_support_slot_keys =
+                            metadata.blocking_support_slot_keys;
+                        existing.blocking_incident_id =
+                            metadata.blocking_incident_id;
+                        existing.blocking_incident_member_slots =
+                            metadata.blocking_incident_member_slots;
+                        ++replay_direct_local_deduped_existing_pending_count_diag;
+                        return;
+                      }
+                      cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                          [metadata.slot_id] = metadata;
+                    };
+                gtsam::FactorIndices direct_local_apply_ordered_slots =
+                    stage_a_direct_local_packet_incompatible_slots;
+                std::sort(direct_local_apply_ordered_slots.begin(),
+                          direct_local_apply_ordered_slots.end());
+                direct_local_apply_ordered_slots.erase(
+                    std::unique(direct_local_apply_ordered_slots.begin(),
+                                direct_local_apply_ordered_slots.end()),
+                    direct_local_apply_ordered_slots.end());
+                std::vector<gtsam::FactorIndices>
+                    direct_local_apply_component_batches;
+                direct_local_apply_component_batches.reserve(
+                    direct_local_apply_ordered_slots.size());
+                {
+                  const auto& direct_local_apply_graph =
+                      cbs_optimizer_->getFactorsUnsafe();
+                  std::unordered_map<gtsam::Key, gtsam::FactorIndices>
+                      candidate_slots_by_local_key;
+                  candidate_slots_by_local_key.reserve(
+                      direct_local_apply_ordered_slots.size() * 2u);
+                  for (const size_t slot : direct_local_apply_ordered_slots) {
+                    if (!direct_local_apply_graph.exists(slot) ||
+                        !direct_local_apply_graph.at(slot)) {
+                      continue;
+                    }
+                    const auto factor = direct_local_apply_graph.at(slot);
+                    for (const gtsam::Key key : factor->keys()) {
+                      const gtsam::Symbol sym(key);
+                      const bool is_local_state_key =
+                          sym.chr() == kPoseSymbolChar ||
+                          sym.chr() == kVelocitySymbolChar ||
+                          sym.chr() == kImuBiasSymbolChar;
+                      if (!is_local_state_key) {
+                        continue;
+                      }
+                      candidate_slots_by_local_key[key].push_back(slot);
+                    }
+                  }
+
+                  std::unordered_set<size_t> visited_slots;
+                  visited_slots.reserve(direct_local_apply_ordered_slots.size());
+                  for (const size_t seed_slot : direct_local_apply_ordered_slots) {
+                    if (visited_slots.count(seed_slot) > 0u) {
+                      continue;
+                    }
+                    gtsam::FactorIndices component_batch;
+                    std::queue<size_t> slot_queue;
+                    slot_queue.push(seed_slot);
+                    visited_slots.insert(seed_slot);
+                    while (!slot_queue.empty()) {
+                      const size_t current_slot = slot_queue.front();
+                      slot_queue.pop();
+                      component_batch.push_back(current_slot);
+                      if (!direct_local_apply_graph.exists(current_slot) ||
+                          !direct_local_apply_graph.at(current_slot)) {
+                        continue;
+                      }
+                      const auto factor = direct_local_apply_graph.at(current_slot);
+                      for (const gtsam::Key key : factor->keys()) {
+                        const gtsam::Symbol sym(key);
+                        const bool is_local_state_key =
+                            sym.chr() == kPoseSymbolChar ||
+                            sym.chr() == kVelocitySymbolChar ||
+                            sym.chr() == kImuBiasSymbolChar;
+                        if (!is_local_state_key) {
+                          continue;
+                        }
+                        const auto key_it =
+                            candidate_slots_by_local_key.find(key);
+                        if (key_it == candidate_slots_by_local_key.end()) {
+                          continue;
+                        }
+                        for (const size_t neighbor_slot : key_it->second) {
+                          if (visited_slots.insert(neighbor_slot).second) {
+                            slot_queue.push(neighbor_slot);
+                          }
+                        }
+                      }
+                    }
+                    std::sort(component_batch.begin(), component_batch.end());
+                    direct_local_apply_component_batches.push_back(
+                        std::move(component_batch));
+                  }
+                }
+                bool direct_local_apply_stop_after_first_failure = false;
+                for (size_t direct_local_apply_batch_index = 0u;
+                     direct_local_apply_batch_index <
+                         direct_local_apply_component_batches.size() &&
+                     !direct_local_apply_stop_after_first_failure;
+                     ++direct_local_apply_batch_index) {
+                  const gtsam::FactorIndices& batch_slots =
+                      direct_local_apply_component_batches
+                          [direct_local_apply_batch_index];
+                  const std::string batch_slots_first_few =
+                      sanitize_forensic_token(
+                          format_factor_slots_preview(batch_slots, 16u));
+                  bool batch_apply_attempted = false;
+                  bool batch_apply_succeeded = false;
+                  bool batch_apply_failed = false;
+                  std::string batch_failure_reason = "none";
+                  const gtsam::NonlinearFactorGraph
+                      direct_local_apply_empty_factors;
+                  const gtsam::Values direct_local_apply_empty_values;
+                  cbs::BPSAM::UpdateParams direct_local_apply_params;
+                  direct_local_apply_params.cbs_wrapper_remove_contract_active =
+                      true;
+                  direct_local_apply_params.cbs_strict_wrapper_remove_contract =
+                      FLAGS_cbs_strict_wrapper_remove_contract;
+                  direct_local_apply_params.cbs_log_final_remove_contract_only =
+                      FLAGS_cbs_log_final_remove_contract_only;
+                  direct_local_apply_params.removeFactorIndices = batch_slots;
+                  replay_direct_local_apply_failure_apply_stage_remove_slots_first_few_diag =
+                      batch_slots_first_few;
+                  try {
+                    for (const size_t slot : batch_slots) {
+                      auto metadata_it =
+                          replay_direct_local_apply_candidates_metadata.find(slot);
+                      CbsSummaryCoveredCrossingReplayMetadata metadata;
+                      if (metadata_it !=
+                          replay_direct_local_apply_candidates_metadata.end()) {
+                        metadata = metadata_it->second;
+                      } else {
+                        metadata.slot_id = slot;
+                        const auto& replay_factors_for_metadata =
+                            cbs_optimizer_->getFactorsUnsafe();
+                        if (replay_factors_for_metadata.exists(slot) &&
+                            replay_factors_for_metadata.at(slot)) {
+                          metadata.factor_class =
+                              classify_forensic_remove_factor_class(
+                                  replay_factors_for_metadata.at(slot));
+                          metadata.factor_keys = format_factor_keys_for_slot(
+                              replay_factors_for_metadata, slot);
+                        } else {
+                          metadata.factor_class = "missing_slot";
+                          metadata.factor_keys = "none";
+                        }
+                      }
+                      if (metadata.slot_id == 0u) {
+                        metadata.slot_id = slot;
+                      }
+                      std::string replay_identity;
+                      const bool terminal_applied =
+                          is_replay_identity_terminal_applied_consumed(
+                              metadata, &replay_identity);
+                      const bool terminal_unresolved_too_old =
+                          is_replay_identity_terminal_unresolved_too_old(
+                              metadata, &replay_identity);
+                      if (terminal_applied || terminal_unresolved_too_old) {
+                        ++replay_blocked_reenqueue_same_epoch_count_diag;
+                        batch_failure_reason =
+                            terminal_applied
+                                ? "identity_already_terminal_applied_consumed"
+                                : "identity_terminal_unresolved_too_old";
+                        batch_apply_failed = true;
+                        direct_local_apply_stop_after_first_failure = true;
+                        break;
+                      }
+                      if (is_direct_local_identity_hard_quarantined(
+                              metadata, &replay_identity)) {
+                        ++replay_direct_local_skipped_due_to_hard_quarantine_count_diag;
+                        replay_direct_local_skipped_due_to_hard_quarantine_slots_diag
+                            .push_back(slot);
+                        batch_failure_reason =
+                            "identity_terminal_hard_quarantine";
+                        batch_apply_failed = true;
+                        direct_local_apply_stop_after_first_failure = true;
+                        break;
+                      }
+                    }
+                    if (batch_apply_failed) {
+                      throw std::runtime_error(batch_failure_reason);
+                    }
+                    batch_apply_attempted = true;
+                    ++replay_direct_local_apply_attempted_count_diag;
+                    gtsam::ISAM2Result direct_local_apply_result;
+                    gtsam::FactorIndices direct_local_effective_remove_slots;
+                    bool direct_local_retry_attempted = false;
+                    bool direct_local_retry_succeeded = false;
+                    run_update_stage_with_retry(
+                        "stage_a_direct_local_replay_post_stage_b_apply",
+                        direct_local_apply_empty_factors,
+                        direct_local_apply_empty_values,
+                        direct_local_apply_params,
+                        &direct_local_apply_result,
+                        &direct_local_effective_remove_slots,
+                        &direct_local_retry_attempted,
+                        &direct_local_retry_succeeded);
+                    post_stage_direct_local_apply_result =
+                        direct_local_apply_result;
+                    post_stage_direct_local_effective_remove_slots.insert(
+                        post_stage_direct_local_effective_remove_slots.end(),
+                        direct_local_effective_remove_slots.begin(),
+                        direct_local_effective_remove_slots.end());
+                    const std::unordered_set<size_t> effective_remove_set(
+                        direct_local_effective_remove_slots.begin(),
+                        direct_local_effective_remove_slots.end());
+                    for (const size_t slot : batch_slots) {
+                      if (effective_remove_set.count(slot) == 0u) {
+                        continue;
+                      }
+                      auto metadata_it =
+                          replay_direct_local_apply_candidates_metadata.find(slot);
+                      CbsSummaryCoveredCrossingReplayMetadata metadata;
+                      if (metadata_it !=
+                          replay_direct_local_apply_candidates_metadata.end()) {
+                        metadata = metadata_it->second;
+                      } else {
+                        metadata.slot_id = slot;
+                      }
+                      if (metadata.slot_id == 0u) {
+                        metadata.slot_id = slot;
+                      }
+                      const bool already_consumed =
+                          is_replay_identity_consumed_this_epoch(metadata);
+                      consume_replay_identity_from_all_stores(slot, metadata);
+                      if (!already_consumed) {
+                        replay_direct_local_applied_and_consumed_this_epoch_diag
+                            .push_back(slot);
+                      }
+                    }
+                    if (direct_local_effective_remove_slots.empty()) {
+                      batch_apply_failed = true;
+                      batch_failure_reason =
+                          "post_stage_b_apply_no_effective_remove";
+                      replay_direct_local_apply_failed_count_diag +=
+                          batch_slots.size();
+                      replay_direct_local_failed_apply_candidate_count_diag +=
+                          batch_slots.size();
+                      replay_direct_local_requeue_reason_diag =
+                          "post_stage_b_apply_no_effective_remove";
+                      replay_direct_local_requeue_mode_diag =
+                          "fail_closed_requeue_after_empty_effective_remove";
+                      for (const size_t slot : batch_slots) {
+                        auto metadata_it =
+                            replay_direct_local_apply_candidates_metadata.find(
+                                slot);
+                        CbsSummaryCoveredCrossingReplayMetadata metadata;
+                        if (metadata_it !=
+                            replay_direct_local_apply_candidates_metadata.end()) {
+                          metadata = metadata_it->second;
+                        } else {
+                          metadata.slot_id = slot;
+                        }
+                        metadata.pending_reason =
+                            "post_stage_b_apply_no_effective_remove";
+                        metadata.replay_path = "direct_local_pending";
+                        upsert_direct_local_pending_metadata_after_stage(
+                            metadata);
+                      }
+                      replay_direct_local_apply_requeue_diag_triggered = true;
+                      replay_direct_local_requeued_after_failed_apply_count_diag +=
+                          batch_slots.size();
+                      replay_direct_local_apply_failure_audit_triggered_diag =
+                          true;
+                      replay_direct_local_apply_failure_stage_diag =
+                          "stage_a_direct_local_replay_post_stage_b_apply";
+                      replay_direct_local_apply_failure_reason_diag =
+                          "post_stage_b_apply_no_effective_remove";
+                      replay_direct_local_apply_stage_first_failure_reason_diag =
+                          "post_stage_b_apply_no_effective_remove";
+                      direct_local_apply_stop_after_first_failure = true;
+                    } else {
+                      replay_direct_local_apply_succeeded_count_diag +=
+                          direct_local_effective_remove_slots.size();
+                      batch_apply_succeeded = true;
+                    }
+                  } catch (const std::exception& direct_local_apply_error) {
+                    if (!batch_apply_failed) {
+                      ++replay_direct_local_apply_attempted_count_diag;
+                    }
+                    batch_apply_failed = true;
+                    const std::string direct_local_apply_error_message =
+                        direct_local_apply_error.what()
+                            ? std::string(direct_local_apply_error.what())
+                            : std::string("unknown");
+                    const bool direct_local_apply_map_at_failure =
+                        direct_local_apply_error_message.find("map::at") !=
+                        std::string::npos;
+                    batch_failure_reason = sanitize_forensic_token(
+                        direct_local_apply_error_message);
+                    replay_direct_local_apply_failed_count_diag +=
+                        batch_slots.size();
+                    replay_direct_local_failed_apply_candidate_count_diag +=
+                        batch_slots.size();
+                    replay_direct_local_apply_failure_audit_triggered_diag = true;
+                    replay_direct_local_apply_failure_stage_diag =
+                        "stage_a_direct_local_replay_post_stage_b_apply";
+                    replay_direct_local_apply_failure_reason_diag =
+                        batch_failure_reason;
+                    replay_direct_local_apply_stage_first_failure_reason_diag =
+                        batch_failure_reason;
+                    replay_direct_local_apply_requeue_diag_triggered = true;
+                    replay_direct_local_requeue_reason_diag =
+                        direct_local_apply_map_at_failure
+                            ? "direct_local_apply_live_map_at_incompatible_slot"
+                            : "direct_local_apply_failed_post_stage_b";
+                    replay_direct_local_requeue_mode_diag =
+                        direct_local_apply_map_at_failure
+                            ? "fail_closed_requeue_failed_batch_only_hard_quarantine_identity"
+                            : "fail_closed_requeue_failed_batch_only";
+                    for (const size_t slot : batch_slots) {
+                      auto metadata_it =
+                          replay_direct_local_apply_candidates_metadata.find(slot);
+                      CbsSummaryCoveredCrossingReplayMetadata metadata;
+                      if (metadata_it !=
+                          replay_direct_local_apply_candidates_metadata.end()) {
+                        metadata = metadata_it->second;
+                      } else {
+                        metadata.slot_id = slot;
+                      }
+                      if (metadata.slot_id == 0u) {
+                        metadata.slot_id = slot;
+                      }
+                      metadata.defer_epoch = curr_kf_id_;
+                      if (metadata.first_defer_epoch == 0u) {
+                        metadata.first_defer_epoch =
+                            metadata.defer_epoch == 0u ? curr_kf_id_
+                                                       : metadata.defer_epoch;
+                      }
+                      metadata.replay_path = "direct_local_pending";
+                      metadata.pending_reason = direct_local_apply_map_at_failure
+                                                    ? "direct_local_apply_live_map_at_incompatible_slot"
+                                                    : "direct_local_apply_failed_post_stage_b";
+                      normalize_replay_metadata_for_lifecycle_identity(&metadata);
+                      const std::string metadata_identity =
+                          build_replay_lifecycle_identity(metadata);
+                      if (direct_local_apply_map_at_failure) {
+                        cbs_phase2_direct_local_hard_quarantine_identity_store
+                            [metadata_identity] = metadata;
+                        replay_direct_local_hard_quarantine_reason_diag =
+                            "direct_local_apply_live_map_at_incompatible_slot";
+                        if (replay_direct_local_hard_quarantined_slot_diag < 0) {
+                          replay_direct_local_hard_quarantined_slot_diag =
+                              static_cast<long long>(metadata.slot_id);
+                          replay_direct_local_hard_quarantined_slot_class_diag =
+                              sanitize_forensic_token(metadata.factor_class);
+                          replay_direct_local_hard_quarantined_slot_keys_diag =
+                              sanitize_forensic_token(metadata.factor_keys);
+                        }
+                        ++replay_direct_local_hard_quarantined_identity_count_diag;
+                        if (replay_direct_local_hard_quarantined_identity_first_few_diag
+                                .size() < 8u) {
+                          replay_direct_local_hard_quarantined_identity_first_few_diag
+                              .push_back(metadata_identity);
+                        }
+                      }
+                      upsert_direct_local_pending_metadata_after_stage(
+                          metadata);
+                      ++replay_direct_local_requeued_after_failed_apply_count_diag;
+                      if (replay_direct_local_first_requeued_slot_diag < 0) {
+                        replay_direct_local_first_requeued_slot_diag =
+                            static_cast<long long>(metadata.slot_id);
+                        replay_direct_local_first_requeued_slot_class_diag =
+                            sanitize_forensic_token(metadata.factor_class);
+                        replay_direct_local_first_requeued_slot_keys_diag =
+                            sanitize_forensic_token(metadata.factor_keys);
+                      }
+                    }
+                    replay_direct_local_apply_failure_pending_queue_size_after_diag =
+                        cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                            .size();
+                    direct_local_apply_stop_after_first_failure = true;
+                  }
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][StageADirectLocalReplayApplyBatchDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " batch_index=" << direct_local_apply_batch_index
+                      << " batch_size=" << batch_slots.size()
+                      << " batch_slots_first_few="
+                      << batch_slots_first_few
+                      << " batch_apply_attempted="
+                      << (batch_apply_attempted ? 1 : 0)
+                      << " batch_apply_succeeded="
+                      << (batch_apply_succeeded ? 1 : 0)
+                      << " batch_apply_failed="
+                      << (batch_apply_failed ? 1 : 0)
+                      << " batch_failure_reason="
+                      << sanitize_forensic_token(batch_failure_reason)
+                      << " cumulative_applied_count="
+                      << replay_direct_local_apply_succeeded_count_diag
+                      << " cumulative_failed_count="
+                      << replay_direct_local_apply_failed_count_diag
+                      << " batch_mode="
+                      << "post_stage_b_direct_local_remove_component_atomic_batch_stop_on_first_failure"
+                      << std::endl;
+                }
+              } else if (stage_b_completed_successfully &&
+                         cbs_phase2_replay_into_stage_a_mode &&
+                         !stage_b_direct_local_replay_apply_slots.empty()) {
+                replay_direct_local_apply_stage_mode_diag =
+                    "two_stage_update_b_packet_remove_contract";
+                replay_direct_local_apply_candidate_count_diag =
+                    stage_b_direct_local_replay_apply_slots.size();
+                replay_direct_local_apply_stage_slots_first_few_diag =
+                    sanitize_forensic_token(format_factor_slots_preview(
+                        stage_b_direct_local_replay_apply_slots, 16u));
+                const size_t direct_local_pending_queue_size_before_apply_stage =
+                    cbs_phase2_direct_local_pending_one_epoch_replay_queue_.size();
+                const std::unordered_set<size_t> stage_b_effective_remove_set(
+                    update_b_effective_remove_slots.begin(),
+                    update_b_effective_remove_slots.end());
+                for (const size_t slot : stage_b_direct_local_replay_apply_slots) {
+                  auto metadata_it =
+                      replay_direct_local_apply_candidates_metadata.find(slot);
+                  CbsSummaryCoveredCrossingReplayMetadata metadata;
+                  if (metadata_it !=
+                      replay_direct_local_apply_candidates_metadata.end()) {
+                    metadata = metadata_it->second;
+                  } else {
+                    metadata.slot_id = slot;
+                  }
+                  if (metadata.slot_id == 0u) {
+                    metadata.slot_id = slot;
+                  }
+                  ++replay_direct_local_apply_attempted_count_diag;
+                  if (stage_b_effective_remove_set.count(slot) > 0u) {
+                    ++replay_direct_local_apply_succeeded_count_diag;
+                    const bool already_consumed =
+                        is_replay_identity_consumed_this_epoch(metadata);
+                    consume_replay_identity_from_all_stores(slot, metadata);
+                    if (!already_consumed) {
+                      replay_direct_local_applied_and_consumed_this_epoch_diag
+                          .push_back(slot);
+                    }
+                    continue;
+                  }
+
+                  ++replay_direct_local_apply_failed_count_diag;
+                  ++replay_direct_local_failed_apply_candidate_count_diag;
+                  replay_direct_local_apply_failure_audit_triggered_diag = true;
+                  replay_direct_local_apply_failure_stage_diag =
+                      "two_stage_update_b_packet_remove_contract";
+                  replay_direct_local_apply_failure_reason_diag =
+                      "direct_local_stage_b_packet_no_effective_remove";
+                  replay_direct_local_apply_stage_first_failure_reason_diag =
+                      "direct_local_stage_b_packet_no_effective_remove";
+                  replay_direct_local_apply_requeue_diag_triggered = true;
+                  replay_direct_local_requeue_reason_diag =
+                      "direct_local_stage_b_packet_no_effective_remove";
+                  replay_direct_local_requeue_mode_diag =
+                      "fail_closed_requeue_no_effective_remove_after_stage_b_packet_contract";
+                  metadata.defer_epoch = curr_kf_id_;
+                  if (metadata.first_defer_epoch == 0u) {
+                    metadata.first_defer_epoch =
+                        metadata.defer_epoch == 0u ? curr_kf_id_
+                                                   : metadata.defer_epoch;
+                  }
+                  metadata.replay_path = "direct_local_pending";
+                  metadata.pending_reason =
+                      "direct_local_stage_b_packet_no_effective_remove";
+                  cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                      [metadata.slot_id] = metadata;
+                  ++replay_direct_local_requeued_after_failed_apply_count_diag;
+                  if (replay_direct_local_first_requeued_slot_diag < 0) {
+                    replay_direct_local_first_requeued_slot_diag =
+                        static_cast<long long>(metadata.slot_id);
+                    replay_direct_local_first_requeued_slot_class_diag =
+                        sanitize_forensic_token(metadata.factor_class);
+                    replay_direct_local_first_requeued_slot_keys_diag =
+                        sanitize_forensic_token(metadata.factor_keys);
+                  }
+                }
+                if (replay_direct_local_apply_failed_count_diag > 0u) {
+                  replay_direct_local_apply_failure_pending_queue_size_before_diag =
+                      direct_local_pending_queue_size_before_apply_stage;
+                  replay_direct_local_apply_failure_pending_queue_size_after_diag =
+                      cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                          .size();
+                }
+              } else if (!stage_b_direct_local_replay_apply_slots.empty() &&
+                         cbs_phase2_replay_into_stage_a_mode) {
+                replay_direct_local_apply_stage_mode_diag =
+                    "stage_b_not_completed_skip_stage_b_packet_direct_local_apply";
+                replay_direct_local_apply_stage_first_failure_reason_diag =
+                    "stage_b_not_completed";
+                replay_direct_local_apply_contract_diag =
+                    "stage_b_packet_remove_with_new_vio_update";
+                replay_direct_local_contract_mode_diag =
+                    "stage_b_packet_contract_blocked_by_stage_b_failure";
+              }
+              replay_direct_local_terminal_applied_consumed_count_diag =
+                  cbs_phase2_direct_local_applied_consumed_terminal_identity_store
+                      .size();
+              replay_direct_local_terminal_hard_quarantine_count_diag =
+                  cbs_phase2_direct_local_hard_quarantine_identity_store.size();
+              replay_direct_local_terminal_unresolved_too_old_count_diag =
+                  cbs_phase2_direct_local_unresolved_too_old_terminal_identity_store
+                      .size();
+              if (cbs_phase2_replay_into_stage_a_mode &&
+                  (replay_direct_local_removable_classified_count_diag > 0u ||
+                   replay_direct_local_apply_attempted_count_diag > 0u ||
+                   replay_direct_local_terminal_applied_consumed_count_diag > 0u ||
+                   replay_direct_local_terminal_hard_quarantine_count_diag > 0u ||
+                   replay_direct_local_terminal_unresolved_too_old_count_diag >
+                       0u)) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageADirectLocalReplayContractDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " direct_local_removable_classified_count="
+                          << replay_direct_local_removable_classified_count_diag
+                          << " direct_local_apply_contract="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_apply_contract_diag)
+                          << " direct_local_apply_attempted_count="
+                          << replay_direct_local_apply_attempted_count_diag
+                          << " direct_local_apply_succeeded_count="
+                          << replay_direct_local_apply_succeeded_count_diag
+                          << " direct_local_apply_failed_count="
+                          << replay_direct_local_apply_failed_count_diag
+                          << " terminal_applied_consumed_count="
+                          << replay_direct_local_terminal_applied_consumed_count_diag
+                          << " terminal_hard_quarantine_count="
+                          << replay_direct_local_terminal_hard_quarantine_count_diag
+                          << " terminal_unresolved_too_old_count="
+                          << replay_direct_local_terminal_unresolved_too_old_count_diag
+                          << " first_failure_reason="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_apply_stage_first_failure_reason_diag)
+                          << " contract_mode="
+                          << sanitize_forensic_token(
+                                 replay_direct_local_contract_mode_diag)
+                          << std::endl;
+              }
+
+              cbs_result = post_stage_direct_local_apply_result.has_value()
+                               ? *post_stage_direct_local_apply_result
+                               : update_b_result;
+              invalid_slot_retry_attempted =
+                  update_a_retry_attempted || update_b_retry_attempted;
+              invalid_slot_retry_succeeded =
+                  update_a_retry_succeeded || update_b_retry_succeeded;
+
+              std::unordered_set<size_t> remove_union(
+                  update_a_effective_remove_slots.begin(),
+                  update_a_effective_remove_slots.end());
+              remove_union.insert(update_b_effective_remove_slots.begin(),
+                                  update_b_effective_remove_slots.end());
+              remove_union.insert(post_stage_direct_local_effective_remove_slots.begin(),
+                                  post_stage_direct_local_effective_remove_slots.end());
+              forensic_remove_slots_this_attempt.assign(remove_union.begin(),
+                                                        remove_union.end());
+              std::sort(forensic_remove_slots_this_attempt.begin(),
+                        forensic_remove_slots_this_attempt.end());
+              removed_factor_indices_applied =
+                  forensic_remove_slots_this_attempt.size();
+            } else {
+              cbs_phase2_two_stage_effective = false;
+              if (defer_summary_crossing_one_epoch_requested &&
+                  enable_remove_factor_indices &&
+                  cbs_use_phase2_summary_prior_bridge &&
+                  one_epoch_replay_state_nonempty) {
+                cbs_phase2_single_packet_update_inconsistent_under_replay_mode =
+                    true;
+                LOG(ERROR)
+                    << "CBS phase2 invariant violation: entered "
+                       "single_packet_update while one-epoch replay state was "
+                       "active. curr_kf_id="
+                    << curr_kf_id_;
+              }
+              gtsam::FactorIndices single_effective_remove_slots;
+              remove_update_attempted_this_attempt =
+                  !cbs_first_update_params.removeFactorIndices.empty();
+              if (enable_remove_factor_indices &&
+                  remove_update_attempted_this_attempt) {
+                lag_boundary_remove_update_attempted = true;
+              }
+              run_update_stage_with_retry("single_packet_update",
+                                          cbs_update_factors,
+                                          new_values,
+                                          cbs_first_update_params,
+                                          &cbs_result,
+                                          &single_effective_remove_slots,
+                                          &invalid_slot_retry_attempted,
+                                          &invalid_slot_retry_succeeded);
+              std::unordered_set<size_t> remove_union(
+                  single_effective_remove_slots.begin(),
+                  single_effective_remove_slots.end());
+              forensic_remove_slots_this_attempt.assign(remove_union.begin(),
+                                                        remove_union.end());
+              std::sort(forensic_remove_slots_this_attempt.begin(),
+                        forensic_remove_slots_this_attempt.end());
+              removed_factor_indices_applied = single_effective_remove_slots.size();
+              removed_factor_indices_applied =
+                  forensic_remove_slots_this_attempt.size();
+            }
+
+            if (enable_remove_factor_indices &&
+                !forensic_remove_slots_this_attempt.empty()) {
+              lag_boundary_remove_update_succeeded = true;
+            }
+
+            cbs_remove_curr_epoch_size = removed_factor_indices_applied;
+            cbs_remove_indices_applied = removed_factor_indices_applied;
+            cbs_prev_epoch_remove_factor_indices_.clear();
+            cbs_prev_epoch_remove_factor_indices_.insert(
+                forensic_remove_slots_this_attempt.begin(),
+                forensic_remove_slots_this_attempt.end());
 
             const bool remove_update_succeeded_before_prune_commit =
                 enable_remove_factor_indices &&
@@ -14502,21 +24981,16 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             if (cbs_use_phase2_summary_prior_bridge && cbs_phase2_heart_) {
               cbs_phase2_pending_prune_exists =
                   cbs_phase2_heart_->hasPendingPrunePlan();
-              if (cbs_phase2_pending_prune_exists &&
-                  remove_update_succeeded_before_prune_commit) {
+              heart_prune_plan_exists = cbs_phase2_pending_prune_exists;
+              if (remove_update_succeeded_before_prune_commit) {
                 cbs_phase2_remove_update_succeeded_before_prune_commit = true;
-                const bool committed = cbs_phase2_heart_->commitPendingPrunePlan();
-                cbs_phase2_prune_committed_this_epoch =
-                    cbs_phase2_prune_committed_this_epoch || committed;
-                cbs_phase2_pending_prune_exists =
-                    cbs_phase2_heart_->hasPendingPrunePlan();
-                cbs_phase2_prune_commit_reason =
-                    committed ? "primary_remove_update_succeeded"
-                              : "pending_prune_commit_failed";
-              } else if (cbs_phase2_pending_prune_exists) {
+              }
+              if (cbs_phase2_pending_prune_exists) {
                 if (cbs_phase2_prune_commit_reason == "none") {
                   cbs_phase2_prune_commit_reason =
-                      "pending_prune_waiting_for_remove_update";
+                      remove_update_succeeded_before_prune_commit
+                          ? "pending_prune_waiting_for_atomic_commit"
+                          : "pending_prune_waiting_for_remove_update";
                 }
               }
             }
@@ -14572,9 +25046,124 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             }
             const ActiveStateCounts active_post = count_active_state_keys();
             const size_t cbs_new_factors_total = cbs_update_factors.size();
-            std::cerr
-                << std::setprecision(12)
-                << "[CBS][HeartEpochDiag] curr_kf_id=" << curr_kf_id_
+            const FrameId oldest_active_frame_id_before =
+                lag_window_state.prev_oldest_active_frame_id;
+            const FrameId oldest_active_frame_id_after =
+                lag_window_state.oldest_active_frame_id;
+            const bool active_window_advanced =
+                oldest_active_frame_id_after > oldest_active_frame_id_before;
+            const bool has_real_lag_transaction =
+                heart_lag_requested_slot_count > 0u ||
+                heart_approved_total_wrapper_remove_slots_count > 0u;
+            const bool emit_heart_first_real_lag_compact_diag =
+                has_real_lag_transaction &&
+                !cbs_heart_first_real_lag_compact_diag_emitted_;
+	            if (emit_heart_first_real_lag_compact_diag) {
+	              std::cerr << std::setprecision(12)
+	                        << "[CBS][HeartFirstRealLagCompactDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " lag_requested_slot_count="
+                        << heart_lag_requested_slot_count
+                        << " lag_requested_slot_ids="
+                        << sanitize_forensic_token(heart_lag_requested_slot_ids)
+                        << " lag_requested_factor_classes="
+                        << heart_lag_requested_factor_classes
+                        << " lag_requested_factor_keys="
+                        << heart_lag_requested_factor_keys
+                        << " approved_direct_local_internal_count="
+                        << heart_approved_direct_local_internal_count
+                        << " approved_summary_covered_crossing_count="
+                        << heart_approved_summary_covered_crossing_count
+                        << " approved_deferred_unsupported_count="
+                        << heart_approved_deferred_unsupported_count
+                        << " approved_total_wrapper_remove_slots_count="
+                        << heart_approved_total_wrapper_remove_slots_count
+                        << " approved_total_wrapper_remove_slots_ids="
+                        << sanitize_forensic_token(
+                               heart_approved_total_wrapper_remove_slots_ids)
+                        << " first_applied_remove_slot="
+                        << cbs_update_packet_forensics.first_applied_remove_slot
+                        << " first_applied_remove_slot_class="
+                        << sanitize_forensic_token(cbs_update_packet_forensics
+                                                       .first_applied_remove_slot_factor_class)
+                        << " first_applied_remove_slot_keys="
+                        << sanitize_forensic_token(cbs_update_packet_forensics
+                                                       .first_applied_remove_slot_factor_keys)
+                        << " first_deferred_remove_slot="
+                        << heart_first_deferred_remove_slot
+                        << " first_deferred_remove_slot_class="
+                        << sanitize_forensic_token(heart_first_deferred_remove_slot_class)
+                        << " first_deferred_remove_slot_keys="
+                        << sanitize_forensic_token(heart_first_deferred_remove_slot_keys)
+                        << " prune_plan_exists=" << (heart_prune_plan_exists ? 1 : 0)
+                        << " prune_plan_commit_attempted="
+                        << (heart_prune_plan_commit_attempted ? 1 : 0)
+                        << " prune_plan_commit_succeeded="
+                        << (heart_prune_plan_commit_succeeded ? 1 : 0)
+                        << " prune_plan_consumed="
+                        << (heart_prune_plan_consumed ? 1 : 0)
+                        << " prune_plan_remove_count="
+                        << heart_prune_plan_remove_count
+                        << " prune_plan_oldest_active_frame_before="
+                        << heart_prune_plan_oldest_active_frame_before
+                        << " prune_plan_oldest_active_frame_after="
+                        << heart_prune_plan_oldest_active_frame_after
+                        << " prune_plan_newest_frame_id="
+                        << heart_prune_plan_newest_frame_id
+                        << " prune_plan_boundary_changed="
+                        << (heart_prune_plan_boundary_changed ? 1 : 0)
+                        << " prune_plan_window_advanced="
+                        << (heart_prune_plan_window_advanced ? 1 : 0)
+                        << " oldest_active_frame_id_before="
+                        << oldest_active_frame_id_before
+                        << " oldest_active_frame_id_after="
+                        << oldest_active_frame_id_after
+                        << " newest_active_frame_id="
+                        << lag_window_state.newest_frame_id
+                        << " active_window_advanced="
+                        << (active_window_advanced ? 1 : 0)
+                        << " timestamp_map_pruned_count="
+                        << cbs_timestamp_map_pruned_count_last_epoch_
+                        << " oldest_active_pose_timestamp="
+                        << cbs_oldest_active_pose_timestamp_last_epoch_
+                        << " newest_active_pose_timestamp="
+                        << cbs_newest_active_pose_timestamp_last_epoch_
+                        << " map_at_count_so_far=" << cbs_map_at_count_so_far_
+                        << " bpsam_ilsretry_count_so_far="
+                        << cbs_bpsam_ilsretry_count_so_far_
+                        << " recovery_count_so_far="
+                        << cbs_recovery_count_so_far_
+                        << " first_bad_epoch_seen="
+                        << (cbs_first_bad_epoch_seen_ ? 1 : 0)
+                        << " crash_imminent_marker="
+                        << (cbs_crash_imminent_marker_epoch ? 1 : 0)
+                        << std::endl;
+	              cbs_heart_first_real_lag_compact_diag_emitted_ = true;
+	            }
+            const bool emit_direct_local_internal_defer_diag =
+                cbs_phase2_lag_remove_slots_requested_raw > 0u;
+            if (emit_direct_local_internal_defer_diag) {
+              std::cerr
+                  << std::setprecision(12)
+                  << "[CBS][DirectLocalInternalDeferDiag]"
+                  << " curr_kf_id=" << curr_kf_id_
+                  << " cbs_diag_defer_direct_local_internal_only="
+                  << (cbs_phase2_diag_defer_direct_local_internal_only ? 1 : 0)
+                  << " applied_direct_local_internal_count="
+                  << cbs_phase2_lag_remove_slots_applied_direct_local_internal
+                  << " deferred_direct_local_internal_count="
+                  << cbs_phase2_direct_local_internal_forced_deferred_count
+                  << " applied_summary_covered_crossing_count="
+                  << cbs_phase2_lag_remove_slots_applied_summary_covered_crossing
+                  << " real_applied_lag_slots_count="
+                  << cbs_phase2_real_applied_lag_slots_count
+                  << " cbs_phase2_primary_update_mode="
+                  << sanitize_forensic_token(cbs_phase2_primary_update_mode)
+                  << std::endl;
+            }
+	            std::cerr
+	                << std::setprecision(12)
+	                << "[CBS][HeartEpochDiag] curr_kf_id=" << curr_kf_id_
                 << " remove_factor_indices_applied="
                 << removed_factor_indices_applied
                 << " remove_factor_indices_requested="
@@ -14621,12 +25210,223 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << cbs_phase2_wrapper_remove_total_count
                 << " cbs_phase2_wrapper_remove_source_coherence_ok="
                 << (cbs_phase2_wrapper_remove_source_coherence_ok ? 1 : 0)
+                << " cbs_phase2_remove_touches_new_factor_key="
+                << (cbs_phase2_remove_touches_new_factor_key ? 1 : 0)
+                << " cbs_phase2_remove_touches_new_value_key="
+                << (cbs_phase2_remove_touches_new_value_key ? 1 : 0)
+                << " cbs_phase2_remove_touches_summary_key="
+                << (cbs_phase2_remove_touches_summary_key ? 1 : 0)
+                << " cbs_phase2_overlap_guard_triggered="
+                << (cbs_phase2_overlap_guard_triggered ? 1 : 0)
+                << " cbs_phase2_overlap_guard_reason="
+                << sanitize_forensic_token(cbs_phase2_overlap_guard_reason)
+                << " cbs_phase2_overlap_guard_post_split_semantics="
+                << (cbs_phase2_overlap_guard_post_split_semantics ? 1 : 0)
+                << " cbs_phase2_overlap_guard_summary_key_only_allowed_for_covered_crossing="
+                << (cbs_phase2_overlap_guard_summary_key_only_allowed_for_covered_crossing
+                        ? 1
+                        : 0)
+                << " cbs_phase2_primary_update_mode="
+                << sanitize_forensic_token(cbs_phase2_primary_update_mode)
+                << " cbs_phase2_two_stage_summary_crossing_mode="
+                << (cbs_phase2_two_stage_summary_crossing_mode ? 1 : 0)
+                << " cbs_phase2_one_epoch_replay_mode_forced_two_stage="
+                << (cbs_phase2_one_epoch_replay_mode_forced_two_stage ? 1 : 0)
+                << " cbs_phase2_single_packet_update_inconsistent_under_replay_mode="
+                << (cbs_phase2_single_packet_update_inconsistent_under_replay_mode
+                        ? 1
+                        : 0)
+                << " cbs_phase2_two_stage_requested="
+                << (cbs_phase2_two_stage_requested ? 1 : 0)
+                << " cbs_phase2_two_stage_effective="
+                << (cbs_phase2_two_stage_effective ? 1 : 0)
+                << " cbs_phase2_replay_queue_size="
+                << cbs_phase2_replay_queue_size
+                << " cbs_phase2_replay_into_stage_a_count="
+                << cbs_phase2_replay_into_stage_a_count
+                << " cbs_phase2_two_stage_update_a_executed="
+                << (cbs_phase2_two_stage_update_a_executed ? 1 : 0)
+                << " cbs_phase2_two_stage_update_b_executed="
+                << (cbs_phase2_two_stage_update_b_executed ? 1 : 0)
+                << " cbs_phase2_two_stage_update_a_remove_count="
+                << cbs_phase2_two_stage_update_a_remove_count
+                << " cbs_phase2_two_stage_update_a_summary_factor_count="
+                << cbs_phase2_two_stage_update_a_summary_factor_count
+                << " cbs_phase2_two_stage_update_b_new_factor_count="
+                << cbs_phase2_two_stage_update_b_new_factor_count
+                << " cbs_phase2_two_stage_update_b_new_value_count="
+                << cbs_phase2_two_stage_update_b_new_value_count
+                << " cbs_phase2_stage_a_summary_only_mode="
+                << (cbs_phase2_stage_a_summary_only_mode ? 1 : 0)
+                << " cbs_phase2_replay_into_stage_a_mode="
+                << (cbs_phase2_replay_into_stage_a_mode ? 1 : 0)
+                << " cbs_phase2_replayed_summary_crossing_count="
+                << cbs_phase2_replayed_summary_crossing_count
+                << " cbs_phase2_stage_a_remove_count="
+                << cbs_phase2_stage_a_remove_count
+                << " cbs_phase2_stage_a_summary_factor_count="
+                << cbs_phase2_stage_a_summary_factor_count
+                << " cbs_phase2_stage_a_summary_crossing_remove_count="
+                << cbs_phase2_stage_a_summary_crossing_remove_count
+                << " cbs_phase2_stage_a_summary_crossing_remove_deferred_count="
+                << cbs_phase2_stage_a_summary_crossing_remove_deferred_count
+                << " cbs_phase2_stage_a_replay_skipped_due_to_failure="
+                << (cbs_phase2_stage_a_replay_skipped_due_to_failure ? 1 : 0)
+                << " cbs_phase2_two_stage_first_bad_epoch_stage="
+                << sanitize_forensic_token(
+                       cbs_phase2_two_stage_first_bad_epoch_stage)
+                << " cbs_phase2_stage_b_defer_delete_slots_mode="
+                << (cbs_phase2_stage_b_defer_delete_slots_mode ? 1 : 0)
+                << " cbs_phase2_stage_b_filter_invalid_smart_factors_mode="
+                << (cbs_phase2_stage_b_filter_invalid_smart_factors_mode ? 1 : 0)
+                << " cbs_phase2_stage_b_skip_smart_updates_one_epoch_mode="
+                << (cbs_phase2_stage_b_skip_smart_updates_one_epoch_mode ? 1 : 0)
+                << " cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective="
+                << (cbs_phase2_stage_b_skip_smart_updates_one_epoch_effective
+                        ? 1
+                        : 0)
+                << " cbs_phase2_stage_b_delete_slots_raw_count="
+                << cbs_phase2_stage_b_delete_slots_raw_count
+                << " cbs_phase2_stage_b_delete_slots_applied_count="
+                << cbs_phase2_stage_b_delete_slots_applied_count
+                << " cbs_phase2_stage_b_delete_slots_deferred_count="
+                << cbs_phase2_stage_b_delete_slots_deferred_count
+                << " cbs_phase2_stage_b_smart_factor_raw_count="
+                << cbs_phase2_stage_b_smart_factor_raw_count
+                << " cbs_phase2_stage_b_smart_factor_kept_count="
+                << cbs_phase2_stage_b_smart_factor_kept_count
+                << " cbs_phase2_stage_b_smart_factor_dropped_count="
+                << cbs_phase2_stage_b_smart_factor_dropped_count
+                << " cbs_phase2_stage_b_smart_factor_skipped_count="
+                << cbs_phase2_stage_b_smart_factor_skipped_count
+                << " cbs_phase2_stage_b_smart_factor_reused_count="
+                << cbs_phase2_stage_b_smart_factor_reused_count
+                << " cbs_phase2_stage_b_map_at_thrown="
+                << (cbs_phase2_stage_b_map_at_thrown ? 1 : 0)
+                << " cbs_phase2_stage_b_first_dropped_smart_factor_keys="
+                << sanitize_forensic_token(
+                       cbs_phase2_stage_b_first_dropped_smart_factor_keys)
+                << " cbs_phase2_stage_b_first_dropped_smart_factor_reason="
+                << sanitize_forensic_token(
+                       cbs_phase2_stage_b_first_dropped_smart_factor_reason)
+                << " cbs_phase2_stage_b_first_bad_epoch_stage="
+                << sanitize_forensic_token(
+                       cbs_phase2_stage_b_first_bad_epoch_stage)
+                << " cbs_phase2_deferred_due_to_overlap_count="
+                << cbs_phase2_deferred_due_to_overlap_count
+                << " cbs_phase2_overlap_guard_deferred_direct_local_internal_count="
+                << cbs_phase2_overlap_guard_deferred_direct_local_internal_count
+                << " cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count="
+                << cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count
+                << " cbs_phase2_overlap_guard_summary_key_only_crossing_count="
+                << cbs_phase2_overlap_guard_summary_key_only_crossing_count
+                << " cbs_phase2_overlap_guard_new_factor_or_value_crossing_count="
+                << cbs_phase2_overlap_guard_new_factor_or_value_crossing_count
+                << " cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent="
+                << (cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent
+                        ? 1
+                        : 0)
+                << " cbs_phase2_diag_defer_direct_local_internal_only="
+                << (cbs_phase2_diag_defer_direct_local_internal_only ? 1 : 0)
+                << " cbs_phase2_direct_local_internal_forced_deferred_count="
+                << cbs_phase2_direct_local_internal_forced_deferred_count
+                << " cbs_phase2_summary_covered_crossing_kept_active_count="
+                << cbs_phase2_summary_covered_crossing_kept_active_count
+                << " cbs_phase2_diag_exclude_summary_covered_crossing_classes="
+                << cbs_phase2_diag_exclude_summary_covered_crossing_classes
+                << " cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes="
+                << cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes
+                << " cbs_phase2_summary_covered_crossing_one_epoch_deferred_count="
+                << cbs_phase2_summary_covered_crossing_one_epoch_deferred_count
+                << " cbs_phase2_summary_covered_crossing_one_epoch_deferred_first_few="
+                << cbs_phase2_summary_covered_crossing_one_epoch_deferred_first_few
+                << " cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count="
+                << cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count
+                << " cbs_phase2_summary_covered_crossing_one_epoch_reapplied_first_few="
+                << cbs_phase2_summary_covered_crossing_one_epoch_reapplied_first_few
+                << " cbs_phase2_defer_summary_covered_crossing_one_epoch_mode="
+                << (cbs_phase2_defer_summary_covered_crossing_one_epoch_mode ? 1
+                                                                               : 0)
+                << " cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count="
+                << cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count
+                << " cbs_phase2_summary_covered_crossing_replayed_count="
+                << cbs_phase2_summary_covered_crossing_replayed_count
+                << " cbs_phase2_summary_covered_crossing_replay_epoch="
+                << cbs_phase2_summary_covered_crossing_replay_epoch
+                << " cbs_phase2_summary_covered_crossing_replay_stage="
+                << sanitize_forensic_token(
+                       cbs_phase2_summary_covered_crossing_replay_stage)
+                << " cbs_phase2_summary_crossing_replay_requested_count="
+                << cbs_phase2_summary_crossing_replay_requested_count
+                << " cbs_phase2_summary_crossing_replay_valid_count="
+                << cbs_phase2_summary_crossing_replay_valid_count
+                << " cbs_phase2_summary_crossing_replay_invalid_count="
+                << cbs_phase2_summary_crossing_replay_invalid_count
+                << " cbs_phase2_summary_crossing_replay_skipped_due_to_no_valid_slots="
+                << (cbs_phase2_summary_crossing_replay_skipped_due_to_no_valid_slots
+                        ? 1
+                        : 0)
+                << " cbs_phase2_summary_crossing_replay_first_invalid_slot="
+                << cbs_phase2_summary_crossing_replay_first_invalid_slot
+                << " cbs_phase2_summary_crossing_replay_first_invalid_slot_class="
+                << cbs_phase2_summary_crossing_replay_first_invalid_slot_class
+                << " cbs_phase2_summary_crossing_replay_first_invalid_slot_keys="
+                << cbs_phase2_summary_crossing_replay_first_invalid_slot_keys
+                << " cbs_phase2_summary_crossing_replay_first_invalid_reason="
+                << cbs_phase2_summary_crossing_replay_first_invalid_reason
+                << " cbs_phase2_summary_crossing_replay_stage_executed="
+                << (cbs_phase2_summary_crossing_replay_stage_executed ? 1 : 0)
+                << " cbs_phase2_summary_crossing_replay_first_replayed_slot="
+                << cbs_phase2_summary_crossing_replay_first_replayed_slot
+                << " cbs_phase2_summary_crossing_replay_first_replayed_slot_class="
+                << cbs_phase2_summary_crossing_replay_first_replayed_slot_class
+                << " cbs_phase2_summary_crossing_replay_first_replayed_slot_keys="
+                << cbs_phase2_summary_crossing_replay_first_replayed_slot_keys
+                << " cbs_phase2_summary_covered_crossing_factor_type_counts_raw="
+                << cbs_phase2_summary_covered_crossing_factor_type_counts_raw
+                << " cbs_phase2_summary_covered_crossing_factor_type_counts_applied="
+                << cbs_phase2_summary_covered_crossing_factor_type_counts_applied
+                << " cbs_phase2_summary_covered_crossing_factor_type_counts_deferred="
+                << cbs_phase2_summary_covered_crossing_factor_type_counts_deferred
+                << " cbs_phase2_first_applied_summary_covered_crossing_slot_class="
+                << cbs_phase2_first_applied_summary_covered_crossing_slot_class
+                << " cbs_phase2_first_applied_summary_covered_crossing_slot_keys="
+                << cbs_phase2_first_applied_summary_covered_crossing_slot_keys
+                << " cbs_phase2_first_deferred_summary_covered_crossing_slot_class="
+                << cbs_phase2_first_deferred_summary_covered_crossing_slot_class
+                << " cbs_phase2_first_deferred_summary_covered_crossing_slot_keys="
+                << cbs_phase2_first_deferred_summary_covered_crossing_slot_keys
+                << " cbs_phase2_first_bad_epoch_apply_class_mix="
+                << cbs_phase2_first_bad_epoch_apply_class_mix
+                << " cbs_phase2_first_bad_epoch_real_applied_direct_local_internal_count="
+                << cbs_phase2_first_bad_epoch_real_applied_direct_local_internal_count
+                << " cbs_phase2_first_bad_epoch_real_applied_summary_covered_crossing_count="
+                << cbs_phase2_first_bad_epoch_real_applied_summary_covered_crossing_count
+                << " cbs_phase2_first_bad_epoch_one_epoch_defer_mode="
+                << cbs_phase2_first_bad_epoch_one_epoch_defer_mode
+                << " cbs_phase2_deferred_due_to_overlap_slots_first_few="
+                << cbs_phase2_deferred_due_to_overlap_slots_first_few
+                << " cbs_phase2_overlap_keys_first_few="
+                << cbs_phase2_overlap_keys_first_few
+                << " cbs_phase2_remove_indices_applied_count="
+                << cbs_phase2_remove_indices_applied_count
+                << " cbs_phase2_remove_indices_deferred_count="
+                << cbs_phase2_remove_indices_deferred_count
                 << " cbs_phase2_fresh_lag_anchor_prior_protection_fired="
                 << (cbs_phase2_fresh_lag_anchor_prior_protection_fired ? 1 : 0)
                 << " cbs_phase2_fresh_lag_anchor_prior_blocked_count="
                 << cbs_phase2_fresh_lag_anchor_prior_blocked_count
                 << " cbs_phase2_fresh_lag_anchor_prior_blocked_slots="
                 << cbs_phase2_fresh_lag_anchor_prior_blocked_slots
+                << " cbs_phase2_fresh_lag_structural_prior_protection_fired="
+                << (cbs_phase2_fresh_lag_structural_prior_protection_fired ? 1
+                                                                            : 0)
+                << " cbs_phase2_fresh_lag_structural_prior_blocked_count="
+                << cbs_phase2_fresh_lag_structural_prior_blocked_count
+                << " cbs_phase2_fresh_lag_structural_prior_blocked_slots="
+                << cbs_phase2_fresh_lag_structural_prior_blocked_slots
+                << " cbs_phase2_fresh_lag_structural_prior_blocked_keys="
+                << cbs_phase2_fresh_lag_structural_prior_blocked_keys
                 << " delete_slots_size=" << delete_slots_forensic.size()
                 << " delete_slots_size_raw="
                 << cbs_phase2_delete_slots_size_raw
@@ -14687,6 +25487,32 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << cbs_phase2_summary_dropped_targets
                 << " cbs_phase2_summary_crossing_factor_count="
                 << cbs_phase2_summary_crossing_factor_count
+                << " cbs_phase2_summary_crossing_candidate_slots_count="
+                << cbs_phase2_summary_crossing_candidate_slots_count
+                << " cbs_phase2_summary_crossing_selected_slots_count="
+                << cbs_phase2_summary_crossing_selected_slots_count
+                << " cbs_phase2_summary_crossing_dropped_slots_count="
+                << cbs_phase2_summary_crossing_dropped_slots_count
+                << " cbs_phase2_summary_first_dropped_crossing_slot="
+                << cbs_phase2_summary_first_dropped_crossing_slot
+                << " cbs_phase2_summary_first_dropped_crossing_slot_class="
+                << cbs_phase2_summary_first_dropped_crossing_slot_class
+                << " cbs_phase2_summary_first_dropped_crossing_slot_keys="
+                << cbs_phase2_summary_first_dropped_crossing_slot_keys
+                << " cbs_phase2_summary_first_dropped_crossing_slot_reason="
+                << cbs_phase2_summary_first_dropped_crossing_slot_reason
+                << " cbs_phase2_summary_first_selected_crossing_slot="
+                << cbs_phase2_summary_first_selected_crossing_slot
+                << " cbs_phase2_summary_first_selected_crossing_slot_class="
+                << cbs_phase2_summary_first_selected_crossing_slot_class
+                << " cbs_phase2_summary_first_selected_crossing_slot_keys="
+                << cbs_phase2_summary_first_selected_crossing_slot_keys
+                << " cbs_phase2_summary_first_covered_crossing_slot="
+                << cbs_phase2_summary_first_covered_crossing_slot
+                << " cbs_phase2_summary_first_covered_crossing_slot_class="
+                << cbs_phase2_summary_first_covered_crossing_slot_class
+                << " cbs_phase2_summary_first_covered_crossing_slot_keys="
+                << cbs_phase2_summary_first_covered_crossing_slot_keys
                 << " cbs_phase2_summary_factor_count_emitted="
                 << cbs_phase2_summary_factor_count_emitted
                 << " cbs_phase2_summary_target_coherence_ok="
@@ -14695,6 +25521,22 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << cbs_phase2_summary_build_ms
                 << " cbs_phase2_summary_mode="
                 << cbs_phase2_summary_mode
+                << " cbs_phase2_summary_required_crossing_slots="
+                << cbs_phase2_summary_required_crossing_slots
+                << " cbs_phase2_summary_covered_crossing_slots="
+                << cbs_phase2_summary_covered_crossing_slots
+                << " cbs_phase2_directly_removable_local_internal_slots="
+                << cbs_phase2_directly_removable_local_internal_slots
+                << " cbs_phase2_retained_protected_local_support_slots="
+                << cbs_phase2_retained_protected_local_support_slots
+                << " cbs_phase2_retained_protected_local_support_slots_first_few="
+                << cbs_phase2_retained_protected_local_support_slots_first_few
+                << " cbs_phase2_first_retained_protected_local_support_slot_class="
+                << cbs_phase2_first_retained_protected_local_support_slot_class
+                << " cbs_phase2_first_retained_protected_local_support_slot_keys="
+                << cbs_phase2_first_retained_protected_local_support_slot_keys
+                << " cbs_phase2_unsupported_deferred_lag_slots="
+                << cbs_phase2_unsupported_deferred_lag_slots
                 << " cbs_phase2_expanded_summary_mode="
                 << cbs_phase2_expanded_summary_mode
                 << " cbs_phase2_expanded_summary_requested_target_count="
@@ -14707,6 +25549,19 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << cbs_phase2_expanded_summary_factor_count_emitted
                 << " cbs_phase2_expanded_summary_build_ms="
                 << cbs_phase2_expanded_summary_build_ms
+                << " cbs_phase2_expanded_summary_support_factor_count="
+                << cbs_phase2_expanded_summary_support_factor_count
+                << " cbs_phase2_expanded_summary_support_slots_first_few="
+                << cbs_phase2_expanded_summary_support_slots_first_few
+                << " cbs_phase2_expanded_summary_used_bootstrap_support_priors="
+                << (cbs_phase2_expanded_summary_used_bootstrap_support_priors ? 1
+                                                                               : 0)
+                << " cbs_phase2_expanded_summary_bootstrap_support_keys="
+                << cbs_phase2_expanded_summary_bootstrap_support_keys
+                << " cbs_phase2_expanded_summary_removed_crossing_uses_bootstrap_support="
+                << (cbs_phase2_expanded_summary_removed_crossing_uses_bootstrap_support
+                        ? 1
+                        : 0)
                 << " cbs_phase2_first_expanded_summary_failure_reason="
                 << cbs_phase2_first_expanded_summary_failure_reason
                 << " cbs_phase2_expanded_included_local_nonbelief_factor_count="
@@ -14821,6 +25676,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << (cbs_phase2_lag_plan_cache_changed_this_epoch ? 1 : 0)
                 << " cbs_phase2_incremental_remove_consumed_this_epoch="
                 << (cbs_phase2_incremental_remove_consumed_this_epoch ? 1 : 0)
+                << " cbs_phase2_lag_transaction_consumed_this_epoch="
+                << (cbs_phase2_lag_transaction_consumed_this_epoch ? 1 : 0)
                 << " cbs_diag_phase2_skip_lag_plan_commit_consume="
                 << (FLAGS_cbs_diag_phase2_skip_lag_plan_commit_consume ? 1 : 0)
                 << " cbs_diag_phase2_skip_delete_slots_first_post_boundary_epoch="
@@ -14861,6 +25718,78 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << cbs_phase2_lag_remove_slots_applied
                 << " cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary="
                 << cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary
+                << " cbs_phase2_lag_remove_slots_requested_raw="
+                << cbs_phase2_lag_remove_slots_requested_raw
+                << " cbs_phase2_lag_remove_slots_summary_covered="
+                << cbs_phase2_lag_remove_slots_summary_covered
+                << " cbs_phase2_lag_remove_slots_deferred_uncovered="
+                << cbs_phase2_lag_remove_slots_deferred_uncovered
+                << " cbs_phase2_lag_remove_slots_applied_after_coverage_gate="
+                << cbs_phase2_lag_remove_slots_applied_after_coverage_gate
+                << " cbs_phase2_summary_required_crossing_slots="
+                << cbs_phase2_summary_required_crossing_slots
+                << " cbs_phase2_summary_covered_crossing_slots="
+                << cbs_phase2_summary_covered_crossing_slots
+                << " cbs_phase2_directly_removable_local_internal_slots="
+                << cbs_phase2_directly_removable_local_internal_slots
+                << " cbs_phase2_retained_protected_local_support_slots="
+                << cbs_phase2_retained_protected_local_support_slots
+                << " cbs_phase2_retained_protected_local_support_slots_first_few="
+                << cbs_phase2_retained_protected_local_support_slots_first_few
+                << " cbs_phase2_first_retained_protected_local_support_slot_class="
+                << cbs_phase2_first_retained_protected_local_support_slot_class
+                << " cbs_phase2_first_retained_protected_local_support_slot_keys="
+                << cbs_phase2_first_retained_protected_local_support_slot_keys
+                << " cbs_phase2_unsupported_deferred_lag_slots="
+                << cbs_phase2_unsupported_deferred_lag_slots
+                << " cbs_phase2_lag_remove_slots_applied_direct_local_internal="
+                << cbs_phase2_lag_remove_slots_applied_direct_local_internal
+                << " cbs_phase2_lag_remove_slots_applied_summary_covered_crossing="
+                << cbs_phase2_lag_remove_slots_applied_summary_covered_crossing
+                << " cbs_phase2_lag_remove_slots_deferred_crossing_uncovered="
+                << cbs_phase2_lag_remove_slots_deferred_crossing_uncovered
+                << " cbs_phase2_lag_remove_slots_deferred_unsupported="
+                << cbs_phase2_lag_remove_slots_deferred_unsupported
+                << " cbs_phase2_real_applied_lag_slots_count="
+                << cbs_phase2_real_applied_lag_slots_count
+                << " cbs_phase2_real_applied_lag_slots_first_few="
+                << cbs_phase2_real_applied_lag_slots_first_few
+                << " cbs_phase2_real_applied_delete_slots_count="
+                << cbs_phase2_real_applied_delete_slots_count
+                << " cbs_phase2_real_applied_total_remove_slots_count="
+                << cbs_phase2_real_applied_total_remove_slots_count
+                << " cbs_phase2_real_applied_lag_slots_source="
+                << cbs_phase2_real_applied_lag_slots_source
+                << " cbs_phase2_applied_lag_slot_membership_ok="
+                << (cbs_phase2_applied_lag_slot_membership_ok ? 1 : 0)
+                << " cbs_phase2_first_applied_lag_slot_outside_split_contract="
+                << cbs_phase2_first_applied_lag_slot_outside_split_contract
+                << " cbs_phase2_first_applied_lag_slot_outside_split_contract_class="
+                << cbs_phase2_first_applied_lag_slot_outside_split_contract_class
+                << " cbs_phase2_first_applied_lag_slot_outside_split_contract_keys="
+                << cbs_phase2_first_applied_lag_slot_outside_split_contract_keys
+                << " cbs_phase2_lag_remove_coverage_gate_reason="
+                << cbs_phase2_lag_remove_coverage_gate_reason
+                << " cbs_phase2_summary_remove_coverage_mode="
+                << cbs_phase2_summary_remove_coverage_mode
+                << " cbs_phase2_summary_remove_coverage_coherence_ok="
+                << (cbs_phase2_summary_remove_coverage_coherence_ok ? 1 : 0)
+                << " cbs_phase2_summary_remove_coverage_first_inconsistency_reason="
+                << cbs_phase2_summary_remove_coverage_first_inconsistency_reason
+                << " cbs_phase2_lag_remove_hard_blocked_due_to_none_mode="
+                << (cbs_phase2_lag_remove_hard_blocked_due_to_none_mode ? 1 : 0)
+                << " cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export="
+                << (cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export
+                        ? 1
+                        : 0)
+                << " cbs_phase2_lag_remove_hard_blocked_count="
+                << cbs_phase2_lag_remove_hard_blocked_count
+                << " cbs_phase2_first_uncovered_lag_remove_slot="
+                << cbs_phase2_first_uncovered_lag_remove_slot
+                << " cbs_phase2_first_uncovered_lag_remove_slot_class="
+                << cbs_phase2_first_uncovered_lag_remove_slot_class
+                << " cbs_phase2_first_uncovered_lag_remove_slot_keys="
+                << cbs_phase2_first_uncovered_lag_remove_slot_keys
                 << " cbs_phase2_lag_remove_boundary_touch_factor_count="
                 << cbs_phase2_lag_remove_boundary_touch_factor_count
                 << " cbs_phase2_lag_remove_filter_reason="
@@ -14897,6 +25826,14 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << cbs_phase2_deferred_lag_remove_anchor_prior_keys
                 << " deferred_lag_remove_anchor_prior_protection_reason="
                 << cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason
+                << " cbs_phase2_deferred_structural_prior_protection_fired="
+                << (cbs_phase2_deferred_structural_prior_protection_fired ? 1 : 0)
+                << " cbs_phase2_deferred_structural_prior_blocked_count="
+                << cbs_phase2_deferred_structural_prior_blocked_count
+                << " cbs_phase2_deferred_structural_prior_blocked_slots="
+                << cbs_phase2_deferred_structural_prior_blocked_slots
+                << " cbs_phase2_deferred_structural_prior_blocked_keys="
+                << cbs_phase2_deferred_structural_prior_blocked_keys
                 << " cbs_phase2_first_post_boundary_factor_class_filter_reason="
                 << cbs_phase2_first_post_boundary_factor_class_filter_reason
                 << " cbs_allow_heavy_maintenance="
@@ -15007,6 +25944,205 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << " cbs_replace_fixed_lag_optimizer="
                 << (FLAGS_cbs_replace_fixed_lag_optimizer ? 1 : 0)
                 << std::endl;
+            if (cbs_phase2_lag_remove_slots_requested_raw > 0u ||
+                cbs_phase2_lag_requested_slot_count > 0u ||
+                cbs_phase2_summary_required_crossing_slots > 0u ||
+                cbs_phase2_directly_removable_local_internal_slots > 0u ||
+                cbs_phase2_unsupported_deferred_lag_slots > 0u) {
+              std::cerr << "[CBS][Phase2SplitDiag] curr_kf_id=" << curr_kf_id_
+                        << " lag_remove_slots_requested_raw="
+                        << cbs_phase2_lag_remove_slots_requested_raw
+                        << " lag_requested_slot_count="
+                        << cbs_phase2_lag_requested_slot_count
+                        << " lag_requested_partition_coherence_ok="
+                        << (cbs_phase2_lag_requested_partition_coherence_ok ? 1 : 0)
+                        << " unclassified_requested_lag_slots="
+                        << cbs_phase2_unclassified_requested_lag_slots
+                        << " unclassified_requested_lag_slots_first_few="
+                        << cbs_phase2_unclassified_requested_lag_slots_first_few
+                        << " first_unclassified_requested_lag_slot="
+                        << cbs_phase2_first_unclassified_requested_lag_slot
+                        << " first_unclassified_requested_lag_slot_class="
+                        << cbs_phase2_first_unclassified_requested_lag_slot_class
+                        << " first_unclassified_requested_lag_slot_keys="
+                        << cbs_phase2_first_unclassified_requested_lag_slot_keys
+                        << " first_unclassified_requested_lag_slot_reason="
+                        << cbs_phase2_first_unclassified_requested_lag_slot_reason
+                        << " summary_required_crossing_slots="
+                        << cbs_phase2_summary_required_crossing_slots
+                        << " summary_covered_crossing_slots="
+                        << cbs_phase2_summary_covered_crossing_slots
+                        << " directly_removable_local_internal_slots="
+                        << cbs_phase2_directly_removable_local_internal_slots
+                        << " unsupported_deferred_lag_slots="
+                        << cbs_phase2_unsupported_deferred_lag_slots
+                        << " current_epoch_requested_direct_local_internal_count="
+                        << cbs_phase2_current_epoch_requested_direct_local_internal_count
+                        << " current_epoch_requested_crossing_required_count="
+                        << cbs_phase2_current_epoch_requested_crossing_required_count
+                        << " current_epoch_requested_unsupported_count="
+                        << cbs_phase2_current_epoch_requested_unsupported_count
+                        << " deferred_queue_requested_count="
+                        << cbs_phase2_deferred_queue_requested_count
+                        << " effective_requested_crossing_required_count="
+                        << cbs_phase2_effective_requested_crossing_required_count
+                        << " effective_requested_crossing_intersection_with_heart_covered_count="
+                        << cbs_phase2_effective_requested_crossing_intersection_with_heart_covered_count
+                        << " effective_heart_covered_minus_requested_crossing_count="
+                        << cbs_phase2_effective_heart_covered_minus_requested_crossing_count
+                        << " crossing_gate_requested_count="
+                        << cbs_phase2_crossing_gate_requested_count
+                        << " crossing_gate_covered_count="
+                        << cbs_phase2_crossing_gate_covered_count
+                        << " crossing_gate_uncovered_count="
+                        << cbs_phase2_crossing_gate_uncovered_count
+                        << " crossing_gate_hard_blocked="
+                        << (cbs_phase2_crossing_gate_hard_blocked ? 1 : 0)
+                        << " crossing_gate_reason="
+                        << cbs_phase2_crossing_gate_reason
+                        << " crossing_gate_using_split_semantics="
+                        << (cbs_phase2_crossing_gate_using_split_semantics ? 1 : 0)
+                        << " crossing_gate_zero_apply_inconsistent="
+                        << (cbs_phase2_crossing_gate_zero_apply_inconsistent ? 1 : 0)
+                        << " crossing_export_coherence_ok="
+                        << (cbs_phase2_crossing_export_coherence_ok ? 1 : 0)
+                        << " overlap_guard_post_split_semantics="
+                        << (cbs_phase2_overlap_guard_post_split_semantics ? 1 : 0)
+                        << " overlap_guard_summary_key_only_allowed_for_covered_crossing="
+                        << (cbs_phase2_overlap_guard_summary_key_only_allowed_for_covered_crossing
+                                ? 1
+                                : 0)
+                        << " overlap_guard_deferred_direct_local_internal_count="
+                        << cbs_phase2_overlap_guard_deferred_direct_local_internal_count
+                        << " overlap_guard_deferred_summary_covered_crossing_count="
+                        << cbs_phase2_overlap_guard_deferred_summary_covered_crossing_count
+                        << " overlap_guard_summary_key_only_crossing_count="
+                        << cbs_phase2_overlap_guard_summary_key_only_crossing_count
+                        << " overlap_guard_new_factor_or_value_crossing_count="
+                        << cbs_phase2_overlap_guard_new_factor_or_value_crossing_count
+                        << " overlap_guard_zeroed_summary_covered_crossing_inconsistent="
+                        << (cbs_phase2_overlap_guard_zeroed_summary_covered_crossing_inconsistent
+                                ? 1
+                                : 0)
+                        << " cbs_phase2_diag_defer_direct_local_internal_only="
+                        << (cbs_phase2_diag_defer_direct_local_internal_only ? 1 : 0)
+                        << " cbs_phase2_direct_local_internal_forced_deferred_count="
+                        << cbs_phase2_direct_local_internal_forced_deferred_count
+                        << " cbs_phase2_summary_covered_crossing_kept_active_count="
+                        << cbs_phase2_summary_covered_crossing_kept_active_count
+                        << " cbs_phase2_diag_exclude_summary_covered_crossing_classes="
+                        << cbs_phase2_diag_exclude_summary_covered_crossing_classes
+                        << " cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes="
+                        << cbs_phase2_diag_one_epoch_defer_summary_covered_crossing_classes
+                        << " cbs_phase2_summary_covered_crossing_one_epoch_deferred_count="
+                        << cbs_phase2_summary_covered_crossing_one_epoch_deferred_count
+                        << " cbs_phase2_summary_covered_crossing_one_epoch_deferred_first_few="
+                        << cbs_phase2_summary_covered_crossing_one_epoch_deferred_first_few
+                        << " cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count="
+                        << cbs_phase2_summary_covered_crossing_one_epoch_reapplied_count
+                        << " cbs_phase2_summary_covered_crossing_one_epoch_reapplied_first_few="
+                        << cbs_phase2_summary_covered_crossing_one_epoch_reapplied_first_few
+                        << " cbs_phase2_defer_summary_covered_crossing_one_epoch_mode="
+                        << (cbs_phase2_defer_summary_covered_crossing_one_epoch_mode
+                                ? 1
+                                : 0)
+                        << " cbs_phase2_one_epoch_replay_mode_forced_two_stage="
+                        << (cbs_phase2_one_epoch_replay_mode_forced_two_stage
+                                ? 1
+                                : 0)
+                        << " cbs_phase2_single_packet_update_inconsistent_under_replay_mode="
+                        << (cbs_phase2_single_packet_update_inconsistent_under_replay_mode
+                                ? 1
+                                : 0)
+                        << " cbs_phase2_two_stage_requested="
+                        << (cbs_phase2_two_stage_requested ? 1 : 0)
+                        << " cbs_phase2_two_stage_effective="
+                        << (cbs_phase2_two_stage_effective ? 1 : 0)
+                        << " cbs_phase2_replay_queue_size="
+                        << cbs_phase2_replay_queue_size
+                        << " cbs_phase2_replay_into_stage_a_count="
+                        << cbs_phase2_replay_into_stage_a_count
+                        << " cbs_phase2_replay_into_stage_a_mode="
+                        << (cbs_phase2_replay_into_stage_a_mode ? 1 : 0)
+                        << " cbs_phase2_replayed_summary_crossing_count="
+                        << cbs_phase2_replayed_summary_crossing_count
+                        << " cbs_phase2_stage_a_remove_count="
+                        << cbs_phase2_stage_a_remove_count
+                        << " cbs_phase2_stage_a_summary_factor_count="
+                        << cbs_phase2_stage_a_summary_factor_count
+                        << " cbs_phase2_stage_a_replay_skipped_due_to_failure="
+                        << (cbs_phase2_stage_a_replay_skipped_due_to_failure ? 1
+                                                                              : 0)
+                        << " cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count="
+                        << cbs_phase2_summary_covered_crossing_deferred_to_next_epoch_count
+                        << " cbs_phase2_summary_covered_crossing_replayed_count="
+                        << cbs_phase2_summary_covered_crossing_replayed_count
+                        << " cbs_phase2_summary_covered_crossing_replay_epoch="
+                        << cbs_phase2_summary_covered_crossing_replay_epoch
+                        << " cbs_phase2_summary_covered_crossing_replay_stage="
+                        << sanitize_forensic_token(
+                               cbs_phase2_summary_covered_crossing_replay_stage)
+                        << " cbs_phase2_summary_crossing_replay_requested_count="
+                        << cbs_phase2_summary_crossing_replay_requested_count
+                        << " cbs_phase2_summary_crossing_replay_valid_count="
+                        << cbs_phase2_summary_crossing_replay_valid_count
+                        << " cbs_phase2_summary_crossing_replay_invalid_count="
+                        << cbs_phase2_summary_crossing_replay_invalid_count
+                        << " cbs_phase2_summary_crossing_replay_skipped_due_to_no_valid_slots="
+                        << (cbs_phase2_summary_crossing_replay_skipped_due_to_no_valid_slots
+                                ? 1
+                                : 0)
+                        << " cbs_phase2_summary_crossing_replay_first_invalid_slot="
+                        << cbs_phase2_summary_crossing_replay_first_invalid_slot
+                        << " cbs_phase2_summary_crossing_replay_first_invalid_slot_class="
+                        << cbs_phase2_summary_crossing_replay_first_invalid_slot_class
+                        << " cbs_phase2_summary_crossing_replay_first_invalid_slot_keys="
+                        << cbs_phase2_summary_crossing_replay_first_invalid_slot_keys
+                        << " cbs_phase2_summary_crossing_replay_first_invalid_reason="
+                        << cbs_phase2_summary_crossing_replay_first_invalid_reason
+                        << " cbs_phase2_summary_crossing_replay_stage_executed="
+                        << (cbs_phase2_summary_crossing_replay_stage_executed ? 1
+                                                                               : 0)
+                        << " cbs_phase2_summary_crossing_replay_first_replayed_slot="
+                        << cbs_phase2_summary_crossing_replay_first_replayed_slot
+                        << " cbs_phase2_summary_crossing_replay_first_replayed_slot_class="
+                        << cbs_phase2_summary_crossing_replay_first_replayed_slot_class
+                        << " cbs_phase2_summary_crossing_replay_first_replayed_slot_keys="
+                        << cbs_phase2_summary_crossing_replay_first_replayed_slot_keys
+                        << " cbs_phase2_summary_covered_crossing_factor_type_counts_raw="
+                        << cbs_phase2_summary_covered_crossing_factor_type_counts_raw
+                        << " cbs_phase2_summary_covered_crossing_factor_type_counts_applied="
+                        << cbs_phase2_summary_covered_crossing_factor_type_counts_applied
+                        << " cbs_phase2_summary_covered_crossing_factor_type_counts_deferred="
+                        << cbs_phase2_summary_covered_crossing_factor_type_counts_deferred
+                        << " cbs_phase2_first_applied_summary_covered_crossing_slot_class="
+                        << cbs_phase2_first_applied_summary_covered_crossing_slot_class
+                        << " cbs_phase2_first_applied_summary_covered_crossing_slot_keys="
+                        << cbs_phase2_first_applied_summary_covered_crossing_slot_keys
+                        << " cbs_phase2_first_deferred_summary_covered_crossing_slot_class="
+                        << cbs_phase2_first_deferred_summary_covered_crossing_slot_class
+                        << " cbs_phase2_first_deferred_summary_covered_crossing_slot_keys="
+                        << cbs_phase2_first_deferred_summary_covered_crossing_slot_keys
+                        << " cbs_phase2_phase2_slot_domain_source="
+                        << cbs_phase2_phase2_slot_domain_source
+                        << " requested_crossing_intersection_with_heart_covered_count="
+                        << cbs_phase2_requested_crossing_intersection_with_heart_covered_count
+                        << " requested_crossing_minus_heart_covered_count="
+                        << cbs_phase2_requested_crossing_minus_heart_covered_count
+                        << " heart_covered_minus_requested_crossing_count="
+                        << cbs_phase2_heart_covered_minus_requested_crossing_count
+                        << " first_requested_crossing_not_in_heart_covered="
+                        << cbs_phase2_first_requested_crossing_not_in_heart_covered
+                        << " first_heart_covered_not_in_requested_crossing="
+                        << cbs_phase2_first_heart_covered_not_in_requested_crossing
+                        << " lag_remove_slots_applied_after_coverage_gate="
+                        << cbs_phase2_lag_remove_slots_applied_after_coverage_gate
+                        << " first_uncovered_lag_remove_slot_class="
+                        << cbs_phase2_first_uncovered_lag_remove_slot_class
+                        << " first_uncovered_lag_remove_slot_keys="
+                        << cbs_phase2_first_uncovered_lag_remove_slot_keys
+                        << std::endl;
+            }
             {
               std::ostringstream clean_snapshot;
               clean_snapshot << "curr_kf_id=" << curr_kf_id_
@@ -15130,6 +26266,82 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                              << cbs_phase2_lag_remove_slots_applied
                              << " cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary="
                              << cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary
+                             << " cbs_phase2_lag_remove_slots_requested_raw="
+                             << cbs_phase2_lag_remove_slots_requested_raw
+                             << " cbs_phase2_lag_remove_slots_summary_covered="
+                             << cbs_phase2_lag_remove_slots_summary_covered
+                             << " cbs_phase2_lag_remove_slots_deferred_uncovered="
+                             << cbs_phase2_lag_remove_slots_deferred_uncovered
+                             << " cbs_phase2_lag_remove_slots_applied_after_coverage_gate="
+                             << cbs_phase2_lag_remove_slots_applied_after_coverage_gate
+                             << " cbs_phase2_summary_required_crossing_slots="
+                             << cbs_phase2_summary_required_crossing_slots
+                             << " cbs_phase2_summary_covered_crossing_slots="
+                             << cbs_phase2_summary_covered_crossing_slots
+                             << " cbs_phase2_directly_removable_local_internal_slots="
+                             << cbs_phase2_directly_removable_local_internal_slots
+                             << " cbs_phase2_retained_protected_local_support_slots="
+                             << cbs_phase2_retained_protected_local_support_slots
+                             << " cbs_phase2_retained_protected_local_support_slots_first_few="
+                             << cbs_phase2_retained_protected_local_support_slots_first_few
+                             << " cbs_phase2_first_retained_protected_local_support_slot_class="
+                             << cbs_phase2_first_retained_protected_local_support_slot_class
+                             << " cbs_phase2_first_retained_protected_local_support_slot_keys="
+                             << cbs_phase2_first_retained_protected_local_support_slot_keys
+                             << " cbs_phase2_unsupported_deferred_lag_slots="
+                             << cbs_phase2_unsupported_deferred_lag_slots
+                             << " cbs_phase2_lag_remove_slots_applied_direct_local_internal="
+                             << cbs_phase2_lag_remove_slots_applied_direct_local_internal
+                             << " cbs_phase2_lag_remove_slots_applied_summary_covered_crossing="
+                             << cbs_phase2_lag_remove_slots_applied_summary_covered_crossing
+                             << " cbs_phase2_lag_remove_slots_deferred_crossing_uncovered="
+                             << cbs_phase2_lag_remove_slots_deferred_crossing_uncovered
+                             << " cbs_phase2_lag_remove_slots_deferred_unsupported="
+                             << cbs_phase2_lag_remove_slots_deferred_unsupported
+                             << " cbs_phase2_real_applied_lag_slots_count="
+                             << cbs_phase2_real_applied_lag_slots_count
+                             << " cbs_phase2_real_applied_lag_slots_first_few="
+                             << cbs_phase2_real_applied_lag_slots_first_few
+                             << " cbs_phase2_real_applied_delete_slots_count="
+                             << cbs_phase2_real_applied_delete_slots_count
+                             << " cbs_phase2_real_applied_total_remove_slots_count="
+                             << cbs_phase2_real_applied_total_remove_slots_count
+                             << " cbs_phase2_real_applied_lag_slots_source="
+                             << cbs_phase2_real_applied_lag_slots_source
+                             << " cbs_phase2_applied_lag_slot_membership_ok="
+                             << (cbs_phase2_applied_lag_slot_membership_ok ? 1 : 0)
+                             << " cbs_phase2_first_applied_lag_slot_outside_split_contract="
+                             << cbs_phase2_first_applied_lag_slot_outside_split_contract
+                             << " cbs_phase2_first_applied_lag_slot_outside_split_contract_class="
+                             << cbs_phase2_first_applied_lag_slot_outside_split_contract_class
+                             << " cbs_phase2_first_applied_lag_slot_outside_split_contract_keys="
+                             << cbs_phase2_first_applied_lag_slot_outside_split_contract_keys
+                             << " cbs_phase2_lag_remove_coverage_gate_reason="
+                             << cbs_phase2_lag_remove_coverage_gate_reason
+                             << " cbs_phase2_summary_remove_coverage_mode="
+                             << cbs_phase2_summary_remove_coverage_mode
+                             << " cbs_phase2_summary_remove_coverage_coherence_ok="
+                             << (cbs_phase2_summary_remove_coverage_coherence_ok
+                                     ? 1
+                                     : 0)
+                             << " cbs_phase2_summary_remove_coverage_first_inconsistency_reason="
+                             << cbs_phase2_summary_remove_coverage_first_inconsistency_reason
+                             << " cbs_phase2_lag_remove_hard_blocked_due_to_none_mode="
+                             << (cbs_phase2_lag_remove_hard_blocked_due_to_none_mode
+                                     ? 1
+                                     : 0)
+                             << " cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export="
+                             << (cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export
+                                     ? 1
+                                     : 0)
+                             << " cbs_phase2_lag_remove_hard_blocked_count="
+                             << cbs_phase2_lag_remove_hard_blocked_count
+                             << " cbs_phase2_first_uncovered_lag_remove_slot="
+                             << cbs_phase2_first_uncovered_lag_remove_slot
+                             << " cbs_phase2_first_uncovered_lag_remove_slot_class="
+                             << cbs_phase2_first_uncovered_lag_remove_slot_class
+                             << " cbs_phase2_first_uncovered_lag_remove_slot_keys="
+                             << cbs_phase2_first_uncovered_lag_remove_slot_keys
                              << " cbs_phase2_lag_remove_boundary_touch_factor_count="
                              << cbs_phase2_lag_remove_boundary_touch_factor_count
                              << " cbs_phase2_lag_remove_filter_reason="
@@ -15166,6 +26378,16 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                              << cbs_phase2_deferred_lag_remove_anchor_prior_keys
                              << " deferred_lag_remove_anchor_prior_protection_reason="
                              << cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason
+                             << " cbs_phase2_deferred_structural_prior_protection_fired="
+                             << (cbs_phase2_deferred_structural_prior_protection_fired
+                                     ? 1
+                                     : 0)
+                             << " cbs_phase2_deferred_structural_prior_blocked_count="
+                             << cbs_phase2_deferred_structural_prior_blocked_count
+                             << " cbs_phase2_deferred_structural_prior_blocked_slots="
+                             << cbs_phase2_deferred_structural_prior_blocked_slots
+                             << " cbs_phase2_deferred_structural_prior_blocked_keys="
+                             << cbs_phase2_deferred_structural_prior_blocked_keys
                              << " cbs_phase2_first_post_boundary_factor_class_filter_reason="
                              << cbs_phase2_first_post_boundary_factor_class_filter_reason
                              << " input_new_factors_count="
@@ -15243,6 +26465,45 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                              << sanitize_forensic_token(
                                     cbs_update_packet_forensics
                                         .remove_analysis.first_type)
+                             << " applied_remove_slots_first_few="
+                             << cbs_update_packet_forensics
+                                    .applied_remove_slots_first_few
+                             << " first_applied_remove_slot="
+                             << cbs_update_packet_forensics
+                                    .first_applied_remove_slot
+                             << " first_applied_remove_slot_source="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .first_applied_remove_slot_source)
+                             << " first_applied_remove_slot_factor_class="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .first_applied_remove_slot_factor_class)
+                             << " first_applied_remove_slot_factor_keys="
+                             << sanitize_forensic_token(
+                                    cbs_update_packet_forensics
+                                        .first_applied_remove_slot_factor_keys)
+                             << " first_applied_remove_slot_exists_before_update="
+                             << cbs_update_packet_forensics
+                                    .first_applied_remove_slot_exists_before_update
+                             << " first_applied_remove_slot_in_stale_local_factor_slots="
+                             << cbs_update_packet_forensics
+                                    .first_applied_remove_slot_in_stale_local_factor_slots
+                             << " first_applied_remove_slot_in_stale_belief_factor_slots="
+                             << cbs_update_packet_forensics
+                                    .first_applied_remove_slot_in_stale_belief_factor_slots
+                             << " first_applied_remove_slot_in_orphan_belief_factor_slots="
+                             << cbs_update_packet_forensics
+                                    .first_applied_remove_slot_in_orphan_belief_factor_slots
+                             << " first_applied_remove_slot_in_delete_slots="
+                             << cbs_update_packet_forensics
+                                    .first_applied_remove_slot_in_delete_slots
+                             << " first_applied_remove_slot_in_phase2_expanded_selected_factor_slots="
+                             << cbs_update_packet_forensics
+                                    .first_applied_remove_slot_in_phase2_expanded_selected_factor_slots
+                             << " first_applied_remove_slot_touches_root_anchor_x0="
+                             << cbs_update_packet_forensics
+                                    .first_applied_remove_slot_touches_root_anchor_x0
                              << " first_delete_slot="
                              << cbs_update_packet_forensics
                                     .delete_analysis.first_slot
@@ -15500,6 +26761,78 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << cbs_phase2_lag_remove_slots_applied
                       << " cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary="
                       << cbs_phase2_lag_remove_slots_deferred_all_first_post_boundary
+                      << " cbs_phase2_lag_remove_slots_requested_raw="
+                      << cbs_phase2_lag_remove_slots_requested_raw
+                      << " cbs_phase2_lag_remove_slots_summary_covered="
+                      << cbs_phase2_lag_remove_slots_summary_covered
+                      << " cbs_phase2_lag_remove_slots_deferred_uncovered="
+                      << cbs_phase2_lag_remove_slots_deferred_uncovered
+                      << " cbs_phase2_lag_remove_slots_applied_after_coverage_gate="
+                      << cbs_phase2_lag_remove_slots_applied_after_coverage_gate
+                      << " cbs_phase2_summary_required_crossing_slots="
+                      << cbs_phase2_summary_required_crossing_slots
+                      << " cbs_phase2_summary_covered_crossing_slots="
+                      << cbs_phase2_summary_covered_crossing_slots
+                      << " cbs_phase2_directly_removable_local_internal_slots="
+                      << cbs_phase2_directly_removable_local_internal_slots
+                      << " cbs_phase2_retained_protected_local_support_slots="
+                      << cbs_phase2_retained_protected_local_support_slots
+                      << " cbs_phase2_retained_protected_local_support_slots_first_few="
+                      << cbs_phase2_retained_protected_local_support_slots_first_few
+                      << " cbs_phase2_first_retained_protected_local_support_slot_class="
+                      << cbs_phase2_first_retained_protected_local_support_slot_class
+                      << " cbs_phase2_first_retained_protected_local_support_slot_keys="
+                      << cbs_phase2_first_retained_protected_local_support_slot_keys
+                      << " cbs_phase2_unsupported_deferred_lag_slots="
+                      << cbs_phase2_unsupported_deferred_lag_slots
+                      << " cbs_phase2_lag_remove_slots_applied_direct_local_internal="
+                      << cbs_phase2_lag_remove_slots_applied_direct_local_internal
+                      << " cbs_phase2_lag_remove_slots_applied_summary_covered_crossing="
+                      << cbs_phase2_lag_remove_slots_applied_summary_covered_crossing
+                      << " cbs_phase2_lag_remove_slots_deferred_crossing_uncovered="
+                      << cbs_phase2_lag_remove_slots_deferred_crossing_uncovered
+                      << " cbs_phase2_lag_remove_slots_deferred_unsupported="
+                      << cbs_phase2_lag_remove_slots_deferred_unsupported
+                      << " cbs_phase2_real_applied_lag_slots_count="
+                      << cbs_phase2_real_applied_lag_slots_count
+                      << " cbs_phase2_real_applied_lag_slots_first_few="
+                      << cbs_phase2_real_applied_lag_slots_first_few
+                      << " cbs_phase2_real_applied_delete_slots_count="
+                      << cbs_phase2_real_applied_delete_slots_count
+                      << " cbs_phase2_real_applied_total_remove_slots_count="
+                      << cbs_phase2_real_applied_total_remove_slots_count
+                      << " cbs_phase2_real_applied_lag_slots_source="
+                      << cbs_phase2_real_applied_lag_slots_source
+                      << " cbs_phase2_applied_lag_slot_membership_ok="
+                      << (cbs_phase2_applied_lag_slot_membership_ok ? 1 : 0)
+                      << " cbs_phase2_first_applied_lag_slot_outside_split_contract="
+                      << cbs_phase2_first_applied_lag_slot_outside_split_contract
+                      << " cbs_phase2_first_applied_lag_slot_outside_split_contract_class="
+                      << cbs_phase2_first_applied_lag_slot_outside_split_contract_class
+                      << " cbs_phase2_first_applied_lag_slot_outside_split_contract_keys="
+                      << cbs_phase2_first_applied_lag_slot_outside_split_contract_keys
+                      << " cbs_phase2_lag_remove_coverage_gate_reason="
+                      << cbs_phase2_lag_remove_coverage_gate_reason
+                      << " cbs_phase2_summary_remove_coverage_mode="
+                      << cbs_phase2_summary_remove_coverage_mode
+                      << " cbs_phase2_summary_remove_coverage_coherence_ok="
+                      << (cbs_phase2_summary_remove_coverage_coherence_ok ? 1 : 0)
+                      << " cbs_phase2_summary_remove_coverage_first_inconsistency_reason="
+                      << cbs_phase2_summary_remove_coverage_first_inconsistency_reason
+                      << " cbs_phase2_lag_remove_hard_blocked_due_to_none_mode="
+                      << (cbs_phase2_lag_remove_hard_blocked_due_to_none_mode ? 1 : 0)
+                      << " cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export="
+                      << (cbs_phase2_lag_remove_hard_blocked_due_to_incoherent_export
+                              ? 1
+                              : 0)
+                      << " cbs_phase2_lag_remove_hard_blocked_count="
+                      << cbs_phase2_lag_remove_hard_blocked_count
+                      << " cbs_phase2_first_uncovered_lag_remove_slot="
+                      << cbs_phase2_first_uncovered_lag_remove_slot
+                      << " cbs_phase2_first_uncovered_lag_remove_slot_class="
+                      << cbs_phase2_first_uncovered_lag_remove_slot_class
+                      << " cbs_phase2_first_uncovered_lag_remove_slot_keys="
+                      << cbs_phase2_first_uncovered_lag_remove_slot_keys
                       << " cbs_phase2_lag_remove_boundary_touch_factor_count="
                       << cbs_phase2_lag_remove_boundary_touch_factor_count
                       << " cbs_phase2_lag_remove_filter_reason="
@@ -15536,6 +26869,16 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << cbs_phase2_deferred_lag_remove_anchor_prior_keys
                       << " deferred_lag_remove_anchor_prior_protection_reason="
                       << cbs_phase2_deferred_lag_remove_anchor_prior_protection_reason
+                      << " cbs_phase2_deferred_structural_prior_protection_fired="
+                      << (cbs_phase2_deferred_structural_prior_protection_fired
+                              ? 1
+                              : 0)
+                      << " cbs_phase2_deferred_structural_prior_blocked_count="
+                      << cbs_phase2_deferred_structural_prior_blocked_count
+                      << " cbs_phase2_deferred_structural_prior_blocked_slots="
+                      << cbs_phase2_deferred_structural_prior_blocked_slots
+                      << " cbs_phase2_deferred_structural_prior_blocked_keys="
+                      << cbs_phase2_deferred_structural_prior_blocked_keys
                       << " cbs_phase2_first_post_boundary_factor_class_filter_reason="
                       << cbs_phase2_first_post_boundary_factor_class_filter_reason
                       << " diag_force_no_external_fast_path="
@@ -15632,10 +26975,48 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << std::endl;
             return true;
           } catch (const gtsam::IndeterminantLinearSystemException& e) {
+            ++cbs_bpsam_ilsretry_count_so_far_;
+            cbs_crash_imminent_marker_epoch = true;
             const gtsam::Symbol failed_symbol(e.nearbyVariable());
             std::ostringstream reason;
             reason << e.what() << " failed_symbol=" << failed_symbol.chr()
                    << failed_symbol.index();
+            const bool stage_b_sequence_context =
+                exception_phase_label.find("bpsam_update_call_two_stage_update_b") !=
+                    std::string::npos ||
+                (cbs_stage_b_failure_sequence_active_epoch &&
+                 !enable_remove_factor_indices);
+            const bool stage_a_sequence_context =
+                exception_phase_label.find("bpsam_update_call_two_stage_update_a") !=
+                    std::string::npos ||
+                (cbs_stage_a_failure_sequence_active_epoch &&
+                 !enable_remove_factor_indices);
+            if (stage_b_sequence_context) {
+              cbs_note_stage_b_failure_exception(enable_remove_factor_indices,
+                                                 exception_phase_label,
+                                                 reason.str());
+              cbs_stage_b_failure_sequence_recovery_attempted = true;
+              if (cbs_stage_b_failure_sequence_recovery_exception_message ==
+                  "none") {
+                cbs_stage_b_failure_sequence_recovery_exception_message =
+                    sanitize_forensic_token(reason.str());
+              }
+              cbs_stage_b_failure_sequence_final_failure_stage =
+                  sanitize_forensic_token(exception_phase_label);
+            }
+            if (stage_a_sequence_context) {
+              cbs_note_stage_a_failure_exception(enable_remove_factor_indices,
+                                                 exception_phase_label,
+                                                 reason.str());
+              cbs_stage_a_failure_sequence_recovery_attempted = true;
+              if (cbs_stage_a_failure_sequence_recovery_exception_message ==
+                  "none") {
+                cbs_stage_a_failure_sequence_recovery_exception_message =
+                    sanitize_forensic_token(reason.str());
+              }
+              cbs_stage_a_failure_sequence_final_failure_stage =
+                  sanitize_forensic_token(exception_phase_label);
+            }
             LOG(ERROR) << "CBS BPSAM indeterminant system: " << reason.str();
             if (!cbs_first_bad_epoch_snapshot_logged_) {
               if (cbs_have_last_clean_epoch_snapshot_) {
@@ -15662,13 +27043,61 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   cbs_update_packet_forensics.first_inconsistency_factor_slot,
                   cbs_update_packet_forensics.first_inconsistency_factor_type,
                   cbs_update_packet_forensics.first_inconsistency_factor_keys);
+              if (cbs_phase2_two_stage_first_bad_epoch_stage_persistent ==
+                  "none") {
+                cbs_phase2_two_stage_first_bad_epoch_stage_persistent =
+                    sanitize_forensic_token(cbs_two_stage_current_update_stage);
+              }
+              cbs_phase2_two_stage_first_bad_epoch_stage =
+                  cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+              cbs_phase2_stage_b_first_bad_epoch_stage =
+                  cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+              if (!cbs_first_bad_epoch_seen_) {
+                cbs_first_bad_epoch_seen_ = true;
+                cbs_first_bad_epoch_kf_id_ = curr_kf_id_;
+              }
               cbs_first_bad_epoch_snapshot_logged_ = true;
             }
             return attempt_cbs_recovery(failed_symbol.index(), reason.str());
           } catch (const std::exception& e) {
             const std::string err_msg =
                 e.what() ? std::string(e.what()) : std::string();
+            const bool stage_b_initial_exception =
+                exception_phase_label.find("bpsam_update_call_two_stage_update_b") !=
+                std::string::npos;
+            const bool stage_b_retry_exception =
+                cbs_stage_b_failure_sequence_active_epoch &&
+                !enable_remove_factor_indices;
+            const bool stage_a_initial_exception =
+                exception_phase_label.find("bpsam_update_call_two_stage_update_a") !=
+                std::string::npos;
+            const bool stage_a_retry_exception =
+                cbs_stage_a_failure_sequence_active_epoch &&
+                !enable_remove_factor_indices;
+            if (stage_b_initial_exception || stage_b_retry_exception) {
+              cbs_note_stage_b_failure_exception(enable_remove_factor_indices,
+                                                 exception_phase_label,
+                                                 err_msg);
+              cbs_stage_b_failure_sequence_final_failure_stage =
+                  sanitize_forensic_token(exception_phase_label);
+            }
+            if (stage_a_initial_exception || stage_a_retry_exception) {
+              cbs_note_stage_a_failure_exception(enable_remove_factor_indices,
+                                                 exception_phase_label,
+                                                 err_msg);
+              cbs_stage_a_failure_sequence_final_failure_stage =
+                  sanitize_forensic_token(exception_phase_label);
+            }
             const bool has_map_at = err_msg.find("map::at") != std::string::npos;
+            if (has_map_at) {
+              ++cbs_map_at_count_so_far_;
+              cbs_crash_imminent_marker_epoch = true;
+            }
+            if (err_msg.find("IndeterminantLinearSystemException") !=
+                std::string::npos) {
+              ++cbs_bpsam_ilsretry_count_so_far_;
+              cbs_crash_imminent_marker_epoch = true;
+            }
             const bool recoverable_signature =
                 err_msg.find("IndeterminantLinearSystemException") !=
                     std::string::npos ||
@@ -15681,6 +27110,12 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               LOG(ERROR) << "CBS-heart update hit map::at while applying "
                             "removeFactorIndices. Retrying this epoch without "
                             "removeFactorIndices.";
+              if (stage_b_initial_exception) {
+                cbs_stage_b_failure_sequence_retry_attempted = true;
+              }
+              if (stage_a_initial_exception) {
+                cbs_stage_a_failure_sequence_retry_attempted = true;
+              }
               if (cbs_use_phase2_summary_prior_bridge && cbs_phase2_heart_) {
                 cbs_phase2_pending_prune_exists =
                     cbs_phase2_heart_->hasPendingPrunePlan();
@@ -15716,6 +27151,19 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     cbs_update_packet_forensics.first_inconsistency_factor_slot,
                     cbs_update_packet_forensics.first_inconsistency_factor_type,
                     cbs_update_packet_forensics.first_inconsistency_factor_keys);
+                if (cbs_phase2_two_stage_first_bad_epoch_stage_persistent ==
+                    "none") {
+                  cbs_phase2_two_stage_first_bad_epoch_stage_persistent =
+                      sanitize_forensic_token(cbs_two_stage_current_update_stage);
+                }
+                cbs_phase2_two_stage_first_bad_epoch_stage =
+                    cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+                cbs_phase2_stage_b_first_bad_epoch_stage =
+                    cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+                if (!cbs_first_bad_epoch_seen_) {
+                  cbs_first_bad_epoch_seen_ = true;
+                  cbs_first_bad_epoch_kf_id_ = curr_kf_id_;
+                }
                 cbs_first_bad_epoch_snapshot_logged_ = true;
               }
               *should_retry_without_remove = true;
@@ -15725,6 +27173,22 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             if (recoverable_signature) {
               LOG(ERROR) << "CBS BPSAM update failed with recoverable signature: "
                          << err_msg;
+              if (stage_b_initial_exception || stage_b_retry_exception) {
+                cbs_stage_b_failure_sequence_recovery_attempted = true;
+                if (cbs_stage_b_failure_sequence_recovery_exception_message ==
+                    "none") {
+                  cbs_stage_b_failure_sequence_recovery_exception_message =
+                      sanitize_forensic_token(err_msg);
+                }
+              }
+              if (stage_a_initial_exception || stage_a_retry_exception) {
+                cbs_stage_a_failure_sequence_recovery_attempted = true;
+                if (cbs_stage_a_failure_sequence_recovery_exception_message ==
+                    "none") {
+                  cbs_stage_a_failure_sequence_recovery_exception_message =
+                      sanitize_forensic_token(err_msg);
+                }
+              }
               if (attempt_cbs_recovery(std::nullopt, err_msg)) {
                 return true;
               }
@@ -15746,7 +27210,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   "first_bad",
                   exception_phase_label,
                   "std_exception",
-                  (exception_phase_label == "bpsam_update_call" ||
+                  (exception_phase_label.find("bpsam_update_call") !=
+                       std::string::npos ||
                    exception_phase_label == "estimate_readback"),
                   enable_remove_factor_indices,
                   forensic_remove_slots_this_attempt,
@@ -15756,10 +27221,48 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   cbs_update_packet_forensics.first_inconsistency_factor_slot,
                   cbs_update_packet_forensics.first_inconsistency_factor_type,
                   cbs_update_packet_forensics.first_inconsistency_factor_keys);
+              if (cbs_phase2_two_stage_first_bad_epoch_stage_persistent ==
+                  "none") {
+                cbs_phase2_two_stage_first_bad_epoch_stage_persistent =
+                    sanitize_forensic_token(cbs_two_stage_current_update_stage);
+              }
+              cbs_phase2_two_stage_first_bad_epoch_stage =
+                  cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+              cbs_phase2_stage_b_first_bad_epoch_stage =
+                  cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+              if (!cbs_first_bad_epoch_seen_) {
+                cbs_first_bad_epoch_seen_ = true;
+                cbs_first_bad_epoch_kf_id_ = curr_kf_id_;
+              }
               cbs_first_bad_epoch_snapshot_logged_ = true;
             }
             return false;
           } catch (...) {
+            cbs_crash_imminent_marker_epoch = true;
+            const bool stage_b_sequence_context =
+                exception_phase_label.find("bpsam_update_call_two_stage_update_b") !=
+                    std::string::npos ||
+                (cbs_stage_b_failure_sequence_active_epoch &&
+                 !enable_remove_factor_indices);
+            const bool stage_a_sequence_context =
+                exception_phase_label.find("bpsam_update_call_two_stage_update_a") !=
+                    std::string::npos ||
+                (cbs_stage_a_failure_sequence_active_epoch &&
+                 !enable_remove_factor_indices);
+            if (stage_b_sequence_context) {
+              cbs_note_stage_b_failure_exception(enable_remove_factor_indices,
+                                                 exception_phase_label,
+                                                 "unknown_exception");
+              cbs_stage_b_failure_sequence_final_failure_stage =
+                  sanitize_forensic_token(exception_phase_label);
+            }
+            if (stage_a_sequence_context) {
+              cbs_note_stage_a_failure_exception(enable_remove_factor_indices,
+                                                 exception_phase_label,
+                                                 "unknown_exception");
+              cbs_stage_a_failure_sequence_final_failure_stage =
+                  sanitize_forensic_token(exception_phase_label);
+            }
             LOG(ERROR) << "CBS BPSAM update failed with unknown exception.";
             if (!cbs_first_bad_epoch_snapshot_logged_) {
               if (cbs_have_last_clean_epoch_snapshot_) {
@@ -15785,9 +27288,196 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                                               cbs_update_packet_forensics.first_inconsistency_factor_slot,
                                               cbs_update_packet_forensics.first_inconsistency_factor_type,
                                               cbs_update_packet_forensics.first_inconsistency_factor_keys);
+              if (cbs_phase2_two_stage_first_bad_epoch_stage_persistent ==
+                  "none") {
+                cbs_phase2_two_stage_first_bad_epoch_stage_persistent =
+                    sanitize_forensic_token(cbs_two_stage_current_update_stage);
+              }
+              cbs_phase2_two_stage_first_bad_epoch_stage =
+                  cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+              cbs_phase2_stage_b_first_bad_epoch_stage =
+                  cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+              if (!cbs_first_bad_epoch_seen_) {
+                cbs_first_bad_epoch_seen_ = true;
+                cbs_first_bad_epoch_kf_id_ = curr_kf_id_;
+              }
               cbs_first_bad_epoch_snapshot_logged_ = true;
             }
             return false;
+          }
+        };
+
+    const auto finalize_lag_boundary_commit =
+        [&](const bool epoch_update_succeeded) {
+          const bool should_emit_atomicity_diag =
+              lag_boundary_advanced_target_epoch &&
+              !cbs_lag_transaction_atomicity_diag_emitted_once;
+          const bool should_emit_lag_boundary_commit_diag =
+              lag_boundary_advanced_target_epoch &&
+              !cbs_lag_boundary_commit_diag_emitted_once;
+          const bool x_prev_frame_exists_after_epoch =
+              lag_boundary_prev_frame_for_diag_exists &&
+              cbs_optimizer_->valueExists(
+                  gtsam::Symbol(kPoseSymbolChar, lag_boundary_prev_frame_for_diag));
+          const bool v_prev_frame_exists_after_epoch =
+              lag_boundary_prev_frame_for_diag_exists &&
+              cbs_optimizer_->valueExists(gtsam::Symbol(kVelocitySymbolChar,
+                                                        lag_boundary_prev_frame_for_diag));
+          const bool b_prev_frame_exists_after_epoch =
+              lag_boundary_prev_frame_for_diag_exists &&
+              cbs_optimizer_->valueExists(
+                  gtsam::Symbol(kImuBiasSymbolChar, lag_boundary_prev_frame_for_diag));
+          const bool stale_prev_frame_cleanup_succeeded =
+              !lag_boundary_prev_frame_for_diag_exists ||
+              (!x_prev_frame_exists_after_epoch && !v_prev_frame_exists_after_epoch &&
+               !b_prev_frame_exists_after_epoch);
+          const bool atomic_remove_success_precondition =
+              epoch_update_succeeded && lag_boundary_remove_update_succeeded &&
+              stale_prev_frame_cleanup_succeeded;
+          bool prune_plan_consumed_now = false;
+          bool lag_transaction_consumed_now = false;
+          bool boundary_commit_applied = false;
+          bool atomic_commit_success = false;
+
+          if (cbs_use_phase2_summary_prior_bridge && cbs_phase2_heart_) {
+            cbs_phase2_pending_prune_exists =
+                cbs_phase2_heart_->hasPendingPrunePlan();
+            heart_prune_plan_exists = cbs_phase2_pending_prune_exists;
+            if (atomic_remove_success_precondition) {
+              if (cbs_phase2_pending_prune_exists) {
+                cbs_phase2_remove_update_succeeded_before_prune_commit = true;
+                heart_prune_plan_commit_attempted = true;
+                const bool committed = cbs_phase2_heart_->commitPendingPrunePlan();
+                cbs_phase2_prune_committed_this_epoch =
+                    cbs_phase2_prune_committed_this_epoch || committed;
+                heart_prune_plan_commit_succeeded =
+                    heart_prune_plan_commit_succeeded || committed;
+                cbs_phase2_pending_prune_exists =
+                    cbs_phase2_heart_->hasPendingPrunePlan();
+                heart_prune_plan_exists = cbs_phase2_pending_prune_exists;
+                prune_plan_consumed_now = committed;
+                if (committed) {
+                  cbs_phase2_prune_commit_reason =
+                      "primary_remove_update_and_stale_cleanup_succeeded";
+                } else if (cbs_phase2_prune_commit_reason == "none" ||
+                           cbs_phase2_prune_commit_reason ==
+                               "pending_prune_waiting_for_atomic_commit") {
+                  cbs_phase2_prune_commit_reason = "pending_prune_commit_failed";
+                }
+              } else {
+                prune_plan_consumed_now = true;
+                if (cbs_phase2_prune_commit_reason == "none" ||
+                    cbs_phase2_prune_commit_reason ==
+                        "pending_prune_waiting_for_atomic_commit") {
+                  cbs_phase2_prune_commit_reason =
+                      "no_pending_prune_plan_atomic_commit";
+                }
+              }
+            } else if (cbs_phase2_pending_prune_exists) {
+              if (!epoch_update_succeeded) {
+                cbs_phase2_prune_commit_reason =
+                    "pending_prune_waiting_for_epoch_success";
+              } else if (!lag_boundary_remove_update_succeeded) {
+                cbs_phase2_prune_commit_reason =
+                    "pending_prune_waiting_for_remove_update";
+              } else {
+                cbs_phase2_prune_commit_reason =
+                    "pending_prune_waiting_for_stale_cleanup";
+              }
+            }
+          } else {
+            prune_plan_consumed_now = atomic_remove_success_precondition;
+          }
+
+          atomic_commit_success =
+              atomic_remove_success_precondition && prune_plan_consumed_now;
+          if (atomic_commit_success) {
+            cbs_prev_oldest_active_frame_id_ =
+                target_oldest_active_frame_id_after_build;
+            cbs_has_prev_oldest_active_frame_id_ = true;
+            boundary_commit_applied = true;
+            lag_transaction_consumed_now = true;
+          } else if (cbs_prev_oldest_active_frame_id_known_before_build) {
+            cbs_prev_oldest_active_frame_id_ =
+                cbs_prev_oldest_active_frame_id_before_build;
+            cbs_has_prev_oldest_active_frame_id_ = true;
+          } else {
+            cbs_has_prev_oldest_active_frame_id_ = false;
+          }
+
+          cbs_phase2_incremental_remove_consumed_this_epoch =
+              lag_transaction_consumed_now;
+          cbs_phase2_lag_transaction_consumed_this_epoch =
+              lag_transaction_consumed_now;
+          heart_prune_plan_consumed = prune_plan_consumed_now;
+
+          if (should_emit_atomicity_diag) {
+            std::cerr << std::setprecision(12)
+                      << "[CBS][LagTransactionAtomicityDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " target_oldest_active_frame_id="
+                      << static_cast<long long>(
+                             target_oldest_active_frame_id_after_build)
+                      << " remove_update_attempted="
+                      << (lag_boundary_remove_update_attempted ? 1 : 0)
+                      << " remove_update_succeeded="
+                      << (lag_boundary_remove_update_succeeded ? 1 : 0)
+                      << " stale_prev_frame_x_after_epoch="
+                      << (x_prev_frame_exists_after_epoch ? 1 : 0)
+                      << " stale_prev_frame_v_after_epoch="
+                      << (v_prev_frame_exists_after_epoch ? 1 : 0)
+                      << " stale_prev_frame_b_after_epoch="
+                      << (b_prev_frame_exists_after_epoch ? 1 : 0)
+                      << " boundary_commit_applied="
+                      << (boundary_commit_applied ? 1 : 0)
+                      << " prune_plan_consumed="
+                      << (prune_plan_consumed_now ? 1 : 0)
+                      << " lag_transaction_consumed="
+                      << (lag_transaction_consumed_now ? 1 : 0)
+                      << " atomic_commit_success="
+                      << (atomic_commit_success ? 1 : 0)
+                      << std::endl;
+            cbs_lag_transaction_atomicity_diag_emitted_once = true;
+          }
+
+          if (should_emit_lag_boundary_commit_diag) {
+            std::cerr << std::setprecision(12)
+                      << "[CBS][LagBoundaryCommitDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " prev_oldest_active_frame_id_before_build="
+                      << (cbs_prev_oldest_active_frame_id_known_before_build
+                              ? static_cast<long long>(
+                                    cbs_prev_oldest_active_frame_id_before_build)
+                              : -1ll)
+                      << " target_oldest_active_frame_id_after_build="
+                      << static_cast<long long>(
+                             target_oldest_active_frame_id_after_build)
+                      << " cbs_prev_oldest_active_frame_id_before_update="
+                      << static_cast<long long>(
+                             cbs_prev_oldest_active_frame_id_before_update)
+                      << " cbs_prev_oldest_active_frame_id_after_build="
+                      << static_cast<long long>(
+                             cbs_prev_oldest_active_frame_id_after_build)
+                      << " remove_update_attempted="
+                      << (lag_boundary_remove_update_attempted ? 1 : 0)
+                      << " remove_update_succeeded="
+                      << (lag_boundary_remove_update_succeeded ? 1 : 0)
+                      << " prune_plan_consumed="
+                      << (prune_plan_consumed_now ? 1 : 0)
+                      << " x_prev_frame_exists_before_update="
+                      << (x_prev_frame_exists_before_update ? 1 : 0)
+                      << " v_prev_frame_exists_before_update="
+                      << (v_prev_frame_exists_before_update ? 1 : 0)
+                      << " b_prev_frame_exists_before_update="
+                      << (b_prev_frame_exists_before_update ? 1 : 0)
+                      << " x_prev_frame_exists_after_epoch="
+                      << (x_prev_frame_exists_after_epoch ? 1 : 0)
+                      << " v_prev_frame_exists_after_epoch="
+                      << (v_prev_frame_exists_after_epoch ? 1 : 0)
+                      << " b_prev_frame_exists_after_epoch="
+                      << (b_prev_frame_exists_after_epoch ? 1 : 0)
+                      << std::endl;
+            cbs_lag_boundary_commit_diag_emitted_once = true;
           }
         };
 
@@ -15800,17 +27490,32 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
         !FLAGS_cbs_diag_disable_first_attempt_remove_factor_indices;
     if (run_cbs_update_epoch(enable_remove_factor_indices_first_attempt,
                              &retry_without_remove)) {
+      finalize_lag_boundary_commit(/*epoch_update_succeeded=*/true);
+      cbs_emit_stage_b_failure_sequence_diag_once();
+      cbs_emit_stage_a_failure_sequence_diag_once();
       return true;
     }
 
     if (retry_without_remove && enable_remove_factor_indices_first_attempt) {
+      if (cbs_stage_b_failure_sequence_active_epoch) {
+        cbs_stage_b_failure_sequence_retry_attempted = true;
+      }
+      if (cbs_stage_a_failure_sequence_active_epoch) {
+        cbs_stage_a_failure_sequence_retry_attempted = true;
+      }
       bool ignored_retry_flag = false;
       if (run_cbs_update_epoch(/*enable_remove_factor_indices=*/false,
                                &ignored_retry_flag)) {
+        finalize_lag_boundary_commit(/*epoch_update_succeeded=*/true);
+        cbs_emit_stage_b_failure_sequence_diag_once();
+        cbs_emit_stage_a_failure_sequence_diag_once();
         return true;
       }
     }
 
+    finalize_lag_boundary_commit(/*epoch_update_succeeded=*/false);
+    cbs_emit_stage_b_failure_sequence_diag_once();
+    cbs_emit_stage_a_failure_sequence_diag_once();
     return false;
   }
 #endif

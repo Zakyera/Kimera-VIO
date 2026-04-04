@@ -876,10 +876,40 @@ class VioBackend {
   bool cbs_phase2_seen_first_boundary_touch_ = false;
   bool cbs_phase2_pending_first_post_boundary_epoch_ = false;
   bool cbs_phase2_deferred_lag_remove_packet_pending_ = false;
+  bool cbs_phase2_first_lag_set_recon_logged_ = false;
+  bool cbs_phase2_zero_apply_forensic_logged_ = false;
   FrameId cbs_phase2_deferred_lag_remove_packet_source_kf_id_ = 0;
   gtsam::FactorIndices cbs_phase2_deferred_lag_remove_packet_slots_;
+  struct CbsSummaryCoveredCrossingReplayMetadata {
+    gtsam::FactorIndex slot_id = 0;
+    FrameId defer_epoch = 0;
+    FrameId first_defer_epoch = 0;
+    std::string factor_class = "none";
+    std::string factor_keys = "none";
+    std::string replay_path = "summary_crossing";
+    std::string pending_reason = "none";
+    std::string blocking_key = "none";
+    long long blocking_support_slot = -1;
+    std::string blocking_support_slot_class = "none";
+    std::string blocking_support_slot_keys = "none";
+    std::string blocking_incident_id = "none";
+    std::string blocking_incident_member_slots = "none";
+  };
+  std::unordered_map<gtsam::FactorIndex, CbsSummaryCoveredCrossingReplayMetadata>
+      cbs_phase2_summary_covered_crossing_one_epoch_replay_queue_;
+  std::unordered_map<gtsam::FactorIndex, CbsSummaryCoveredCrossingReplayMetadata>
+      cbs_phase2_direct_local_pending_one_epoch_replay_queue_;
   bool cbs_phase2_delete_slots_suppression_one_shot_used_ = false;
   bool cbs_first_bad_epoch_snapshot_logged_ = false;
+  bool cbs_heart_first_real_lag_compact_diag_emitted_ = false;
+  bool cbs_first_bad_epoch_seen_ = false;
+  FrameId cbs_first_bad_epoch_kf_id_ = std::numeric_limits<FrameId>::max();
+  size_t cbs_map_at_count_so_far_ = 0u;
+  size_t cbs_bpsam_ilsretry_count_so_far_ = 0u;
+  size_t cbs_recovery_count_so_far_ = 0u;
+  size_t cbs_timestamp_map_pruned_count_last_epoch_ = 0u;
+  Timestamp cbs_oldest_active_pose_timestamp_last_epoch_ = -1;
+  Timestamp cbs_newest_active_pose_timestamp_last_epoch_ = -1;
   bool cbs_have_last_clean_epoch_snapshot_ = false;
   std::string cbs_last_clean_epoch_snapshot_;
   std::string cbs_last_clean_primary_packet_ab_snapshot_;
