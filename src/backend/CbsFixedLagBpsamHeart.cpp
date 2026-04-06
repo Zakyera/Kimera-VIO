@@ -980,6 +980,35 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
   size_t strict_crossing_candidate_slots_count = 0u;
   size_t strict_crossing_selected_slots_count = 0u;
   size_t strict_crossing_dropped_slots_count = 0u;
+  std::unordered_set<gtsam::FactorIndex> boundary_crossing_factor_slots_set;
+  std::unordered_set<gtsam::FactorIndex> local_crossing_factor_slots_set;
+  std::unordered_set<gtsam::FactorIndex>
+      nonbelief_local_crossing_factor_slots_set;
+  std::unordered_set<gtsam::FactorIndex>
+      selected_local_nonbelief_crossing_factor_slots_set;
+  size_t stale_state_keys_count = 0u;
+  size_t kept_state_keys_count = 0u;
+  size_t stale_pose_keys_count = 0u;
+  size_t kept_pose_keys_count = 0u;
+  size_t stale_local_factor_slots_count = 0u;
+  size_t candidate_factors_touching_stale_count = 0u;
+  size_t candidate_factors_touching_kept_count = 0u;
+  size_t candidate_factors_touching_both_stale_and_kept_count = 0u;
+  std::unordered_set<gtsam::FactorIndex>
+      boundary_candidate_crossing_factor_slots_raw_set;
+  size_t rejected_candidate_due_to_no_stale_incidence_count = 0u;
+  size_t rejected_candidate_due_to_no_kept_incidence_count = 0u;
+  size_t rejected_candidate_due_to_nonlocal_ownership_count = 0u;
+  size_t rejected_candidate_due_to_belief_factor_count = 0u;
+  size_t rejected_candidate_due_to_missing_factor_ptr_count = 0u;
+  long long first_boundary_candidate_rejected_slot = -1;
+  std::string first_boundary_candidate_rejected_slot_class = "none";
+  std::string first_boundary_candidate_rejected_slot_keys = "none";
+  std::string first_boundary_candidate_rejected_reason = "none";
+  size_t rejected_crossing_due_to_nonlocal_count = 0u;
+  size_t rejected_crossing_due_to_belief_count = 0u;
+  size_t rejected_crossing_due_to_missing_estimate_count = 0u;
+  size_t rejected_crossing_due_to_target_mismatch_count = 0u;
   long long strict_first_dropped_crossing_slot = -1;
   std::string strict_first_dropped_crossing_slot_class = "none";
   std::string strict_first_dropped_crossing_slot_keys = "none";
@@ -1844,6 +1873,73 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
           strict_crossing_selected_slots_count;
       stats->summary_crossing_dropped_slots_count =
           strict_crossing_dropped_slots_count;
+      stats->boundary_crossing_factor_slots_count =
+          boundary_crossing_factor_slots_set.size();
+      stats->boundary_crossing_factor_slots_first_few = format_slots_set_preview(
+          boundary_crossing_factor_slots_set, 8u);
+      stats->local_crossing_factor_slots_count =
+          local_crossing_factor_slots_set.size();
+      stats->local_crossing_factor_slots_first_few = format_slots_set_preview(
+          local_crossing_factor_slots_set, 8u);
+      stats->nonbelief_local_crossing_factor_slots_count =
+          nonbelief_local_crossing_factor_slots_set.size();
+      stats->nonbelief_local_crossing_factor_slots_first_few =
+          format_slots_set_preview(nonbelief_local_crossing_factor_slots_set,
+                                   8u);
+      stats->selected_local_nonbelief_crossing_factor_slots_count =
+          selected_local_nonbelief_crossing_factor_slots_set.size();
+      stats->selected_local_nonbelief_crossing_factor_slots_first_few =
+          format_slots_set_preview(
+              selected_local_nonbelief_crossing_factor_slots_set, 8u);
+      stats->stale_state_keys_count = stale_state_keys_count;
+      stats->kept_state_keys_count = kept_state_keys_count;
+      stats->stale_pose_keys_count = stale_pose_keys_count;
+      stats->kept_pose_keys_count = kept_pose_keys_count;
+      stats->stale_local_factor_slots_count = stale_local_factor_slots_count;
+      stats->candidate_factors_touching_stale_count =
+          candidate_factors_touching_stale_count;
+      stats->candidate_factors_touching_kept_count =
+          candidate_factors_touching_kept_count;
+      stats->candidate_factors_touching_both_stale_and_kept_count =
+          candidate_factors_touching_both_stale_and_kept_count;
+      stats->boundary_candidate_crossing_factor_slots_count_raw =
+          boundary_candidate_crossing_factor_slots_raw_set.size();
+      stats->boundary_candidate_crossing_factor_slots_first_few_raw =
+          format_slots_set_preview(boundary_candidate_crossing_factor_slots_raw_set,
+                                   8u);
+      stats->rejected_candidate_due_to_no_stale_incidence_count =
+          rejected_candidate_due_to_no_stale_incidence_count;
+      stats->rejected_candidate_due_to_no_kept_incidence_count =
+          rejected_candidate_due_to_no_kept_incidence_count;
+      stats->rejected_candidate_due_to_nonlocal_ownership_count =
+          rejected_candidate_due_to_nonlocal_ownership_count;
+      stats->rejected_candidate_due_to_belief_factor_count =
+          rejected_candidate_due_to_belief_factor_count;
+      stats->rejected_candidate_due_to_missing_factor_ptr_count =
+          rejected_candidate_due_to_missing_factor_ptr_count;
+      stats->first_boundary_candidate_rejected_slot =
+          first_boundary_candidate_rejected_slot;
+      stats->first_boundary_candidate_rejected_slot_class =
+          first_boundary_candidate_rejected_slot_class;
+      stats->first_boundary_candidate_rejected_slot_keys =
+          first_boundary_candidate_rejected_slot_keys;
+      stats->first_boundary_candidate_rejected_reason =
+          first_boundary_candidate_rejected_reason;
+      stats->rejected_crossing_due_to_nonlocal_count =
+          rejected_crossing_due_to_nonlocal_count;
+      stats->rejected_crossing_due_to_belief_count =
+          rejected_crossing_due_to_belief_count;
+      stats->rejected_crossing_due_to_missing_estimate_count =
+          rejected_crossing_due_to_missing_estimate_count;
+      stats->rejected_crossing_due_to_target_mismatch_count =
+          rejected_crossing_due_to_target_mismatch_count;
+      stats->first_rejected_crossing_slot = strict_first_dropped_crossing_slot;
+      stats->first_rejected_crossing_slot_class =
+          strict_first_dropped_crossing_slot_class;
+      stats->first_rejected_crossing_slot_keys =
+          strict_first_dropped_crossing_slot_keys;
+      stats->first_rejected_crossing_reason =
+          strict_first_dropped_crossing_slot_reason;
       stats->summary_first_dropped_crossing_slot =
           strict_first_dropped_crossing_slot;
       stats->summary_first_dropped_crossing_slot_class =
@@ -2092,6 +2188,20 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
         }
         return true;
       };
+  auto noteBoundaryCandidateRejected =
+      [&](const gtsam::FactorIndex slot,
+          const gtsam::NonlinearFactor::shared_ptr& factor,
+          const std::string& reason) {
+        if (first_boundary_candidate_rejected_slot >= 0) {
+          return;
+        }
+        first_boundary_candidate_rejected_slot = static_cast<long long>(slot);
+        first_boundary_candidate_rejected_slot_class =
+            classifyFactorClassForDiag(factor);
+        first_boundary_candidate_rejected_slot_keys =
+            formatFactorKeysForDiag(factor);
+        first_boundary_candidate_rejected_reason = reason;
+      };
   const std::unordered_set<Key> orphan_pruned_keys = [&]() {
     std::unordered_set<Key> keys;
     keys.insert(plan->orphan_prune.orphan_robot_keys.begin(),
@@ -2173,6 +2283,17 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
       strict_crossing_candidate_set.end());
   std::sort(strict_crossing_candidates.begin(), strict_crossing_candidates.end());
   strict_crossing_candidate_slots_count = strict_crossing_candidates.size();
+  boundary_crossing_factor_slots_set.clear();
+  boundary_crossing_factor_slots_set.insert(
+      plan->boundary_candidates.crossing_factor_slots.begin(),
+      plan->boundary_candidates.crossing_factor_slots.end());
+  local_crossing_factor_slots_set.clear();
+  nonbelief_local_crossing_factor_slots_set.clear();
+  selected_local_nonbelief_crossing_factor_slots_set.clear();
+  rejected_crossing_due_to_nonlocal_count = 0u;
+  rejected_crossing_due_to_belief_count = 0u;
+  rejected_crossing_due_to_missing_estimate_count = 0u;
+  rejected_crossing_due_to_target_mismatch_count = 0u;
   stale_local_factor_slot_set.clear();
   stale_local_factor_slot_set.insert(
       plan->stale_eviction.stale_local_factor_slots.begin(),
@@ -2188,6 +2309,88 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
   stale_local_key_set.clear();
   stale_local_key_set.insert(plan->stale_eviction.stale_local_keys.begin(),
                              plan->stale_eviction.stale_local_keys.end());
+  stale_state_keys_count = stale_local_key_set.size();
+  stale_pose_keys_count = 0u;
+  for (const Key key : stale_local_key_set) {
+    if (isLocalPoseKey(key)) {
+      ++stale_pose_keys_count;
+    }
+  }
+  kept_state_keys_count = 0u;
+  kept_pose_keys_count = 0u;
+  for (const Key key : plan->local_ownership.all_local_state_keys) {
+    if (stale_local_key_set.count(key) > 0u) {
+      continue;
+    }
+    ++kept_state_keys_count;
+    if (isLocalPoseKey(key)) {
+      ++kept_pose_keys_count;
+    }
+  }
+  stale_local_factor_slots_count = stale_local_factor_slot_set.size();
+  candidate_factors_touching_stale_count = 0u;
+  candidate_factors_touching_kept_count = 0u;
+  candidate_factors_touching_both_stale_and_kept_count = 0u;
+  boundary_candidate_crossing_factor_slots_raw_set.clear();
+  rejected_candidate_due_to_no_stale_incidence_count = 0u;
+  rejected_candidate_due_to_no_kept_incidence_count = 0u;
+  rejected_candidate_due_to_nonlocal_ownership_count = 0u;
+  rejected_candidate_due_to_belief_factor_count = 0u;
+  rejected_candidate_due_to_missing_factor_ptr_count = 0u;
+  for (const gtsam::FactorIndex slot : stale_local_factor_slot_set) {
+    if (!factorExists(graph, slot)) {
+      ++rejected_candidate_due_to_missing_factor_ptr_count;
+      noteBoundaryCandidateRejected(slot, nullptr, "missing_factor_ptr");
+      continue;
+    }
+    const auto factor = graph.at(slot);
+    if (!factor) {
+      ++rejected_candidate_due_to_missing_factor_ptr_count;
+      noteBoundaryCandidateRejected(slot, factor, "missing_factor_ptr");
+      continue;
+    }
+
+    bool touches_stale = false;
+    bool touches_kept = false;
+    bool all_local = true;
+    for (const Key key : factor->keys()) {
+      const bool key_stale = stale_local_key_set.count(key) > 0u;
+      touches_stale = touches_stale || key_stale;
+      touches_kept = touches_kept || !key_stale;
+      if (!isLocalStateKey(key)) {
+        all_local = false;
+      }
+    }
+    if (touches_stale) {
+      ++candidate_factors_touching_stale_count;
+    }
+    if (touches_kept) {
+      ++candidate_factors_touching_kept_count;
+    }
+    if (touches_stale && touches_kept) {
+      ++candidate_factors_touching_both_stale_and_kept_count;
+      boundary_candidate_crossing_factor_slots_raw_set.insert(slot);
+    } else if (!touches_stale) {
+      ++rejected_candidate_due_to_no_stale_incidence_count;
+      noteBoundaryCandidateRejected(slot, factor, "no_stale_incidence");
+      continue;
+    } else {
+      ++rejected_candidate_due_to_no_kept_incidence_count;
+      noteBoundaryCandidateRejected(slot, factor, "no_kept_incidence");
+      continue;
+    }
+
+    if (isBeliefFactor(factor)) {
+      ++rejected_candidate_due_to_belief_factor_count;
+      noteBoundaryCandidateRejected(slot, factor, "belief_factor");
+      continue;
+    }
+    if (!all_local) {
+      ++rejected_candidate_due_to_nonlocal_ownership_count;
+      noteBoundaryCandidateRejected(slot, factor, "nonlocal_ownership");
+      continue;
+    }
+  }
 
   // Split lag-derived slots into:
   // 1) summary-required local crossing
@@ -2553,6 +2756,16 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
       [&](const gtsam::FactorIndex slot,
           const gtsam::NonlinearFactor::shared_ptr& factor,
           const std::string& reason) {
+        if (reason == "non_local_factor_not_supported") {
+          ++rejected_crossing_due_to_nonlocal_count;
+        } else if (reason == "belief_factor_not_supported") {
+          ++rejected_crossing_due_to_belief_count;
+        } else if (reason == "factor_missing_estimate_key") {
+          ++rejected_crossing_due_to_missing_estimate_count;
+        } else if (reason == "crossing_slot_not_stale_local" ||
+                   reason == "crossing_slot_not_in_summary_required_set") {
+          ++rejected_crossing_due_to_target_mismatch_count;
+        }
         ++strict_crossing_dropped_slots_count;
         if (strict_first_dropped_crossing_slot < 0) {
           strict_first_dropped_crossing_slot = static_cast<long long>(slot);
@@ -2599,6 +2812,10 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
         all_keys_have_estimate = false;
       }
     }
+    if (all_local) {
+      local_crossing_factor_slots_set.insert(slot);
+      nonbelief_local_crossing_factor_slots_set.insert(slot);
+    }
     if (!all_local) {
       noteStrictDroppedCrossing(slot, factor, "non_local_factor_not_supported");
       continue;
@@ -2609,6 +2826,7 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
     }
 
     strict_selected_slots.push_back(slot);
+    selected_local_nonbelief_crossing_factor_slots_set.insert(slot);
     strict_removed_graph.push_back(factor);
     for (const Key key : factor->keys()) {
       strict_selected_keys_set.insert(key);
@@ -2629,7 +2847,14 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
   }
 
   std::string strict_failed_reason = "none";
-  if (strict_selected_slots.empty()) {
+  if (strict_crossing_candidates.empty() && requested_targets.empty()) {
+    // No crossing requested for this epoch: this is a valid no-op summary case,
+    // not a materialization failure.
+    target_coherence_ok = true;
+    summary_selected_slots_for_coverage.clear();
+    refreshDirectLocalInternalClassification();
+    return finishWith(true, "no_crossing_requested", "none");
+  } else if (strict_selected_slots.empty()) {
     strict_failed_reason = "no_local_nonbelief_crossing_factors_selected";
   } else if (strict_realizable_targets.empty()) {
     strict_failed_reason = "no_realizable_local_crossing_targets";

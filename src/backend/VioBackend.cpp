@@ -11665,6 +11665,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     bool cbs_phase2_fresh_lag_remove_blocked_due_to_no_summary = false;
     size_t cbs_phase2_fresh_lag_remove_blocked_count = 0u;
     size_t cbs_phase2_fresh_lag_remove_applied_count = 0u;
+    size_t cbs_phase2_fresh_lag_candidates_before_filter_count = 0u;
+    size_t cbs_phase2_deferred_replay_candidates_before_filter_count = 0u;
     bool cbs_phase2_fresh_lag_anchor_prior_protection_fired = false;
     size_t cbs_phase2_fresh_lag_anchor_prior_blocked_count = 0u;
     std::string cbs_phase2_fresh_lag_anchor_prior_blocked_slots = "none";
@@ -11681,6 +11683,48 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
     size_t cbs_phase2_summary_crossing_candidate_slots_count = 0u;
     size_t cbs_phase2_summary_crossing_selected_slots_count = 0u;
     size_t cbs_phase2_summary_crossing_dropped_slots_count = 0u;
+    size_t cbs_phase2_boundary_crossing_factor_slots_count = 0u;
+    std::string cbs_phase2_boundary_crossing_factor_slots_first_few = "none";
+    size_t cbs_phase2_local_crossing_factor_slots_count = 0u;
+    std::string cbs_phase2_local_crossing_factor_slots_first_few = "none";
+    size_t cbs_phase2_nonbelief_local_crossing_factor_slots_count = 0u;
+    std::string cbs_phase2_nonbelief_local_crossing_factor_slots_first_few =
+        "none";
+    size_t cbs_phase2_selected_local_nonbelief_crossing_factor_slots_count =
+        0u;
+    std::string
+        cbs_phase2_selected_local_nonbelief_crossing_factor_slots_first_few =
+            "none";
+    size_t cbs_phase2_stale_state_keys_count = 0u;
+    size_t cbs_phase2_kept_state_keys_count = 0u;
+    size_t cbs_phase2_stale_pose_keys_count = 0u;
+    size_t cbs_phase2_kept_pose_keys_count = 0u;
+    size_t cbs_phase2_stale_local_factor_slots_count_for_discovery = 0u;
+    size_t cbs_phase2_candidate_factors_touching_stale_count = 0u;
+    size_t cbs_phase2_candidate_factors_touching_kept_count = 0u;
+    size_t cbs_phase2_candidate_factors_touching_both_stale_and_kept_count =
+        0u;
+    size_t cbs_phase2_boundary_candidate_crossing_factor_slots_count_raw = 0u;
+    std::string
+        cbs_phase2_boundary_candidate_crossing_factor_slots_first_few_raw =
+            "none";
+    size_t cbs_phase2_rejected_candidate_due_to_no_stale_incidence_count = 0u;
+    size_t cbs_phase2_rejected_candidate_due_to_no_kept_incidence_count = 0u;
+    size_t cbs_phase2_rejected_candidate_due_to_nonlocal_ownership_count = 0u;
+    size_t cbs_phase2_rejected_candidate_due_to_belief_factor_count = 0u;
+    size_t cbs_phase2_rejected_candidate_due_to_missing_factor_ptr_count = 0u;
+    long long cbs_phase2_first_boundary_candidate_rejected_slot = -1;
+    std::string cbs_phase2_first_boundary_candidate_rejected_slot_class = "none";
+    std::string cbs_phase2_first_boundary_candidate_rejected_slot_keys = "none";
+    std::string cbs_phase2_first_boundary_candidate_rejected_reason = "none";
+    size_t cbs_phase2_rejected_crossing_due_to_nonlocal_count = 0u;
+    size_t cbs_phase2_rejected_crossing_due_to_belief_count = 0u;
+    size_t cbs_phase2_rejected_crossing_due_to_missing_estimate_count = 0u;
+    size_t cbs_phase2_rejected_crossing_due_to_target_mismatch_count = 0u;
+    long long cbs_phase2_first_rejected_crossing_slot = -1;
+    std::string cbs_phase2_first_rejected_crossing_slot_class = "none";
+    std::string cbs_phase2_first_rejected_crossing_slot_keys = "none";
+    std::string cbs_phase2_first_rejected_crossing_reason = "none";
     long long cbs_phase2_summary_first_dropped_crossing_slot = -1;
     std::string cbs_phase2_summary_first_dropped_crossing_slot_class = "none";
     std::string cbs_phase2_summary_first_dropped_crossing_slot_keys = "none";
@@ -12799,6 +12843,87 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               phase2_stats.summary_crossing_selected_slots_count;
           cbs_phase2_summary_crossing_dropped_slots_count =
               phase2_stats.summary_crossing_dropped_slots_count;
+          cbs_phase2_boundary_crossing_factor_slots_count =
+              phase2_stats.boundary_crossing_factor_slots_count;
+          cbs_phase2_boundary_crossing_factor_slots_first_few =
+              sanitize_diag_token(
+                  phase2_stats.boundary_crossing_factor_slots_first_few);
+          cbs_phase2_local_crossing_factor_slots_count =
+              phase2_stats.local_crossing_factor_slots_count;
+          cbs_phase2_local_crossing_factor_slots_first_few =
+              sanitize_diag_token(
+                  phase2_stats.local_crossing_factor_slots_first_few);
+          cbs_phase2_nonbelief_local_crossing_factor_slots_count =
+              phase2_stats.nonbelief_local_crossing_factor_slots_count;
+          cbs_phase2_nonbelief_local_crossing_factor_slots_first_few =
+              sanitize_diag_token(
+                  phase2_stats
+                      .nonbelief_local_crossing_factor_slots_first_few);
+          cbs_phase2_selected_local_nonbelief_crossing_factor_slots_count =
+              phase2_stats.selected_local_nonbelief_crossing_factor_slots_count;
+          cbs_phase2_selected_local_nonbelief_crossing_factor_slots_first_few =
+              sanitize_diag_token(
+                  phase2_stats
+                      .selected_local_nonbelief_crossing_factor_slots_first_few);
+          cbs_phase2_stale_state_keys_count = phase2_stats.stale_state_keys_count;
+          cbs_phase2_kept_state_keys_count = phase2_stats.kept_state_keys_count;
+          cbs_phase2_stale_pose_keys_count = phase2_stats.stale_pose_keys_count;
+          cbs_phase2_kept_pose_keys_count = phase2_stats.kept_pose_keys_count;
+          cbs_phase2_stale_local_factor_slots_count_for_discovery =
+              phase2_stats.stale_local_factor_slots_count;
+          cbs_phase2_candidate_factors_touching_stale_count =
+              phase2_stats.candidate_factors_touching_stale_count;
+          cbs_phase2_candidate_factors_touching_kept_count =
+              phase2_stats.candidate_factors_touching_kept_count;
+          cbs_phase2_candidate_factors_touching_both_stale_and_kept_count =
+              phase2_stats
+                  .candidate_factors_touching_both_stale_and_kept_count;
+          cbs_phase2_boundary_candidate_crossing_factor_slots_count_raw =
+              phase2_stats.boundary_candidate_crossing_factor_slots_count_raw;
+          cbs_phase2_boundary_candidate_crossing_factor_slots_first_few_raw =
+              sanitize_diag_token(
+                  phase2_stats
+                      .boundary_candidate_crossing_factor_slots_first_few_raw);
+          cbs_phase2_rejected_candidate_due_to_no_stale_incidence_count =
+              phase2_stats
+                  .rejected_candidate_due_to_no_stale_incidence_count;
+          cbs_phase2_rejected_candidate_due_to_no_kept_incidence_count =
+              phase2_stats.rejected_candidate_due_to_no_kept_incidence_count;
+          cbs_phase2_rejected_candidate_due_to_nonlocal_ownership_count =
+              phase2_stats.rejected_candidate_due_to_nonlocal_ownership_count;
+          cbs_phase2_rejected_candidate_due_to_belief_factor_count =
+              phase2_stats.rejected_candidate_due_to_belief_factor_count;
+          cbs_phase2_rejected_candidate_due_to_missing_factor_ptr_count =
+              phase2_stats.rejected_candidate_due_to_missing_factor_ptr_count;
+          cbs_phase2_first_boundary_candidate_rejected_slot =
+              phase2_stats.first_boundary_candidate_rejected_slot;
+          cbs_phase2_first_boundary_candidate_rejected_slot_class =
+              sanitize_diag_token(
+                  phase2_stats.first_boundary_candidate_rejected_slot_class);
+          cbs_phase2_first_boundary_candidate_rejected_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats.first_boundary_candidate_rejected_slot_keys);
+          cbs_phase2_first_boundary_candidate_rejected_reason =
+              sanitize_diag_token(
+                  phase2_stats.first_boundary_candidate_rejected_reason);
+          cbs_phase2_rejected_crossing_due_to_nonlocal_count =
+              phase2_stats.rejected_crossing_due_to_nonlocal_count;
+          cbs_phase2_rejected_crossing_due_to_belief_count =
+              phase2_stats.rejected_crossing_due_to_belief_count;
+          cbs_phase2_rejected_crossing_due_to_missing_estimate_count =
+              phase2_stats.rejected_crossing_due_to_missing_estimate_count;
+          cbs_phase2_rejected_crossing_due_to_target_mismatch_count =
+              phase2_stats.rejected_crossing_due_to_target_mismatch_count;
+          cbs_phase2_first_rejected_crossing_slot =
+              phase2_stats.first_rejected_crossing_slot;
+          cbs_phase2_first_rejected_crossing_slot_class =
+              sanitize_diag_token(
+                  phase2_stats.first_rejected_crossing_slot_class);
+          cbs_phase2_first_rejected_crossing_slot_keys =
+              sanitize_diag_token(
+                  phase2_stats.first_rejected_crossing_slot_keys);
+          cbs_phase2_first_rejected_crossing_reason =
+              sanitize_diag_token(phase2_stats.first_rejected_crossing_reason);
           cbs_phase2_summary_first_dropped_crossing_slot =
               phase2_stats.summary_first_dropped_crossing_slot;
           cbs_phase2_summary_first_dropped_crossing_slot_class =
@@ -12908,6 +13033,58 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           cbs_phase2_expanded_veto_count = phase2_stats.expanded_veto_count;
           cbs_phase2_first_summary_failure_reason = sanitize_diag_token(
               phase2_stats.first_summary_failure_reason);
+          static bool lag_edge_crossing_selection_diag_emitted_once_global =
+              false;
+          const bool emit_lag_edge_crossing_selection_diag_global =
+              cbs_phase2_first_summary_failure_reason ==
+                  "no_local_nonbelief_crossing_factors_selected" &&
+              !lag_edge_crossing_selection_diag_emitted_once_global;
+          if (emit_lag_edge_crossing_selection_diag_global) {
+            std::cerr
+                << std::setprecision(12)
+                << "[CBS][LagEdgeCrossingSelectionDiag]"
+                << " curr_kf_id=" << curr_kf_id_
+                << " boundary_crossing_factor_slots_count="
+                << cbs_phase2_boundary_crossing_factor_slots_count
+                << " local_crossing_factor_slots_count="
+                << cbs_phase2_local_crossing_factor_slots_count
+                << " nonbelief_local_crossing_factor_slots_count="
+                << cbs_phase2_nonbelief_local_crossing_factor_slots_count
+                << " selected_local_nonbelief_crossing_factor_slots_count="
+                << cbs_phase2_selected_local_nonbelief_crossing_factor_slots_count
+                << " rejected_crossing_due_to_nonlocal_count="
+                << cbs_phase2_rejected_crossing_due_to_nonlocal_count
+                << " rejected_crossing_due_to_belief_count="
+                << cbs_phase2_rejected_crossing_due_to_belief_count
+                << " rejected_crossing_due_to_missing_estimate_count="
+                << cbs_phase2_rejected_crossing_due_to_missing_estimate_count
+                << " rejected_crossing_due_to_target_mismatch_count="
+                << cbs_phase2_rejected_crossing_due_to_target_mismatch_count
+                << " first_rejected_crossing_slot="
+                << cbs_phase2_first_rejected_crossing_slot
+                << " first_rejected_crossing_slot_class="
+                << sanitize_diag_token(
+                       cbs_phase2_first_rejected_crossing_slot_class)
+                << " first_rejected_crossing_slot_keys="
+                << sanitize_diag_token(
+                       cbs_phase2_first_rejected_crossing_slot_keys)
+                << " first_rejected_crossing_reason="
+                << sanitize_diag_token(cbs_phase2_first_rejected_crossing_reason)
+                << " boundary_crossing_factor_slots_first_few="
+                << sanitize_diag_token(
+                       cbs_phase2_boundary_crossing_factor_slots_first_few)
+                << " local_crossing_factor_slots_first_few="
+                << sanitize_diag_token(cbs_phase2_local_crossing_factor_slots_first_few)
+                << " nonbelief_local_crossing_factor_slots_first_few="
+                << sanitize_diag_token(
+                       cbs_phase2_nonbelief_local_crossing_factor_slots_first_few)
+                << " selected_local_nonbelief_crossing_factor_slots_first_few="
+                << sanitize_diag_token(
+                       cbs_phase2_selected_local_nonbelief_crossing_factor_slots_first_few)
+                << " selection_mode=strict_local_nonbelief_crossing_funnel"
+                << std::endl;
+            lag_edge_crossing_selection_diag_emitted_once_global = true;
+          }
           cbs_phase2_first_dropped_target_reason = sanitize_diag_token(
               phase2_stats.first_dropped_target_reason);
           cbs_phase2_summary_remove_coverage_mode = sanitize_diag_token(
@@ -14148,6 +14325,10 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           for (const size_t slot : deferred_replay_slot_set) {
             fresh_lag_slot_set.erase(slot);
           }
+          cbs_phase2_fresh_lag_candidates_before_filter_count =
+              fresh_lag_slot_set.size();
+          cbs_phase2_deferred_replay_candidates_before_filter_count =
+              deferred_replay_slot_set.size();
           gtsam::FactorIndices blocked_fresh_structural_slots;
           blocked_fresh_structural_slots.reserve(fresh_lag_slot_set.size());
           std::vector<std::string> blocked_fresh_structural_keys;
@@ -16520,6 +16701,20 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           }
           return std::string("before_update_call");
         };
+    const auto classify_precise_exception_origin_mode =
+        [&](const std::string& phase_label) {
+          if (phase_label.find("remove_slot_exists_check") != std::string::npos ||
+              phase_label.find("missing_key_packet_skip") != std::string::npos) {
+            return std::string("remove_slot_translation_or_packet_assembly");
+          }
+          if (phase_label == "estimate_readback") {
+            return std::string("estimate_readback_post_update");
+          }
+          if (phase_label.find("bpsam_update_call") != std::string::npos) {
+            return std::string("inside_bpsam_update_call");
+          }
+          return std::string("before_bpsam_update_call");
+        };
 
     const auto format_compact_remove_type_counts =
         [&](const ForensicFactorTypeCounts& counts) {
@@ -17580,6 +17775,28 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           static std::string
               cbs_phase2_two_stage_first_bad_epoch_stage_persistent = "none";
           std::string cbs_two_stage_current_update_stage = "none";
+          bool stage_a_preflight_skip_for_origin_diag = false;
+          bool stage_b_continued_after_stage_a_skip_for_origin_diag = false;
+          size_t stage_b_factor_count_for_origin_diag = 0u;
+          size_t stage_b_value_count_for_origin_diag = 0u;
+          size_t stage_b_remove_count_for_origin_diag = 0u;
+          std::string summary_failure_reason_exact_for_origin_diag = "none";
+          static bool first_out_of_range_origin_diag_emitted_once = false;
+          static bool first_map_at_after_stage_b_continuation_diag_emitted_once =
+              false;
+          static bool first_stage_b_out_of_range_origin_diag_emitted_once =
+              false;
+          static bool first_stage_b_retry_map_at_diag_emitted_once = false;
+          static bool first_stage_a_ils_origin_diag_emitted_once = false;
+          static bool first_stage_a_ils_packet_contract_diag_emitted_once = false;
+          static bool stage_b_continuation_seen_once = false;
+          std::string two_stage_packet_shape_mode_diag = "single_packet_mode";
+          size_t two_stage_direct_local_stage_a_packet_compatible_count_diag = 0u;
+          std::string two_stage_activation_reason_diag = "none";
+          std::string two_stage_non_activation_reason_diag = "none";
+          bool two_stage_forced_active_by_summary_gate_diag = false;
+          bool single_packet_contract_preferred_before_override_diag = false;
+          std::string two_stage_activation_override_reason_diag = "none";
 
           try {
             // zy Step 40f
@@ -17631,6 +17848,15 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
             cbs_phase2_stage_b_first_bad_epoch_stage =
                 cbs_phase2_two_stage_first_bad_epoch_stage_persistent;
+            if (curr_kf_id_ == 0u && !cbs_first_bad_epoch_seen_) {
+              first_out_of_range_origin_diag_emitted_once = false;
+              first_map_at_after_stage_b_continuation_diag_emitted_once = false;
+              first_stage_b_out_of_range_origin_diag_emitted_once = false;
+              first_stage_b_retry_map_at_diag_emitted_once = false;
+              first_stage_a_ils_origin_diag_emitted_once = false;
+              first_stage_a_ils_packet_contract_diag_emitted_once = false;
+              stage_b_continuation_seen_once = false;
+            }
             cbs_two_stage_current_update_stage = "single_packet_update";
             const auto count_nonnull_factors =
                 [](const gtsam::NonlinearFactorGraph& graph) {
@@ -17671,14 +17897,61 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 enable_remove_factor_indices &&
                 cbs_use_phase2_summary_prior_bridge &&
                 one_epoch_replay_state_nonempty;
+            const bool summary_plan_exists_for_two_stage_override =
+                cbs_phase2_summary_attempted && phase2_plan_ready;
+            const bool summary_backed_two_stage_epoch_plausibly_eligible =
+                summary_plan_exists_for_two_stage_override &&
+                (cbs_phase2_summary_factor_count_emitted > 0u ||
+                 cbs_phase2_summary_covered_crossing_slots > 0u ||
+                 cbs_phase2_summary_crossing_replay_requested_count > 0u ||
+                 cbs_phase2_directly_removable_local_internal_candidate_slots >
+                     0u);
+            const bool single_packet_contract_preferred_before_override =
+                !enable_remove_factor_indices ||
+                !cbs_use_phase2_summary_prior_bridge ||
+                (!two_stage_requested_flag &&
+                 !defer_summary_crossing_one_epoch_requested &&
+                 cbs_phase2_summary_crossing_replay_requested_count == 0u);
+            const bool two_stage_forced_active_by_summary_gate =
+                single_packet_contract_preferred_before_override &&
+                summary_backed_two_stage_epoch_plausibly_eligible;
+            single_packet_contract_preferred_before_override_diag =
+                single_packet_contract_preferred_before_override;
+            two_stage_forced_active_by_summary_gate_diag =
+                two_stage_forced_active_by_summary_gate;
+            if (two_stage_forced_active_by_summary_gate) {
+              two_stage_activation_override_reason_diag =
+                  "summary_plan_exists_with_summary_or_crossing_or_replay_or_direct_local_candidates";
+            } else {
+              two_stage_activation_override_reason_diag = "none";
+            }
             cbs_phase2_one_epoch_replay_mode_forced_two_stage =
                 two_stage_mode_requested_by_one_epoch_replay &&
                 !two_stage_requested_by_split_config;
             cbs_phase2_two_stage_requested =
                 two_stage_requested_by_split_config ||
-                two_stage_mode_requested_by_one_epoch_replay;
+                two_stage_mode_requested_by_one_epoch_replay ||
+                two_stage_forced_active_by_summary_gate;
             cbs_phase2_two_stage_summary_crossing_mode =
                 cbs_phase2_two_stage_requested;
+            if (cbs_phase2_two_stage_requested) {
+              if (two_stage_requested_by_split_config &&
+                  two_stage_mode_requested_by_one_epoch_replay) {
+                two_stage_activation_reason_diag = "split_and_replay_requested";
+              } else if (two_stage_forced_active_by_summary_gate) {
+                two_stage_activation_reason_diag =
+                    "summary_backed_activation_override";
+              } else if (two_stage_requested_by_split_config) {
+                two_stage_activation_reason_diag =
+                    "split_summary_covered_crossing_requested";
+              } else if (two_stage_mode_requested_by_one_epoch_replay) {
+                two_stage_activation_reason_diag = "replay_requested";
+              } else {
+                two_stage_activation_reason_diag = "other_exact_reason";
+              }
+            } else {
+              two_stage_activation_reason_diag = "none";
+            }
             cbs_phase2_stage_a_summary_only_mode =
                 (stage_a_summary_only_requested ||
                  defer_summary_crossing_one_epoch_requested) &&
@@ -20647,6 +20920,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 replay_valid_slots_for_stage_a.size();
 
             bool remove_update_attempted_this_attempt = false;
+            bool single_packet_fallback_preflight_skipped = false;
             if (cbs_phase2_two_stage_summary_crossing_mode) {
               cbs_phase2_two_stage_effective = true;
               cbs::BPSAM::UpdateParams update_a_params = cbs_first_update_params;
@@ -21549,6 +21823,10 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     stage_a_direct_local_packet_compatible_slots.size();
                 stage_a_direct_local_packet_incompatible_count =
                     stage_a_direct_local_packet_incompatible_slots.size();
+                two_stage_direct_local_stage_a_packet_compatible_count_diag =
+                    stage_a_direct_local_packet_compatible_count;
+                two_stage_packet_shape_mode_diag =
+                    stage_a_direct_local_packet_shape_mode;
                 if (stage_a_direct_local_packet_incompatible_count > 0u) {
                   stage_a_direct_local_packet_incompatibility_reason =
                       "direct_local_stage_a_packet_shape_incompatible";
@@ -21571,6 +21849,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               } else {
                 stage_a_direct_local_packet_shape_mode =
                     "no_direct_local_removable_candidates";
+                two_stage_packet_shape_mode_diag =
+                    stage_a_direct_local_packet_shape_mode;
               }
 
               update_a_params.removeFactorIndices = update_a_remove_slots;
@@ -21601,6 +21881,132 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               if (cbs_phase2_stage_a_zero_remove_first_boundary_epoch_effective) {
                 update_a_params.removeFactorIndices.clear();
                 stage_a_zero_remove_boundary_diag_emitted_once = true;
+              }
+              const size_t original_stage_a_remove_count_before_sanitization =
+                  update_a_params.removeFactorIndices.size();
+              size_t sanitized_stage_a_remove_count =
+                  original_stage_a_remove_count_before_sanitization;
+              size_t stage_a_remove_sanitization_dropped_missing_slot_count = 0u;
+              long long stage_a_remove_sanitization_first_dropped_slot = -1;
+              std::string stage_a_remove_sanitization_first_dropped_slot_class =
+                  "none";
+              std::string stage_a_remove_sanitization_first_dropped_slot_keys =
+                  "none";
+              std::unordered_set<size_t>
+                  stage_a_direct_local_packet_compatible_slots_set_for_sanitization(
+                      stage_a_direct_local_packet_compatible_slots.begin(),
+                      stage_a_direct_local_packet_compatible_slots.end());
+              if (!update_a_params.removeFactorIndices.empty()) {
+                const auto& sanitization_factors = cbs_optimizer_->getFactorsUnsafe();
+                gtsam::FactorIndices sanitized_stage_a_remove_slots;
+                sanitized_stage_a_remove_slots.reserve(
+                    update_a_params.removeFactorIndices.size());
+                std::unordered_set<size_t> dedupe_sanitized_slots;
+                dedupe_sanitized_slots.reserve(
+                    update_a_params.removeFactorIndices.size());
+                for (const size_t slot : update_a_params.removeFactorIndices) {
+                  const bool slot_live = sanitization_factors.exists(slot) &&
+                                         sanitization_factors.at(slot);
+                  const bool slot_packet_valid =
+                      cbs_phase2_lag_apply_summary_covered_crossing_slots_set.count(
+                          slot) > 0u ||
+                      stage_a_direct_local_packet_compatible_slots_set_for_sanitization
+                              .count(slot) > 0u;
+                  const bool keep_slot =
+                      slot_live && slot_packet_valid &&
+                      dedupe_sanitized_slots.insert(slot).second;
+                  if (keep_slot) {
+                    sanitized_stage_a_remove_slots.push_back(slot);
+                    continue;
+                  }
+                  ++stage_a_remove_sanitization_dropped_missing_slot_count;
+                  if (stage_a_remove_sanitization_first_dropped_slot < 0) {
+                    stage_a_remove_sanitization_first_dropped_slot =
+                        static_cast<long long>(slot);
+                    if (slot_live) {
+                      stage_a_remove_sanitization_first_dropped_slot_class =
+                          sanitize_forensic_token(
+                              classify_forensic_remove_factor_class(
+                                  sanitization_factors.at(slot)));
+                      stage_a_remove_sanitization_first_dropped_slot_keys =
+                          sanitize_forensic_token(format_factor_keys_for_slot(
+                              sanitization_factors, slot));
+                    } else {
+                      const auto metadata_it =
+                          cbs_phase2_summary_covered_crossing_replay_metadata_map.find(
+                              slot);
+                      if (metadata_it !=
+                              cbs_phase2_summary_covered_crossing_replay_metadata_map
+                                  .end() &&
+                          !metadata_it->second.factor_class.empty()) {
+                        stage_a_remove_sanitization_first_dropped_slot_class =
+                            sanitize_forensic_token(
+                                metadata_it->second.factor_class);
+                        stage_a_remove_sanitization_first_dropped_slot_keys =
+                            sanitize_forensic_token(metadata_it->second.factor_keys);
+                      } else {
+                        stage_a_remove_sanitization_first_dropped_slot_class =
+                            "missing_slot";
+                        stage_a_remove_sanitization_first_dropped_slot_keys = "none";
+                      }
+                    }
+                  }
+                }
+                update_a_params.removeFactorIndices.swap(
+                    sanitized_stage_a_remove_slots);
+                sanitized_stage_a_remove_count =
+                    update_a_params.removeFactorIndices.size();
+              }
+              std::cerr << std::setprecision(12)
+                        << "[CBS][StageARemoveSanitizationDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " original_stage_a_remove_count="
+                        << original_stage_a_remove_count_before_sanitization
+                        << " sanitized_stage_a_remove_count="
+                        << sanitized_stage_a_remove_count
+                        << " dropped_missing_slot_count="
+                        << stage_a_remove_sanitization_dropped_missing_slot_count
+                        << " first_dropped_slot="
+                        << stage_a_remove_sanitization_first_dropped_slot
+                        << " first_dropped_slot_class="
+                        << sanitize_forensic_token(
+                               stage_a_remove_sanitization_first_dropped_slot_class)
+                        << " first_dropped_slot_keys="
+                        << sanitize_forensic_token(
+                               stage_a_remove_sanitization_first_dropped_slot_keys)
+                        << " sanitization_mode="
+                        << "stage_a_remove_slot_sanitize_drop_missing_or_nonlive_or_not_packet_valid"
+                        << std::endl;
+              const size_t stage_a_summary_factor_count_before_preflight =
+                  count_nonnull_factors(*stage_a_summary_factors_for_update_ptr);
+              const bool stage_a_support_poor_remove_heavy_shape_for_support_only_salvage =
+                  stage_a_summary_factor_count_before_preflight > 0u &&
+                  stage_a_root_bootstrap_support_factor_count == 0u &&
+                  stage_a_direct_local_packet_compatible_count == 0u &&
+                  !update_a_params.removeFactorIndices.empty();
+              if (stage_a_support_poor_remove_heavy_shape_for_support_only_salvage) {
+                const size_t stage_a_support_only_salvage_cleared_remove_count =
+                    update_a_params.removeFactorIndices.size();
+                update_a_params.removeFactorIndices.clear();
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageASupportOnlySalvageDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " packet_shape_mode="
+                    << sanitize_forensic_token(
+                           stage_a_direct_local_packet_shape_mode)
+                    << " summary_factor_count="
+                    << stage_a_summary_factor_count_before_preflight
+                    << " root_bootstrap_support_factor_count="
+                    << stage_a_root_bootstrap_support_factor_count
+                    << " stage_a_values_count=0"
+                    << " cleared_stage_a_remove_count="
+                    << stage_a_support_only_salvage_cleared_remove_count
+                    << " salvage_reason="
+                    << "stage_a_support_poor_remove_heavy_packet_after_remove_sanitization"
+                    << " salvage_mode="
+                    << "stage_a_support_only_salvage_clear_remove_then_run_stage_a_update"
+                    << std::endl;
               }
               remove_update_attempted_this_attempt =
                   !update_a_params.removeFactorIndices.empty() ||
@@ -22313,6 +22719,236 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               const bool stage_a_summary_singleton_no_values =
                   cbs_phase2_two_stage_update_a_summary_factor_count == 1u &&
                   stage_a_values.size() == 0u;
+              const bool stage_a_summary_only_missing_support_preflight_skip =
+                  stage_a_direct_local_packet_shape_mode ==
+                      "summary_only_without_direct_local_support" &&
+                  cbs_phase2_two_stage_update_a_summary_factor_count > 0u &&
+                  stage_a_root_bootstrap_support_factor_count == 0u &&
+                  stage_a_values.empty() &&
+                  stage_a_direct_local_packet_compatible_count == 0u;
+              const bool stage_a_zero_support_remove_only_preflight_skip =
+                  cbs_phase2_two_stage_update_a_summary_factor_count == 0u &&
+                  stage_a_root_bootstrap_support_factor_count == 0u &&
+                  stage_a_values.empty() &&
+                  !update_a_params.removeFactorIndices.empty();
+              const bool
+                  stage_a_support_poor_remove_heavy_after_sanitization_preflight_skip =
+                      cbs_phase2_two_stage_update_a_summary_factor_count > 0u &&
+                      stage_a_root_bootstrap_support_factor_count == 0u &&
+                      stage_a_values.empty() &&
+                      stage_a_direct_local_packet_compatible_count == 0u &&
+                      !update_a_params.removeFactorIndices.empty();
+              const bool stage_a_missing_support_preflight_skip =
+                  stage_a_summary_only_missing_support_preflight_skip ||
+                  stage_a_zero_support_remove_only_preflight_skip ||
+                  stage_a_support_poor_remove_heavy_after_sanitization_preflight_skip;
+              stage_a_preflight_skip_for_origin_diag =
+                  stage_a_missing_support_preflight_skip;
+              std::string stage_a_missing_support_preflight_skip_reason = "none";
+              std::string stage_a_missing_support_preflight_contract_mode =
+                  "none";
+              const bool fresh_lag_candidates_existed_before_filter =
+                  cbs_phase2_fresh_lag_candidates_before_filter_count > 0u;
+              const bool replay_valid_remove_candidates_existed_before_filter =
+                  !replay_valid_slots_for_stage_a.empty();
+              const bool summary_crossing_remove_candidates_existed_before_filter =
+                  summary_crossing_remove_candidate_count > 0u;
+              const bool summary_insertion_plan_exists =
+                  cbs_phase2_summary_attempted && phase2_plan_ready;
+              std::string summary_insertion_plan_state =
+                  "not_ready_or_not_attempted";
+              if (summary_insertion_plan_exists) {
+                if (cbs_phase2_build_only_no_inject) {
+                  summary_insertion_plan_state = "blocked_build_only_no_inject";
+                } else if (!cbs_phase2_summary_implemented_this_epoch) {
+                  summary_insertion_plan_state =
+                      "blocked_not_implemented_this_epoch";
+                } else if (cbs_phase2_summary_factor_count_emitted == 0u) {
+                  summary_insertion_plan_state =
+                      "empty_no_summary_factors_emitted";
+                } else if (!cbs_phase2_summary_injected_this_epoch) {
+                  summary_insertion_plan_state = "blocked_not_injected";
+                } else {
+                  summary_insertion_plan_state = "ready_injected";
+                }
+              }
+              const bool direct_local_stage_a_compatible_available_before_packet_assembly =
+                  stage_a_direct_local_packet_compatible_count > 0u;
+              const bool root_bootstrap_support_available_before_packet_assembly =
+                  stage_a_root_bootstrap_support_factor_count > 0u;
+              long long stage_a_support_first_direct_local_incompatible_slot = -1;
+              std::string stage_a_support_first_direct_local_incompatible_slot_class =
+                  "none";
+              std::string stage_a_support_first_direct_local_incompatible_slot_keys =
+                  "none";
+              std::string stage_a_support_first_direct_local_incompatible_reason =
+                  "none";
+              std::string stage_a_support_first_root_bootstrap_unavailable_reason =
+                  "none";
+              std::string stage_a_support_summary_failure_reason = "none";
+              long long stage_a_support_summary_failure_offending_slot = -1;
+              std::string stage_a_support_summary_failure_offending_key = "none";
+              std::string stage_a_support_summary_failure_exception_context =
+                  "none";
+              std::string stage_a_support_materialization_mode = "none";
+              if (!stage_a_direct_local_packet_incompatible_slots.empty()) {
+                const size_t first_slot =
+                    stage_a_direct_local_packet_incompatible_slots.front();
+                stage_a_support_first_direct_local_incompatible_slot =
+                    static_cast<long long>(first_slot);
+                const auto metadata_it =
+                    replay_direct_local_apply_candidates_metadata.find(first_slot);
+                if (metadata_it !=
+                        replay_direct_local_apply_candidates_metadata.end() &&
+                    !metadata_it->second.factor_class.empty()) {
+                  stage_a_support_first_direct_local_incompatible_slot_class =
+                      sanitize_forensic_token(metadata_it->second.factor_class);
+                  stage_a_support_first_direct_local_incompatible_slot_keys =
+                      sanitize_forensic_token(metadata_it->second.factor_keys);
+                  if (!metadata_it->second.pending_reason.empty() &&
+                      metadata_it->second.pending_reason != "none") {
+                    stage_a_support_first_direct_local_incompatible_reason =
+                        sanitize_forensic_token(metadata_it->second.pending_reason);
+                  }
+                } else {
+                  const auto& support_factors = cbs_optimizer_->getFactorsUnsafe();
+                  if (support_factors.exists(first_slot) &&
+                      support_factors.at(first_slot)) {
+                    stage_a_support_first_direct_local_incompatible_slot_class =
+                        sanitize_forensic_token(classify_forensic_remove_factor_class(
+                            support_factors.at(first_slot)));
+                    stage_a_support_first_direct_local_incompatible_slot_keys =
+                        sanitize_forensic_token(
+                            format_factor_keys_for_slot(support_factors, first_slot));
+                  }
+                }
+                if (stage_a_support_first_direct_local_incompatible_reason ==
+                        "none" &&
+                    stage_a_direct_local_packet_incompatibility_reason != "none") {
+                  stage_a_support_first_direct_local_incompatible_reason =
+                      sanitize_forensic_token(
+                          stage_a_direct_local_packet_incompatibility_reason);
+                }
+              } else if (stage_a_direct_local_packet_compatible_count == 0u) {
+                if (replay_direct_local_apply_candidate_slots.empty()) {
+                  if (cbs_phase2_directly_removable_local_internal_candidate_slots ==
+                      0u) {
+                    stage_a_support_first_direct_local_incompatible_reason =
+                        "no_direct_local_candidates_from_heart_partition";
+                  } else {
+                    stage_a_support_first_direct_local_incompatible_reason =
+                        "no_direct_local_replay_candidates_after_partition_routing";
+                  }
+                } else {
+                  const size_t first_slot =
+                      replay_direct_local_apply_candidate_slots.front();
+                  stage_a_support_first_direct_local_incompatible_slot =
+                      static_cast<long long>(first_slot);
+                  const auto metadata_it =
+                      replay_direct_local_apply_candidates_metadata.find(first_slot);
+                  if (metadata_it !=
+                          replay_direct_local_apply_candidates_metadata.end() &&
+                      !metadata_it->second.factor_class.empty()) {
+                    stage_a_support_first_direct_local_incompatible_slot_class =
+                        sanitize_forensic_token(metadata_it->second.factor_class);
+                    stage_a_support_first_direct_local_incompatible_slot_keys =
+                        sanitize_forensic_token(metadata_it->second.factor_keys);
+                  }
+                  stage_a_support_first_direct_local_incompatible_reason =
+                      "all_direct_local_candidates_incompatible_with_stage_a_packet";
+                }
+              }
+              if (stage_a_root_bootstrap_support_factor_count > 0u) {
+                stage_a_support_first_root_bootstrap_unavailable_reason =
+                    "support_materialized";
+              } else if (stage_a_root_bootstrap_first_failure_reason != "none") {
+                stage_a_support_first_root_bootstrap_unavailable_reason =
+                    sanitize_forensic_token(
+                        stage_a_root_bootstrap_first_failure_reason);
+              } else if (stage_a_root_blocked_component_member_slots.empty()) {
+                stage_a_support_first_root_bootstrap_unavailable_reason =
+                    "no_root_blocked_component_members_for_epoch";
+              } else if (stage_a_root_bootstrap_treatment_mode == "not_requested") {
+                stage_a_support_first_root_bootstrap_unavailable_reason =
+                    "root_bootstrap_treatment_not_requested";
+              } else {
+                stage_a_support_first_root_bootstrap_unavailable_reason =
+                    "root_bootstrap_support_not_materialized";
+              }
+              if (cbs_phase2_first_summary_failure_reason != "none") {
+                stage_a_support_summary_failure_reason =
+                    sanitize_forensic_token(cbs_phase2_first_summary_failure_reason);
+              } else if (cbs_phase2_first_expanded_summary_failure_reason != "none") {
+                stage_a_support_summary_failure_reason = sanitize_forensic_token(
+                    cbs_phase2_first_expanded_summary_failure_reason);
+              }
+              summary_failure_reason_exact_for_origin_diag =
+                  stage_a_support_summary_failure_reason;
+              if (cbs_phase2_first_expanded_bad_factor_slot >= 0) {
+                stage_a_support_summary_failure_offending_slot =
+                    cbs_phase2_first_expanded_bad_factor_slot;
+              }
+              if (cbs_phase2_first_expanded_bad_key >= 0) {
+                stage_a_support_summary_failure_offending_key =
+                    std::to_string(cbs_phase2_first_expanded_bad_key);
+              }
+              if (cbs_phase2_first_expanded_exception_context != "none") {
+                stage_a_support_summary_failure_exception_context =
+                    sanitize_forensic_token(
+                        cbs_phase2_first_expanded_exception_context);
+              }
+              if (stage_a_missing_support_preflight_skip) {
+                if (summary_insertion_plan_state == "ready_injected") {
+                  stage_a_support_materialization_mode =
+                      "ready_injected_zero_stage_a_support";
+                } else if (summary_insertion_plan_state ==
+                           "blocked_not_implemented_this_epoch") {
+                  stage_a_support_materialization_mode =
+                      "summary_plan_blocked_not_implemented";
+                } else {
+                  stage_a_support_materialization_mode = "missing_support_skip_other";
+                }
+              }
+              if (stage_a_summary_only_missing_support_preflight_skip) {
+                stage_a_missing_support_preflight_skip_reason =
+                    "summary_only_without_direct_local_support_preflight";
+                stage_a_missing_support_preflight_contract_mode =
+                    "stage_a_packet_contract_skip_defer_on_missing_support_preflight";
+              } else if (stage_a_zero_support_remove_only_preflight_skip) {
+                stage_a_missing_support_preflight_skip_reason =
+                    "zero_support_remove_only_preflight";
+                stage_a_missing_support_preflight_contract_mode =
+                    "stage_a_packet_contract_skip_defer_on_zero_support_remove_only_preflight";
+              } else if (stage_a_support_poor_remove_heavy_after_sanitization_preflight_skip) {
+                stage_a_missing_support_preflight_skip_reason =
+                    "stage_a_support_poor_remove_heavy_packet_after_remove_sanitization";
+                stage_a_missing_support_preflight_contract_mode =
+                    "stage_a_packet_contract_skip_defer_on_support_poor_remove_heavy_after_remove_sanitization";
+              }
+              std::cerr << std::setprecision(12)
+                        << "[CBS][StageASummaryOnlySupportPreflightDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " packet_shape_mode="
+                        << sanitize_forensic_token(
+                               stage_a_direct_local_packet_shape_mode)
+                        << " summary_factor_count="
+                        << cbs_phase2_two_stage_update_a_summary_factor_count
+                        << " root_bootstrap_support_factor_count="
+                        << stage_a_root_bootstrap_support_factor_count
+                        << " stage_a_values_count=" << stage_a_values.size()
+                        << " stage_a_remove_count="
+                        << update_a_params.removeFactorIndices.size()
+                        << " direct_local_stage_a_packet_compatible_count="
+                        << stage_a_direct_local_packet_compatible_count
+                        << " stage_a_preflight_skip="
+                        << (stage_a_missing_support_preflight_skip ? 1 : 0)
+                        << " stage_a_preflight_skip_reason="
+                        << sanitize_forensic_token(
+                               stage_a_missing_support_preflight_skip_reason)
+                        << " stage_a_preflight_contract_mode="
+                        << sanitize_forensic_token(
+                               stage_a_missing_support_preflight_contract_mode)
+                        << std::endl;
               const bool stage_a_boundary_underconstrained_guard =
                   !stage_a_boundary_support_guard_triggered_once &&
                   stage_a_boundary_advanced_this_epoch &&
@@ -22321,7 +22957,277 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   update_a_params.removeFactorIndices.empty() &&
                   replay_valid_slots_for_stage_a.empty() &&
                   stage_a_root_blocked_component_member_slots.empty();
-              if (stage_a_boundary_underconstrained_guard) {
+              static bool lag_boundary_candidate_discovery_diag_emitted_once =
+                  false;
+              const bool emit_lag_boundary_candidate_discovery_diag =
+                  !lag_boundary_candidate_discovery_diag_emitted_once &&
+                  cbs_phase2_boundary_crossing_factor_slots_count == 0u &&
+                  (cbs_phase2_summary_attempted ||
+                   stage_a_missing_support_preflight_skip);
+              if (emit_lag_boundary_candidate_discovery_diag) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][LagBoundaryCandidateDiscoveryDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " stale_state_keys_count="
+                    << cbs_phase2_stale_state_keys_count
+                    << " kept_state_keys_count="
+                    << cbs_phase2_kept_state_keys_count
+                    << " stale_pose_keys_count="
+                    << cbs_phase2_stale_pose_keys_count
+                    << " kept_pose_keys_count="
+                    << cbs_phase2_kept_pose_keys_count
+                    << " stale_local_factor_slots_count="
+                    << cbs_phase2_stale_local_factor_slots_count_for_discovery
+                    << " candidate_factors_touching_stale_count="
+                    << cbs_phase2_candidate_factors_touching_stale_count
+                    << " candidate_factors_touching_kept_count="
+                    << cbs_phase2_candidate_factors_touching_kept_count
+                    << " candidate_factors_touching_both_stale_and_kept_count="
+                    << cbs_phase2_candidate_factors_touching_both_stale_and_kept_count
+                    << " boundary_candidate_crossing_factor_slots_count_raw="
+                    << cbs_phase2_boundary_candidate_crossing_factor_slots_count_raw
+                    << " rejected_candidate_due_to_no_stale_incidence_count="
+                    << cbs_phase2_rejected_candidate_due_to_no_stale_incidence_count
+                    << " rejected_candidate_due_to_no_kept_incidence_count="
+                    << cbs_phase2_rejected_candidate_due_to_no_kept_incidence_count
+                    << " rejected_candidate_due_to_nonlocal_ownership_count="
+                    << cbs_phase2_rejected_candidate_due_to_nonlocal_ownership_count
+                    << " rejected_candidate_due_to_belief_factor_count="
+                    << cbs_phase2_rejected_candidate_due_to_belief_factor_count
+                    << " rejected_candidate_due_to_missing_factor_ptr_count="
+                    << cbs_phase2_rejected_candidate_due_to_missing_factor_ptr_count
+                    << " first_boundary_candidate_rejected_slot="
+                    << cbs_phase2_first_boundary_candidate_rejected_slot
+                    << " first_boundary_candidate_rejected_slot_class="
+                    << sanitize_forensic_token(
+                           cbs_phase2_first_boundary_candidate_rejected_slot_class)
+                    << " first_boundary_candidate_rejected_slot_keys="
+                    << sanitize_forensic_token(
+                           cbs_phase2_first_boundary_candidate_rejected_slot_keys)
+                    << " first_boundary_candidate_rejected_reason="
+                    << sanitize_forensic_token(
+                           cbs_phase2_first_boundary_candidate_rejected_reason)
+                    << " boundary_candidate_crossing_factor_slots_first_few_raw="
+                    << sanitize_forensic_token(
+                           cbs_phase2_boundary_candidate_crossing_factor_slots_first_few_raw)
+                    << " discovery_mode=upstream_boundary_candidate_discovery"
+                    << std::endl;
+                lag_boundary_candidate_discovery_diag_emitted_once = true;
+              }
+              static bool lag_edge_crossing_selection_diag_emitted_once = false;
+              const bool emit_lag_edge_crossing_selection_diag =
+                  (stage_a_support_summary_failure_reason ==
+                       "no_local_nonbelief_crossing_factors_selected" ||
+                   cbs_phase2_boundary_crossing_factor_slots_count == 0u) &&
+                  !lag_edge_crossing_selection_diag_emitted_once;
+              if (emit_lag_edge_crossing_selection_diag) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][LagEdgeCrossingSelectionDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " boundary_crossing_factor_slots_count="
+                    << cbs_phase2_boundary_crossing_factor_slots_count
+                    << " local_crossing_factor_slots_count="
+                    << cbs_phase2_local_crossing_factor_slots_count
+                    << " nonbelief_local_crossing_factor_slots_count="
+                    << cbs_phase2_nonbelief_local_crossing_factor_slots_count
+                    << " selected_local_nonbelief_crossing_factor_slots_count="
+                    << cbs_phase2_selected_local_nonbelief_crossing_factor_slots_count
+                    << " rejected_crossing_due_to_nonlocal_count="
+                    << cbs_phase2_rejected_crossing_due_to_nonlocal_count
+                    << " rejected_crossing_due_to_belief_count="
+                    << cbs_phase2_rejected_crossing_due_to_belief_count
+                    << " rejected_crossing_due_to_missing_estimate_count="
+                    << cbs_phase2_rejected_crossing_due_to_missing_estimate_count
+                    << " rejected_crossing_due_to_target_mismatch_count="
+                    << cbs_phase2_rejected_crossing_due_to_target_mismatch_count
+                    << " first_rejected_crossing_slot="
+                    << cbs_phase2_first_rejected_crossing_slot
+                    << " first_rejected_crossing_slot_class="
+                    << sanitize_forensic_token(
+                           cbs_phase2_first_rejected_crossing_slot_class)
+                    << " first_rejected_crossing_slot_keys="
+                    << sanitize_forensic_token(
+                           cbs_phase2_first_rejected_crossing_slot_keys)
+                    << " first_rejected_crossing_reason="
+                    << sanitize_forensic_token(
+                           cbs_phase2_first_rejected_crossing_reason)
+                    << " boundary_crossing_factor_slots_first_few="
+                    << sanitize_forensic_token(
+                           cbs_phase2_boundary_crossing_factor_slots_first_few)
+                    << " local_crossing_factor_slots_first_few="
+                    << sanitize_forensic_token(
+                           cbs_phase2_local_crossing_factor_slots_first_few)
+                    << " nonbelief_local_crossing_factor_slots_first_few="
+                    << sanitize_forensic_token(
+                           cbs_phase2_nonbelief_local_crossing_factor_slots_first_few)
+                    << " selected_local_nonbelief_crossing_factor_slots_first_few="
+                    << sanitize_forensic_token(
+                           cbs_phase2_selected_local_nonbelief_crossing_factor_slots_first_few)
+                    << " selection_mode=strict_local_nonbelief_crossing_funnel"
+                    << std::endl;
+                lag_edge_crossing_selection_diag_emitted_once = true;
+              }
+              if (stage_a_missing_support_preflight_skip) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageASkipSupportSourceDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " fresh_lag_candidates_before_filter_count="
+                    << cbs_phase2_fresh_lag_candidates_before_filter_count
+                    << " fresh_lag_candidates_existed_before_filter="
+                    << (fresh_lag_candidates_existed_before_filter ? 1 : 0)
+                    << " deferred_replay_candidates_before_filter_count="
+                    << cbs_phase2_deferred_replay_candidates_before_filter_count
+                    << " replay_valid_remove_candidates_before_filter_count="
+                    << replay_valid_slots_for_stage_a.size()
+                    << " replay_valid_remove_candidates_existed_before_filter="
+                    << (replay_valid_remove_candidates_existed_before_filter ? 1
+                                                                             : 0)
+                    << " summary_covered_crossing_remove_candidates_before_filter_count="
+                    << summary_crossing_remove_candidate_count
+                    << " summary_covered_crossing_remove_candidates_existed_before_filter="
+                    << (summary_crossing_remove_candidates_existed_before_filter
+                            ? 1
+                            : 0)
+                    << " summary_insertion_plan_exists="
+                    << (summary_insertion_plan_exists ? 1 : 0)
+                    << " summary_insertion_plan_state="
+                    << sanitize_forensic_token(summary_insertion_plan_state)
+                    << " summary_mode="
+                    << sanitize_forensic_token(cbs_phase2_summary_mode)
+                    << " summary_implemented_this_epoch="
+                    << (cbs_phase2_summary_implemented_this_epoch ? 1 : 0)
+                    << " summary_injected_this_epoch="
+                    << (cbs_phase2_summary_injected_this_epoch ? 1 : 0)
+                    << " summary_injection_required_for_lag_remove="
+                    << (cbs_phase2_summary_injection_required_for_lag_remove ? 1 : 0)
+                    << " summary_factor_count_emitted="
+                    << cbs_phase2_summary_factor_count_emitted
+                    << " direct_local_stage_a_packet_compatible_count="
+                    << stage_a_direct_local_packet_compatible_count
+                    << " direct_local_stage_a_compatible_available_before_packet_assembly="
+                    << (direct_local_stage_a_compatible_available_before_packet_assembly
+                            ? 1
+                            : 0)
+                    << " root_bootstrap_support_factor_count="
+                    << stage_a_root_bootstrap_support_factor_count
+                    << " root_bootstrap_support_available_before_packet_assembly="
+                    << (root_bootstrap_support_available_before_packet_assembly
+                            ? 1
+                            : 0)
+                    << " packet_shape_mode="
+                    << sanitize_forensic_token(stage_a_direct_local_packet_shape_mode)
+                    << " final_zero_support_reason="
+                    << sanitize_forensic_token(
+                           stage_a_missing_support_preflight_skip_reason)
+                    << " contract_mode="
+                    << sanitize_forensic_token(
+                           stage_a_missing_support_preflight_contract_mode)
+                    << std::endl;
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageASupportMaterializationDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " packet_shape_mode="
+                    << sanitize_forensic_token(stage_a_direct_local_packet_shape_mode)
+                    << " summary_plan_state="
+                    << sanitize_forensic_token(summary_insertion_plan_state)
+                    << " summary_mode="
+                    << sanitize_forensic_token(cbs_phase2_summary_mode)
+                    << " summary_implemented_this_epoch="
+                    << (cbs_phase2_summary_implemented_this_epoch ? 1 : 0)
+                    << " summary_injected_this_epoch="
+                    << (cbs_phase2_summary_injected_this_epoch ? 1 : 0)
+                    << " summary_factor_count_emitted="
+                    << cbs_phase2_summary_factor_count_emitted
+                    << " direct_local_candidate_count="
+                    << cbs_phase2_directly_removable_local_internal_candidate_slots
+                    << " direct_local_compatible_available_before_packet_assembly="
+                    << (direct_local_stage_a_compatible_available_before_packet_assembly
+                            ? 1
+                            : 0)
+                    << " direct_local_stage_a_packet_compatible_count="
+                    << stage_a_direct_local_packet_compatible_count
+                    << " root_bootstrap_support_available_before_packet_assembly="
+                    << (root_bootstrap_support_available_before_packet_assembly
+                            ? 1
+                            : 0)
+                    << " root_bootstrap_support_factor_count="
+                    << stage_a_root_bootstrap_support_factor_count
+                    << " replay_valid_remove_candidates_before_filter_count="
+                    << replay_valid_slots_for_stage_a.size()
+                    << " summary_covered_crossing_remove_candidates_before_filter_count="
+                    << summary_crossing_remove_candidate_count
+                    << " final_zero_support_reason="
+                    << sanitize_forensic_token(
+                           stage_a_missing_support_preflight_skip_reason)
+                    << " first_direct_local_incompatible_slot="
+                    << stage_a_support_first_direct_local_incompatible_slot
+                    << " first_direct_local_incompatible_slot_class="
+                    << sanitize_forensic_token(
+                           stage_a_support_first_direct_local_incompatible_slot_class)
+                    << " first_direct_local_incompatible_slot_keys="
+                    << sanitize_forensic_token(
+                           stage_a_support_first_direct_local_incompatible_slot_keys)
+                    << " first_direct_local_incompatible_reason="
+                    << sanitize_forensic_token(
+                           stage_a_support_first_direct_local_incompatible_reason)
+                    << " first_root_bootstrap_unavailable_reason="
+                    << sanitize_forensic_token(
+                           stage_a_support_first_root_bootstrap_unavailable_reason)
+                    << " summary_failure_reason_exact="
+                    << sanitize_forensic_token(stage_a_support_summary_failure_reason)
+                    << " summary_failure_offending_slot="
+                    << stage_a_support_summary_failure_offending_slot
+                    << " summary_failure_offending_key="
+                    << sanitize_forensic_token(
+                           stage_a_support_summary_failure_offending_key)
+                    << " summary_failure_exception_context="
+                    << sanitize_forensic_token(
+                           stage_a_support_summary_failure_exception_context)
+                    << " support_materialization_mode="
+                    << sanitize_forensic_token(stage_a_support_materialization_mode)
+                    << std::endl;
+                cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure = true;
+                cbs_phase2_stage_a_skipped_kf = static_cast<long long>(curr_kf_id_);
+                cbs_phase2_stage_a_skip_reason =
+                    stage_a_missing_support_preflight_skip_reason;
+                stage_a_failure_reason = cbs_phase2_stage_a_skip_reason;
+                cbs_note_stage_a_failure_exception(
+                    enable_remove_factor_indices,
+                    "two_stage_update_a_missing_support_contract_preflight",
+                    stage_a_failure_reason);
+                cbs_stage_a_failure_sequence_final_failure_stage =
+                    "two_stage_update_a_missing_support_contract_preflight_skipped_epoch";
+                cbs_two_stage_current_update_stage =
+                    "two_stage_update_a_missing_support_contract_preflight";
+                replay_direct_local_apply_stage_first_failure_reason_diag =
+                    "stage_a_packet_skipped_missing_support_contract_preflight";
+                replay_direct_local_contract_mode_diag =
+                    stage_a_missing_support_preflight_contract_mode;
+                if (stage_a_missing_support_preflight_skip_reason ==
+                    "stage_a_support_poor_remove_heavy_packet_after_remove_sanitization") {
+                  std::cerr << std::setprecision(12)
+                            << "[CBS][StageAILSFailClosedDiag]"
+                            << " curr_kf_id=" << curr_kf_id_
+                            << " stage_a_initial_failed=0"
+                            << " stage_a_fail_closed_skip=1"
+                            << " stage_a_fail_closed_reason="
+                            << sanitize_forensic_token(
+                                   stage_a_missing_support_preflight_skip_reason)
+                            << " deferred_stage_a_remove_count="
+                            << update_a_params.removeFactorIndices.size()
+                            << " contract_mode="
+                            << "stage_a_packet_contract_skip_defer_on_support_poor_remove_heavy_after_remove_sanitization"
+                            << std::endl;
+                }
+                update_a_result = gtsam::ISAM2Result();
+                update_a_effective_remove_slots.clear();
+                update_a_retry_attempted = false;
+                update_a_retry_succeeded = false;
+              } else if (stage_a_boundary_underconstrained_guard) {
                 stage_a_boundary_support_guard_triggered_once = true;
                 cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure = true;
                 cbs_phase2_stage_a_skipped_kf = static_cast<long long>(curr_kf_id_);
@@ -22389,6 +23295,144 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 const bool has_ils =
                     stage_a_error_msg.find("IndeterminantLinearSystemException") !=
                     std::string::npos;
+                const long long first_stage_a_remove_slot =
+                    update_a_params.removeFactorIndices.empty()
+                        ? -1ll
+                        : static_cast<long long>(
+                              update_a_params.removeFactorIndices.front());
+                std::string first_stage_a_remove_slot_class = "none";
+                std::string first_stage_a_remove_slot_keys = "none";
+                if (first_stage_a_remove_slot >= 0) {
+                  const auto& stage_a_support_factors =
+                      cbs_optimizer_->getFactorsUnsafe();
+                  const size_t first_remove_slot =
+                      static_cast<size_t>(first_stage_a_remove_slot);
+                  if (stage_a_support_factors.exists(first_remove_slot) &&
+                      stage_a_support_factors.at(first_remove_slot)) {
+                    first_stage_a_remove_slot_class = sanitize_forensic_token(
+                        classify_forensic_remove_factor_class(
+                            stage_a_support_factors.at(first_remove_slot)));
+                    first_stage_a_remove_slot_keys = sanitize_forensic_token(
+                        format_factor_keys_for_slot(stage_a_support_factors,
+                                                    first_remove_slot));
+                  } else {
+                    first_stage_a_remove_slot_class = "missing_slot";
+                    first_stage_a_remove_slot_keys = "none";
+                  }
+                }
+                const std::string stage_a_origin_mode =
+                    classify_precise_exception_origin_mode(exception_phase_label);
+                const bool stage_a_summary_only_incompatible_shape =
+                    stage_a_direct_local_packet_shape_mode ==
+                        "summary_only_without_direct_local_support" &&
+                    cbs_phase2_two_stage_update_a_summary_factor_count > 0u &&
+                    stage_a_root_bootstrap_support_factor_count == 0u &&
+                    stage_a_values.empty() &&
+                    stage_a_direct_local_packet_compatible_count == 0u;
+                const bool stage_a_remove_heavy_shape =
+                    !update_a_params.removeFactorIndices.empty();
+                const bool stage_a_support_poor_remove_heavy_shape =
+                    cbs_phase2_two_stage_update_a_summary_factor_count > 0u &&
+                    stage_a_root_bootstrap_support_factor_count == 0u &&
+                    stage_a_values.empty() &&
+                    stage_a_direct_local_packet_compatible_count == 0u &&
+                    stage_a_remove_heavy_shape;
+                const bool strict_two_stage_regime_active =
+                    cbs_phase2_two_stage_summary_crossing_mode &&
+                    cbs_phase2_diag_defer_direct_local_internal_only &&
+                    cbs_phase2_defer_summary_covered_crossing_one_epoch_mode;
+                const bool stage_a_retry_phase_failed =
+                    exception_phase_label.find(
+                        "two_stage_update_a_retry_skip_invalid_remove_slots") !=
+                    std::string::npos;
+                std::string stage_a_contract_reason =
+                    "other_contract_shape";
+                if (stage_a_support_poor_remove_heavy_shape) {
+                  stage_a_contract_reason = stage_a_summary_only_incompatible_shape
+                                                ? "support_poor_summary_only_remove_heavy_incompatible_stage_a_packet"
+                                                : "stage_a_support_poor_remove_heavy_packet_after_remove_sanitization";
+                } else if (stage_a_summary_only_incompatible_shape) {
+                  stage_a_contract_reason =
+                      "summary_only_without_direct_local_support";
+                } else if (stage_a_remove_heavy_shape) {
+                  stage_a_contract_reason =
+                      "remove_heavy_without_summary_only_contract_match";
+                } else {
+                  stage_a_contract_reason =
+                      "ils_without_remove_heavy_packet_shape";
+                }
+                if (has_ils && !first_stage_a_ils_origin_diag_emitted_once) {
+                  std::cerr << std::setprecision(12)
+                            << "[CBS][FirstStageAILSOriginDiag]"
+                            << " curr_kf_id=" << curr_kf_id_
+                            << " current_update_stage="
+                            << sanitize_forensic_token(
+                                   cbs_two_stage_current_update_stage)
+                            << " phase_label="
+                            << sanitize_forensic_token(exception_phase_label)
+                            << " exception_message="
+                            << sanitize_forensic_token(stage_a_error_msg)
+                            << " packet_shape_mode="
+                            << sanitize_forensic_token(
+                                   stage_a_direct_local_packet_shape_mode)
+                            << " summary_factor_count="
+                            << cbs_phase2_two_stage_update_a_summary_factor_count
+                            << " root_bootstrap_support_factor_count="
+                            << stage_a_root_bootstrap_support_factor_count
+                            << " stage_a_value_count=" << stage_a_values.size()
+                            << " stage_a_remove_count="
+                            << update_a_params.removeFactorIndices.size()
+                            << " direct_local_candidate_count="
+                            << cbs_phase2_directly_removable_local_internal_candidate_slots
+                            << " direct_local_stage_a_packet_compatible_count="
+                            << stage_a_direct_local_packet_compatible_count
+                            << " summary_covered_crossing_count="
+                            << cbs_phase2_summary_covered_crossing_slots
+                            << " replay_requested_count="
+                            << cbs_phase2_summary_crossing_replay_requested_count
+                            << " first_stage_a_remove_slot="
+                            << first_stage_a_remove_slot
+                            << " first_stage_a_remove_slot_class="
+                            << first_stage_a_remove_slot_class
+                            << " first_stage_a_remove_slot_keys="
+                            << first_stage_a_remove_slot_keys
+                            << " origin_mode="
+                            << sanitize_forensic_token(stage_a_origin_mode)
+                            << std::endl;
+                  first_stage_a_ils_origin_diag_emitted_once = true;
+                }
+                if (has_ils &&
+                    !first_stage_a_ils_packet_contract_diag_emitted_once) {
+                  std::cerr << std::setprecision(12)
+                            << "[CBS][StageAILSPacketContractDiag]"
+                            << " curr_kf_id=" << curr_kf_id_
+                            << " packet_shape_mode="
+                            << sanitize_forensic_token(
+                                   stage_a_direct_local_packet_shape_mode)
+                            << " summary_factor_count="
+                            << cbs_phase2_two_stage_update_a_summary_factor_count
+                            << " root_bootstrap_support_factor_count="
+                            << stage_a_root_bootstrap_support_factor_count
+                            << " stage_a_value_count=" << stage_a_values.size()
+                            << " stage_a_remove_count="
+                            << update_a_params.removeFactorIndices.size()
+                            << " direct_local_stage_a_packet_compatible_count="
+                            << stage_a_direct_local_packet_compatible_count
+                            << " summary_covered_crossing_count="
+                            << cbs_phase2_summary_covered_crossing_slots
+                            << " replay_requested_count="
+                            << cbs_phase2_summary_crossing_replay_requested_count
+                            << " stage_a_contract_reason="
+                            << sanitize_forensic_token(stage_a_contract_reason)
+                            << " contract_mode="
+                            << "stage_a_ils_packet_contract_shape_audit"
+                            << std::endl;
+                  first_stage_a_ils_packet_contract_diag_emitted_once = true;
+                }
+                const bool stage_a_ils_fail_closed_contract =
+                    has_ils && strict_two_stage_regime_active &&
+                    stage_a_support_poor_remove_heavy_shape &&
+                    !cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure;
                 if (!stage_a_direct_local_packet_incompatible_slots.empty()) {
                   replay_direct_local_apply_failure_audit_triggered_diag = true;
                   replay_direct_local_apply_failure_stage_diag =
@@ -22705,6 +23749,36 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << " cbs_phase2_stage_a_skip_reason="
                       << sanitize_forensic_token(cbs_phase2_stage_a_skip_reason)
                       << std::endl;
+                  update_a_result = gtsam::ISAM2Result();
+                  update_a_effective_remove_slots.clear();
+                  update_a_retry_attempted = false;
+                  update_a_retry_succeeded = false;
+                } else if (stage_a_ils_fail_closed_contract) {
+                  cbs_phase2_stage_a_epoch_skipped_due_to_initial_failure = true;
+                  cbs_phase2_stage_a_skipped_kf =
+                      static_cast<long long>(curr_kf_id_);
+                  cbs_phase2_stage_a_skip_reason =
+                      "stage_a_support_poor_remove_heavy_packet_after_remove_sanitization";
+                  stage_a_failure_reason = cbs_phase2_stage_a_skip_reason;
+                  cbs_stage_a_failure_sequence_final_failure_stage =
+                      sanitize_forensic_token(
+                          "two_stage_update_a_ils_fail_closed_skipped_epoch");
+                  cbs_two_stage_current_update_stage =
+                      "two_stage_update_a_ils_fail_closed";
+                  std::cerr << std::setprecision(12)
+                            << "[CBS][StageAILSFailClosedDiag]"
+                            << " curr_kf_id=" << curr_kf_id_
+                            << " stage_a_initial_failed="
+                            << (stage_a_retry_phase_failed ? 0 : 1)
+                            << " stage_a_fail_closed_skip=1"
+                            << " stage_a_fail_closed_reason="
+                            << sanitize_forensic_token(
+                                   cbs_phase2_stage_a_skip_reason)
+                            << " deferred_stage_a_remove_count="
+                            << update_a_params.removeFactorIndices.size()
+                            << " contract_mode="
+                            << "stage_a_ils_fail_closed_skip_defer_on_support_poor_remove_heavy_after_remove_sanitization"
+                            << std::endl;
                   update_a_result = gtsam::ISAM2Result();
                   update_a_effective_remove_slots.clear();
                   update_a_retry_attempted = false;
@@ -23862,6 +24936,11 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   build_stage_b_packet_snapshot(*stage_b_factors_for_update_ptr,
                                                 new_values,
                                                 update_b_params);
+              stage_b_factor_count_for_origin_diag =
+                  stage_b_packet_snapshot.factor_count;
+              stage_b_value_count_for_origin_diag =
+                  stage_b_packet_snapshot.value_count;
+              stage_b_remove_count_for_origin_diag = stage_b_packet_snapshot.remove_count;
               const PostStageAPreStageBStateSnapshot
                   post_stage_a_pre_stage_b_state_snapshot =
                       build_post_stage_a_pre_stage_b_state_snapshot(
@@ -23869,9 +24948,55 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                           *stage_b_factors_for_update_ptr,
                           new_values);
               bool stage_b_completed_successfully = false;
+              bool stage_b_skipped_missing_key_packet = false;
+              const bool stage_a_preflight_skip_reason_is_contract =
+                  stage_a_missing_support_preflight_skip &&
+                  (stage_a_missing_support_preflight_skip_reason ==
+                       "summary_only_without_direct_local_support_preflight" ||
+                   stage_a_missing_support_preflight_skip_reason ==
+                       "zero_support_remove_only_preflight");
+              const bool stage_b_continued_after_stage_a_skip =
+                  !stage_a_completed_successfully &&
+                  stage_a_preflight_skip_reason_is_contract;
+              stage_b_continued_after_stage_a_skip_for_origin_diag =
+                  stage_b_continued_after_stage_a_skip;
+              if (stage_b_continued_after_stage_a_skip) {
+                stage_b_continuation_seen_once = true;
+              }
+              const bool stage_b_allowed_to_execute =
+                  stage_a_completed_successfully ||
+                  stage_b_continued_after_stage_a_skip;
+              const std::string stage_a_skip_stage_b_continuation_mode =
+                  stage_b_continued_after_stage_a_skip
+                      ? "continue_stage_b_after_stage_a_preflight_skip"
+                      : (stage_a_completed_successfully
+                             ? "stage_a_completed_normal_two_stage"
+                             : "skip_stage_b_due_to_stage_a_not_completed_nonpreflight");
+              if (stage_a_missing_support_preflight_skip) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageASkipStageBContinuationDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " stage_a_preflight_skip="
+                    << (stage_a_missing_support_preflight_skip ? 1 : 0)
+                    << " stage_a_preflight_skip_reason="
+                    << sanitize_forensic_token(
+                           stage_a_missing_support_preflight_skip_reason)
+                    << " stage_b_continued_after_stage_a_skip="
+                    << (stage_b_continued_after_stage_a_skip ? 1 : 0)
+                    << " stage_b_new_factor_count="
+                    << stage_b_packet_snapshot.factor_count
+                    << " stage_b_new_value_count=" << new_values.size()
+                    << " stage_b_remove_count="
+                    << update_b_params.removeFactorIndices.size()
+                    << " continuation_mode="
+                    << sanitize_forensic_token(
+                           stage_a_skip_stage_b_continuation_mode)
+                    << std::endl;
+              }
               cbs_phase2_two_stage_update_b_executed =
-                  stage_a_completed_successfully;
-              if (!stage_a_completed_successfully) {
+                  stage_b_allowed_to_execute;
+              if (!stage_b_allowed_to_execute) {
                 cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure = true;
                 cbs_phase2_stage_b_skipped_kf =
                     static_cast<long long>(curr_kf_id_);
@@ -23914,6 +25039,9 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                                             &update_b_effective_remove_slots,
                                             &update_b_retry_attempted,
                                             &update_b_retry_succeeded);
+                stage_b_skipped_missing_key_packet =
+                    cbs_two_stage_current_update_stage ==
+                    "two_stage_update_b_skipped_missing_key_packet";
                 stage_b_completed_successfully = true;
                 stage_b_last_clean_snapshot = stage_b_packet_snapshot;
                 stage_b_last_clean_snapshot_valid = true;
@@ -24225,10 +25353,163 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << std::endl;
                   stage_b_first_failure_diag_emitted = true;
                 }
+                const bool has_stage_b_map_at =
+                    stage_b_error_message.find("map::at") != std::string::npos;
+                const bool has_stage_b_out_of_range =
+                    stage_b_error_message.find("out_of_range") !=
+                        std::string::npos ||
+                    stage_b_error_message.find("std::out_of_range") !=
+                        std::string::npos;
+                const bool stage_b_out_of_range_or_map_at =
+                    has_stage_b_map_at || has_stage_b_out_of_range;
+                const bool stage_b_retry_phase_failed =
+                    exception_phase_label.find(
+                        "two_stage_update_b_retry_skip_invalid_remove_slots") !=
+                    std::string::npos;
+                const auto resolve_stage_b_slot_class_and_keys =
+                    [&](const long long slot_id,
+                        std::string* slot_class,
+                        std::string* slot_keys) {
+                      CHECK_NOTNULL(slot_class);
+                      CHECK_NOTNULL(slot_keys);
+                      *slot_class = "none";
+                      *slot_keys = "none";
+                      if (slot_id < 0) {
+                        return;
+                      }
+                      const auto& factors = cbs_optimizer_->getFactorsUnsafe();
+                      const size_t slot = static_cast<size_t>(slot_id);
+                      if (!factors.exists(slot) || !factors.at(slot)) {
+                        *slot_class = "missing_slot";
+                        return;
+                      }
+                      *slot_class = sanitize_forensic_token(
+                          classify_forensic_remove_factor_class(
+                              factors.at(slot)));
+                      *slot_keys = sanitize_forensic_token(
+                          format_factor_keys_for_slot(factors, slot));
+                    };
+                const long long first_stage_b_remove_slot =
+                    update_b_params.removeFactorIndices.empty()
+                        ? -1ll
+                        : static_cast<long long>(
+                              update_b_params.removeFactorIndices.front());
+                std::string first_stage_b_remove_slot_class = "none";
+                std::string first_stage_b_remove_slot_keys = "none";
+                resolve_stage_b_slot_class_and_keys(first_stage_b_remove_slot,
+                                                    &first_stage_b_remove_slot_class,
+                                                    &first_stage_b_remove_slot_keys);
+                const std::string stage_b_retry_mode =
+                    update_b_retry_attempted
+                        ? (stage_b_retry_phase_failed
+                               ? "invalid_remove_slot_retry_failed"
+                               : "invalid_remove_slot_retry_attempted")
+                        : "none";
+                const std::string stage_b_origin_mode =
+                    classify_precise_exception_origin_mode(exception_phase_label);
+                if (stage_b_out_of_range_or_map_at &&
+                    !first_stage_b_out_of_range_origin_diag_emitted_once) {
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][FirstStageBOutOfRangeOriginDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " current_update_stage="
+                      << sanitize_forensic_token(cbs_two_stage_current_update_stage)
+                      << " phase_label="
+                      << sanitize_forensic_token(exception_phase_label)
+                      << " exception_message="
+                      << sanitize_forensic_token(stage_b_error_message)
+                      << " stage_b_factor_count="
+                      << stage_b_packet_snapshot.factor_count
+                      << " stage_b_value_count="
+                      << stage_b_packet_snapshot.value_count
+                      << " stage_b_remove_count="
+                      << stage_b_packet_snapshot.remove_count
+                      << " first_stage_b_remove_slot="
+                      << first_stage_b_remove_slot
+                      << " first_stage_b_remove_slot_class="
+                      << first_stage_b_remove_slot_class
+                      << " first_stage_b_remove_slot_keys="
+                      << first_stage_b_remove_slot_keys
+                      << " stage_b_retry_attempted="
+                      << (update_b_retry_attempted ? 1 : 0)
+                      << " stage_b_retry_mode="
+                      << sanitize_forensic_token(stage_b_retry_mode)
+                      << " origin_mode="
+                      << sanitize_forensic_token(stage_b_origin_mode)
+                      << std::endl;
+                  first_stage_b_out_of_range_origin_diag_emitted_once = true;
+                }
+                const size_t stage_b_retry_remove_count =
+                    update_b_retry_attempted
+                        ? update_b_effective_remove_slots.size()
+                        : 0u;
+                const long long first_stage_b_retry_remove_slot =
+                    (update_b_retry_attempted &&
+                     !update_b_effective_remove_slots.empty())
+                        ? static_cast<long long>(
+                              update_b_effective_remove_slots.front())
+                        : -1ll;
+                std::string first_stage_b_retry_remove_slot_class = "none";
+                std::string first_stage_b_retry_remove_slot_keys = "none";
+                resolve_stage_b_slot_class_and_keys(
+                    first_stage_b_retry_remove_slot,
+                    &first_stage_b_retry_remove_slot_class,
+                    &first_stage_b_retry_remove_slot_keys);
+                if (has_stage_b_map_at && update_b_retry_attempted &&
+                    !first_stage_b_retry_map_at_diag_emitted_once) {
+                  std::cerr
+                      << std::setprecision(12)
+                      << "[CBS][FirstStageBRetryMapAtDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " phase_label="
+                      << sanitize_forensic_token(exception_phase_label)
+                      << " exception_message="
+                      << sanitize_forensic_token(stage_b_error_message)
+                      << " stage_b_factor_count="
+                      << stage_b_packet_snapshot.factor_count
+                      << " stage_b_value_count="
+                      << stage_b_packet_snapshot.value_count
+                      << " stage_b_remove_count="
+                      << stage_b_packet_snapshot.remove_count
+                      << " stage_b_retry_attempted="
+                      << (update_b_retry_attempted ? 1 : 0)
+                      << " stage_b_retry_remove_count="
+                      << stage_b_retry_remove_count
+                      << " first_stage_b_retry_remove_slot="
+                      << first_stage_b_retry_remove_slot
+                      << " first_stage_b_retry_remove_slot_class="
+                      << first_stage_b_retry_remove_slot_class
+                      << " first_stage_b_retry_remove_slot_keys="
+                      << first_stage_b_retry_remove_slot_keys
+                      << " retry_map_at_mode="
+                      << sanitize_forensic_token(stage_b_origin_mode)
+                      << std::endl;
+                  first_stage_b_retry_map_at_diag_emitted_once = true;
+                }
+                const bool strict_two_stage_regime_active =
+                    cbs_phase2_two_stage_summary_crossing_mode &&
+                    cbs_phase2_diag_defer_direct_local_internal_only &&
+                    cbs_phase2_defer_summary_covered_crossing_one_epoch_mode;
+                const FrameId stage_b_early_boundary_window_kf_max =
+                    std::max<FrameId>(
+                        static_cast<FrameId>(backend_params_.nr_states_ + 20),
+                        static_cast<FrameId>(60));
+                const bool stage_b_early_boundary_window_active =
+                    static_cast<FrameId>(std::max(0, curr_kf_id_)) <=
+                    stage_b_early_boundary_window_kf_max;
+                const bool stage_b_fail_closed_retry_contract =
+                    strict_two_stage_regime_active &&
+                    stage_b_early_boundary_window_active &&
+                    stage_b_out_of_range_or_map_at;
                 const bool skip_stage_b_on_initial_failure =
                     cbs_phase2_stage_b_skip_epoch_on_initial_failure_mode &&
                     !cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure;
-                if (skip_stage_b_on_initial_failure) {
+                const bool skip_stage_b_fail_closed =
+                    stage_b_fail_closed_retry_contract &&
+                    !cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure;
+                if (skip_stage_b_on_initial_failure ||
+                    skip_stage_b_fail_closed) {
                   cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure = true;
                   cbs_phase2_stage_b_skipped_kf =
                       static_cast<long long>(curr_kf_id_);
@@ -24237,9 +25518,11 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                           stage_b_error_message.empty()
                               ? std::string("unknown")
                               : stage_b_error_message);
-                  cbs_phase2_stage_b_skip_reason =
-                      "initial_stage_b_exception:" +
-                      sanitized_stage_b_error_message;
+                  cbs_phase2_stage_b_skip_reason = skip_stage_b_fail_closed
+                                                       ? "stage_b_retry_fail_closed:" +
+                                                             sanitized_stage_b_error_message
+                                                       : "initial_stage_b_exception:" +
+                                                             sanitized_stage_b_error_message;
                   cbs_note_stage_b_failure_exception(
                       enable_remove_factor_indices,
                       "bpsam_update_call_two_stage_update_b",
@@ -24275,6 +25558,30 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << " cbs_phase2_stage_b_skip_reason="
                       << sanitize_forensic_token(cbs_phase2_stage_b_skip_reason)
                       << std::endl;
+                  if (skip_stage_b_fail_closed) {
+                    const std::string stage_b_fail_closed_reason =
+                        has_stage_b_map_at
+                            ? "stage_b_retry_map_at_early_boundary_fail_closed"
+                            : (has_stage_b_out_of_range
+                                   ? "stage_b_retry_out_of_range_early_boundary_fail_closed"
+                                   : "stage_b_retry_exception_early_boundary_fail_closed");
+                    std::cerr
+                        << std::setprecision(12)
+                        << "[CBS][StageBRetryFailClosedDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " stage_b_initial_failed="
+                        << (stage_b_retry_phase_failed ? 0 : 1)
+                        << " stage_b_retry_failed="
+                        << (stage_b_retry_phase_failed ? 1 : 0)
+                        << " stage_b_fail_closed_skip=1"
+                        << " stage_b_fail_closed_reason="
+                        << sanitize_forensic_token(stage_b_fail_closed_reason)
+                        << " deferred_stage_b_remove_count="
+                        << update_b_params.removeFactorIndices.size()
+                        << " contract_mode="
+                        << "stage_b_retry_fail_closed_skip_defer_on_out_of_range_or_map_at_early_boundary"
+                        << std::endl;
+                  }
                   update_b_result = update_a_result;
                   update_b_effective_remove_slots.clear();
                   update_b_retry_attempted = false;
@@ -24778,73 +26085,120 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 const std::unordered_set<size_t> stage_b_effective_remove_set(
                     update_b_effective_remove_slots.begin(),
                     update_b_effective_remove_slots.end());
-                for (const size_t slot : stage_b_direct_local_replay_apply_slots) {
-                  auto metadata_it =
-                      replay_direct_local_apply_candidates_metadata.find(slot);
-                  CbsSummaryCoveredCrossingReplayMetadata metadata;
-                  if (metadata_it !=
-                      replay_direct_local_apply_candidates_metadata.end()) {
-                    metadata = metadata_it->second;
-                  } else {
-                    metadata.slot_id = slot;
-                  }
-                  if (metadata.slot_id == 0u) {
-                    metadata.slot_id = slot;
-                  }
-                  ++replay_direct_local_apply_attempted_count_diag;
-                  if (stage_b_effective_remove_set.count(slot) > 0u) {
-                    ++replay_direct_local_apply_succeeded_count_diag;
-                    const bool already_consumed =
-                        is_replay_identity_consumed_this_epoch(metadata);
-                    consume_replay_identity_from_all_stores(slot, metadata);
-                    if (!already_consumed) {
-                      replay_direct_local_applied_and_consumed_this_epoch_diag
-                          .push_back(slot);
-                    }
-                    continue;
-                  }
-
-                  ++replay_direct_local_apply_failed_count_diag;
-                  ++replay_direct_local_failed_apply_candidate_count_diag;
-                  replay_direct_local_apply_failure_audit_triggered_diag = true;
-                  replay_direct_local_apply_failure_stage_diag =
-                      "two_stage_update_b_packet_remove_contract";
-                  replay_direct_local_apply_failure_reason_diag =
-                      "direct_local_stage_b_packet_no_effective_remove";
+                const bool stage_b_packet_skipped_missing_key_preflight =
+                    stage_b_skipped_missing_key_packet ||
+                    cbs_two_stage_current_update_stage ==
+                        "two_stage_update_b_skipped_missing_key_packet";
+                if (stage_b_packet_skipped_missing_key_preflight) {
+                  replay_direct_local_apply_stage_mode_diag =
+                      "two_stage_update_b_packet_remove_contract_skipped_missing_key_preflight";
                   replay_direct_local_apply_stage_first_failure_reason_diag =
-                      "direct_local_stage_b_packet_no_effective_remove";
-                  replay_direct_local_apply_requeue_diag_triggered = true;
-                  replay_direct_local_requeue_reason_diag =
-                      "direct_local_stage_b_packet_no_effective_remove";
-                  replay_direct_local_requeue_mode_diag =
-                      "fail_closed_requeue_no_effective_remove_after_stage_b_packet_contract";
-                  metadata.defer_epoch = curr_kf_id_;
-                  if (metadata.first_defer_epoch == 0u) {
-                    metadata.first_defer_epoch =
-                        metadata.defer_epoch == 0u ? curr_kf_id_
-                                                   : metadata.defer_epoch;
+                      "stage_b_packet_skipped_missing_key_preflight";
+                  replay_direct_local_contract_mode_diag =
+                      "stage_b_packet_contract_skip_defer_on_missing_key_preflight";
+                  for (const size_t slot : stage_b_direct_local_replay_apply_slots) {
+                    auto metadata_it =
+                        replay_direct_local_apply_candidates_metadata.find(slot);
+                    CbsSummaryCoveredCrossingReplayMetadata metadata;
+                    if (metadata_it !=
+                        replay_direct_local_apply_candidates_metadata.end()) {
+                      metadata = metadata_it->second;
+                    } else {
+                      metadata.slot_id = slot;
+                    }
+                    if (metadata.slot_id == 0u) {
+                      metadata.slot_id = slot;
+                    }
+                    metadata.defer_epoch = curr_kf_id_;
+                    if (metadata.first_defer_epoch == 0u) {
+                      metadata.first_defer_epoch =
+                          metadata.defer_epoch == 0u ? curr_kf_id_
+                                                     : metadata.defer_epoch;
+                    }
+                    metadata.replay_path = "direct_local_pending";
+                    metadata.pending_reason =
+                        "stage_b_packet_skipped_missing_key_preflight";
+                    cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                        [metadata.slot_id] = metadata;
+                    ++replay_direct_local_policy_deferred_count_diag;
+                    if (replay_direct_local_first_policy_deferred_slot_diag < 0) {
+                      replay_direct_local_first_policy_deferred_slot_diag =
+                          static_cast<long long>(metadata.slot_id);
+                      replay_direct_local_first_policy_deferred_slot_class_diag =
+                          sanitize_forensic_token(metadata.factor_class);
+                      replay_direct_local_first_policy_deferred_slot_keys_diag =
+                          sanitize_forensic_token(metadata.factor_keys);
+                    }
                   }
-                  metadata.replay_path = "direct_local_pending";
-                  metadata.pending_reason =
-                      "direct_local_stage_b_packet_no_effective_remove";
-                  cbs_phase2_direct_local_pending_one_epoch_replay_queue_
-                      [metadata.slot_id] = metadata;
-                  ++replay_direct_local_requeued_after_failed_apply_count_diag;
-                  if (replay_direct_local_first_requeued_slot_diag < 0) {
-                    replay_direct_local_first_requeued_slot_diag =
-                        static_cast<long long>(metadata.slot_id);
-                    replay_direct_local_first_requeued_slot_class_diag =
-                        sanitize_forensic_token(metadata.factor_class);
-                    replay_direct_local_first_requeued_slot_keys_diag =
-                        sanitize_forensic_token(metadata.factor_keys);
+                } else {
+                  for (const size_t slot : stage_b_direct_local_replay_apply_slots) {
+                    auto metadata_it =
+                        replay_direct_local_apply_candidates_metadata.find(slot);
+                    CbsSummaryCoveredCrossingReplayMetadata metadata;
+                    if (metadata_it !=
+                        replay_direct_local_apply_candidates_metadata.end()) {
+                      metadata = metadata_it->second;
+                    } else {
+                      metadata.slot_id = slot;
+                    }
+                    if (metadata.slot_id == 0u) {
+                      metadata.slot_id = slot;
+                    }
+                    ++replay_direct_local_apply_attempted_count_diag;
+                    if (stage_b_effective_remove_set.count(slot) > 0u) {
+                      ++replay_direct_local_apply_succeeded_count_diag;
+                      const bool already_consumed =
+                          is_replay_identity_consumed_this_epoch(metadata);
+                      consume_replay_identity_from_all_stores(slot, metadata);
+                      if (!already_consumed) {
+                        replay_direct_local_applied_and_consumed_this_epoch_diag
+                            .push_back(slot);
+                      }
+                      continue;
+                    }
+
+                    ++replay_direct_local_apply_failed_count_diag;
+                    ++replay_direct_local_failed_apply_candidate_count_diag;
+                    replay_direct_local_apply_failure_audit_triggered_diag = true;
+                    replay_direct_local_apply_failure_stage_diag =
+                        "two_stage_update_b_packet_remove_contract";
+                    replay_direct_local_apply_failure_reason_diag =
+                        "direct_local_stage_b_packet_no_effective_remove";
+                    replay_direct_local_apply_stage_first_failure_reason_diag =
+                        "direct_local_stage_b_packet_no_effective_remove";
+                    replay_direct_local_apply_requeue_diag_triggered = true;
+                    replay_direct_local_requeue_reason_diag =
+                        "direct_local_stage_b_packet_no_effective_remove";
+                    replay_direct_local_requeue_mode_diag =
+                        "fail_closed_requeue_no_effective_remove_after_stage_b_packet_contract";
+                    metadata.defer_epoch = curr_kf_id_;
+                    if (metadata.first_defer_epoch == 0u) {
+                      metadata.first_defer_epoch =
+                          metadata.defer_epoch == 0u ? curr_kf_id_
+                                                     : metadata.defer_epoch;
+                    }
+                    metadata.replay_path = "direct_local_pending";
+                    metadata.pending_reason =
+                        "direct_local_stage_b_packet_no_effective_remove";
+                    cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                        [metadata.slot_id] = metadata;
+                    ++replay_direct_local_requeued_after_failed_apply_count_diag;
+                    if (replay_direct_local_first_requeued_slot_diag < 0) {
+                      replay_direct_local_first_requeued_slot_diag =
+                          static_cast<long long>(metadata.slot_id);
+                      replay_direct_local_first_requeued_slot_class_diag =
+                          sanitize_forensic_token(metadata.factor_class);
+                      replay_direct_local_first_requeued_slot_keys_diag =
+                          sanitize_forensic_token(metadata.factor_keys);
+                    }
                   }
-                }
-                if (replay_direct_local_apply_failed_count_diag > 0u) {
-                  replay_direct_local_apply_failure_pending_queue_size_before_diag =
-                      direct_local_pending_queue_size_before_apply_stage;
-                  replay_direct_local_apply_failure_pending_queue_size_after_diag =
-                      cbs_phase2_direct_local_pending_one_epoch_replay_queue_
-                          .size();
+                  if (replay_direct_local_apply_failed_count_diag > 0u) {
+                    replay_direct_local_apply_failure_pending_queue_size_before_diag =
+                        direct_local_pending_queue_size_before_apply_stage;
+                    replay_direct_local_apply_failure_pending_queue_size_after_diag =
+                        cbs_phase2_direct_local_pending_one_epoch_replay_queue_
+                            .size();
+                  }
                 }
               } else if (!stage_b_direct_local_replay_apply_slots.empty() &&
                          cbs_phase2_replay_into_stage_a_mode) {
@@ -24937,20 +26291,83 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << curr_kf_id_;
               }
               gtsam::FactorIndices single_effective_remove_slots;
-              remove_update_attempted_this_attempt =
-                  !cbs_first_update_params.removeFactorIndices.empty();
-              if (enable_remove_factor_indices &&
-                  remove_update_attempted_this_attempt) {
-                lag_boundary_remove_update_attempted = true;
+              const bool about_to_enter_single_packet_fallback = true;
+              std::string single_packet_summary_failure_reason_exact =
+                  summary_failure_reason_exact_for_origin_diag;
+              if (single_packet_summary_failure_reason_exact == "none") {
+                if (cbs_phase2_first_summary_failure_reason != "none") {
+                  single_packet_summary_failure_reason_exact =
+                      cbs_phase2_first_summary_failure_reason;
+                } else if (cbs_phase2_first_expanded_summary_failure_reason !=
+                           "none") {
+                  single_packet_summary_failure_reason_exact =
+                      cbs_phase2_first_expanded_summary_failure_reason;
+                }
               }
-              run_update_stage_with_retry("single_packet_update",
-                                          cbs_update_factors,
-                                          new_values,
-                                          cbs_first_update_params,
-                                          &cbs_result,
-                                          &single_effective_remove_slots,
-                                          &invalid_slot_retry_attempted,
-                                          &invalid_slot_retry_succeeded);
+              const bool single_packet_preflight_skip =
+                  about_to_enter_single_packet_fallback &&
+                  single_packet_summary_failure_reason_exact ==
+                      "no_local_nonbelief_crossing_factors_selected" &&
+                  cbs_phase2_real_applied_total_remove_slots_count == 0u &&
+                  !stage_a_preflight_skip_for_origin_diag &&
+                  !stage_b_continued_after_stage_a_skip_for_origin_diag;
+              const std::string single_packet_preflight_skip_reason =
+                  single_packet_preflight_skip
+                      ? "missing_support_materialization_preflight"
+                      : "none";
+              const std::string single_packet_preflight_contract_mode =
+                  single_packet_preflight_skip
+                      ? "single_packet_contract_skip_defer_on_missing_support_materialization"
+                      : "single_packet_contract_default_execute";
+              std::cerr << std::setprecision(12)
+                        << "[CBS][SinglePacketFallbackPreflightDiag]"
+                        << " curr_kf_id=" << curr_kf_id_
+                        << " about_to_enter_single_packet_fallback="
+                        << (about_to_enter_single_packet_fallback ? 1 : 0)
+                        << " summary_failure_reason_exact="
+                        << sanitize_forensic_token(
+                               single_packet_summary_failure_reason_exact)
+                        << " real_applied_total_remove_slots_count="
+                        << cbs_phase2_real_applied_total_remove_slots_count
+                        << " stage_a_preflight_skip="
+                        << (stage_a_preflight_skip_for_origin_diag ? 1 : 0)
+                        << " stage_b_continued_after_stage_a_skip="
+                        << (stage_b_continued_after_stage_a_skip_for_origin_diag
+                                ? 1
+                                : 0)
+                        << " single_packet_preflight_skip="
+                        << (single_packet_preflight_skip ? 1 : 0)
+                        << " single_packet_preflight_skip_reason="
+                        << sanitize_forensic_token(
+                               single_packet_preflight_skip_reason)
+                        << " single_packet_preflight_contract_mode="
+                        << sanitize_forensic_token(
+                               single_packet_preflight_contract_mode)
+                        << std::endl;
+              if (single_packet_preflight_skip) {
+                single_packet_fallback_preflight_skipped = true;
+                cbs_two_stage_current_update_stage =
+                    "single_packet_update_missing_support_materialization_preflight";
+                cbs_result = gtsam::ISAM2Result();
+                single_effective_remove_slots.clear();
+                invalid_slot_retry_attempted = false;
+                invalid_slot_retry_succeeded = false;
+              } else {
+                remove_update_attempted_this_attempt =
+                    !cbs_first_update_params.removeFactorIndices.empty();
+                if (enable_remove_factor_indices &&
+                    remove_update_attempted_this_attempt) {
+                  lag_boundary_remove_update_attempted = true;
+                }
+                run_update_stage_with_retry("single_packet_update",
+                                            cbs_update_factors,
+                                            new_values,
+                                            cbs_first_update_params,
+                                            &cbs_result,
+                                            &single_effective_remove_slots,
+                                            &invalid_slot_retry_attempted,
+                                            &invalid_slot_retry_succeeded);
+              }
               std::unordered_set<size_t> remove_union(
                   single_effective_remove_slots.begin(),
                   single_effective_remove_slots.end());
@@ -24961,6 +26378,46 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               removed_factor_indices_applied = single_effective_remove_slots.size();
               removed_factor_indices_applied =
                   forensic_remove_slots_this_attempt.size();
+            }
+
+            if (!cbs_phase2_two_stage_effective) {
+              const bool summary_plan_exists_for_activation_diag =
+                  cbs_phase2_summary_attempted && phase2_plan_ready;
+              const bool summary_mode_failed_for_activation_diag =
+                  cbs_phase2_summary_mode.find("failed") != std::string::npos ||
+                  cbs_phase2_first_summary_failure_reason != "none";
+              if (!enable_remove_factor_indices ||
+                  !cbs_use_phase2_summary_prior_bridge ||
+                  (!two_stage_requested_flag &&
+                   !defer_summary_crossing_one_epoch_requested &&
+                   cbs_phase2_summary_crossing_replay_requested_count == 0u)) {
+                two_stage_non_activation_reason_diag =
+                    "single_packet_contract_preferred";
+              } else if (!summary_plan_exists_for_activation_diag ||
+                         !cbs_phase2_heart_) {
+                two_stage_non_activation_reason_diag = "summary_plan_not_ready";
+              } else if (summary_mode_failed_for_activation_diag) {
+                two_stage_non_activation_reason_diag = "summary_plan_failed";
+              } else if (cbs_phase2_summary_mode == "no_crossing_requested" ||
+                         cbs_phase2_summary_required_crossing_slots == 0u) {
+                two_stage_non_activation_reason_diag = "no_crossing_requested";
+              } else if (cbs_phase2_summary_factor_count_emitted == 0u) {
+                two_stage_non_activation_reason_diag = "no_summary_factors";
+              } else if (cbs_phase2_directly_removable_local_internal_candidate_slots >
+                             0u &&
+                         two_stage_direct_local_stage_a_packet_compatible_count_diag ==
+                             0u) {
+                two_stage_non_activation_reason_diag =
+                    "no_direct_local_stage_a_support";
+              } else if (cbs_phase2_summary_crossing_replay_requested_count ==
+                             0u &&
+                         !defer_summary_crossing_one_epoch_requested) {
+                two_stage_non_activation_reason_diag = "replay_not_requested";
+              } else {
+                two_stage_non_activation_reason_diag = "other_exact_reason";
+              }
+            } else {
+              two_stage_non_activation_reason_diag = "none";
             }
 
             if (enable_remove_factor_indices &&
@@ -25000,7 +26457,10 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             int rounds_executed = 1;
             std::optional<double> prev_residual = compute_cbs_residual();
 
-            for (int round = 1; round < max_pose_rounds; ++round) {
+            for (int round = 1;
+                 round < max_pose_rounds &&
+                 !single_packet_fallback_preflight_skipped;
+                 ++round) {
               const auto inner_round_start = std::chrono::steady_clock::now();
               cbs_result = cbs_optimizer_->update(gtsam::NonlinearFactorGraph(),
                                                   gtsam::Values(),
@@ -25161,6 +26621,177 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   << sanitize_forensic_token(cbs_phase2_primary_update_mode)
                   << std::endl;
             }
+            static bool lag_boundary_candidate_discovery_diag_emitted_once_global =
+                false;
+            const bool emit_lag_boundary_candidate_discovery_diag_global =
+                !lag_boundary_candidate_discovery_diag_emitted_once_global &&
+                cbs_phase2_summary_attempted &&
+                cbs_phase2_boundary_crossing_factor_slots_count == 0u;
+            if (emit_lag_boundary_candidate_discovery_diag_global) {
+              std::cerr
+                  << std::setprecision(12)
+                  << "[CBS][LagBoundaryCandidateDiscoveryDiag]"
+                  << " curr_kf_id=" << curr_kf_id_
+                  << " stale_state_keys_count="
+                  << cbs_phase2_stale_state_keys_count
+                  << " kept_state_keys_count="
+                  << cbs_phase2_kept_state_keys_count
+                  << " stale_pose_keys_count="
+                  << cbs_phase2_stale_pose_keys_count
+                  << " kept_pose_keys_count="
+                  << cbs_phase2_kept_pose_keys_count
+                  << " stale_local_factor_slots_count="
+                  << cbs_phase2_stale_local_factor_slots_count_for_discovery
+                  << " candidate_factors_touching_stale_count="
+                  << cbs_phase2_candidate_factors_touching_stale_count
+                  << " candidate_factors_touching_kept_count="
+                  << cbs_phase2_candidate_factors_touching_kept_count
+                  << " candidate_factors_touching_both_stale_and_kept_count="
+                  << cbs_phase2_candidate_factors_touching_both_stale_and_kept_count
+                  << " boundary_candidate_crossing_factor_slots_count_raw="
+                  << cbs_phase2_boundary_candidate_crossing_factor_slots_count_raw
+                  << " rejected_candidate_due_to_no_stale_incidence_count="
+                  << cbs_phase2_rejected_candidate_due_to_no_stale_incidence_count
+                  << " rejected_candidate_due_to_no_kept_incidence_count="
+                  << cbs_phase2_rejected_candidate_due_to_no_kept_incidence_count
+                  << " rejected_candidate_due_to_nonlocal_ownership_count="
+                  << cbs_phase2_rejected_candidate_due_to_nonlocal_ownership_count
+                  << " rejected_candidate_due_to_belief_factor_count="
+                  << cbs_phase2_rejected_candidate_due_to_belief_factor_count
+                  << " rejected_candidate_due_to_missing_factor_ptr_count="
+                  << cbs_phase2_rejected_candidate_due_to_missing_factor_ptr_count
+                  << " first_boundary_candidate_rejected_slot="
+                  << cbs_phase2_first_boundary_candidate_rejected_slot
+                  << " first_boundary_candidate_rejected_slot_class="
+                  << sanitize_forensic_token(
+                         cbs_phase2_first_boundary_candidate_rejected_slot_class)
+                  << " first_boundary_candidate_rejected_slot_keys="
+                  << sanitize_forensic_token(
+                         cbs_phase2_first_boundary_candidate_rejected_slot_keys)
+                  << " first_boundary_candidate_rejected_reason="
+                  << sanitize_forensic_token(
+                         cbs_phase2_first_boundary_candidate_rejected_reason)
+                  << " boundary_candidate_crossing_factor_slots_first_few_raw="
+                  << sanitize_forensic_token(
+                         cbs_phase2_boundary_candidate_crossing_factor_slots_first_few_raw)
+                  << " discovery_mode=upstream_boundary_candidate_discovery"
+                  << std::endl;
+              lag_boundary_candidate_discovery_diag_emitted_once_global = true;
+            }
+            static bool lag_edge_crossing_selection_diag_emitted_once_global =
+                false;
+            const bool emit_lag_edge_crossing_selection_diag_global =
+                !lag_edge_crossing_selection_diag_emitted_once_global &&
+                cbs_phase2_summary_attempted &&
+                cbs_phase2_boundary_crossing_factor_slots_count == 0u;
+            if (emit_lag_edge_crossing_selection_diag_global) {
+              std::cerr
+                  << std::setprecision(12)
+                  << "[CBS][LagEdgeCrossingSelectionDiag]"
+                  << " curr_kf_id=" << curr_kf_id_
+                  << " boundary_crossing_factor_slots_count="
+                  << cbs_phase2_boundary_crossing_factor_slots_count
+                  << " local_crossing_factor_slots_count="
+                  << cbs_phase2_local_crossing_factor_slots_count
+                  << " nonbelief_local_crossing_factor_slots_count="
+                  << cbs_phase2_nonbelief_local_crossing_factor_slots_count
+                  << " selected_local_nonbelief_crossing_factor_slots_count="
+                  << cbs_phase2_selected_local_nonbelief_crossing_factor_slots_count
+                  << " rejected_crossing_due_to_nonlocal_count="
+                  << cbs_phase2_rejected_crossing_due_to_nonlocal_count
+                  << " rejected_crossing_due_to_belief_count="
+                  << cbs_phase2_rejected_crossing_due_to_belief_count
+                  << " rejected_crossing_due_to_missing_estimate_count="
+                  << cbs_phase2_rejected_crossing_due_to_missing_estimate_count
+                  << " rejected_crossing_due_to_target_mismatch_count="
+                  << cbs_phase2_rejected_crossing_due_to_target_mismatch_count
+                  << " first_rejected_crossing_slot="
+                  << cbs_phase2_first_rejected_crossing_slot
+                  << " first_rejected_crossing_slot_class="
+                  << sanitize_forensic_token(
+                         cbs_phase2_first_rejected_crossing_slot_class)
+                  << " first_rejected_crossing_slot_keys="
+                  << sanitize_forensic_token(
+                         cbs_phase2_first_rejected_crossing_slot_keys)
+                  << " first_rejected_crossing_reason="
+                  << sanitize_forensic_token(
+                         cbs_phase2_first_rejected_crossing_reason)
+                  << " boundary_crossing_factor_slots_first_few="
+                  << sanitize_forensic_token(
+                         cbs_phase2_boundary_crossing_factor_slots_first_few)
+                  << " local_crossing_factor_slots_first_few="
+                  << sanitize_forensic_token(
+                         cbs_phase2_local_crossing_factor_slots_first_few)
+                  << " nonbelief_local_crossing_factor_slots_first_few="
+                  << sanitize_forensic_token(
+                         cbs_phase2_nonbelief_local_crossing_factor_slots_first_few)
+                  << " selected_local_nonbelief_crossing_factor_slots_first_few="
+                  << sanitize_forensic_token(
+                         cbs_phase2_selected_local_nonbelief_crossing_factor_slots_first_few)
+                  << " selection_mode=strict_local_nonbelief_crossing_funnel"
+                  << std::endl;
+              lag_edge_crossing_selection_diag_emitted_once_global = true;
+            }
+            std::cerr << std::setprecision(12)
+                      << "[CBS][TwoStageActivationOverrideDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " summary_plan_exists="
+                      << ((cbs_phase2_summary_attempted && phase2_plan_ready) ? 1
+                                                                              : 0)
+                      << " summary_factor_count_emitted="
+                      << cbs_phase2_summary_factor_count_emitted
+                      << " summary_covered_crossing_count="
+                      << cbs_phase2_summary_covered_crossing_slots
+                      << " direct_local_candidate_count="
+                      << cbs_phase2_directly_removable_local_internal_candidate_slots
+                      << " replay_requested_count="
+                      << cbs_phase2_summary_crossing_replay_requested_count
+                      << " single_packet_contract_preferred_before_override="
+                      << (single_packet_contract_preferred_before_override_diag
+                              ? 1
+                              : 0)
+                      << " two_stage_forced_active_by_summary_gate="
+                      << (two_stage_forced_active_by_summary_gate_diag ? 1 : 0)
+                      << " override_reason="
+                      << sanitize_forensic_token(
+                             two_stage_activation_override_reason_diag)
+                      << " activation_mode=summary_backed_two_stage_gate_override"
+                      << std::endl;
+            std::cerr << std::setprecision(12)
+                      << "[CBS][TwoStageActivationDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " cbs_phase2_two_stage_effective="
+                      << (cbs_phase2_two_stage_effective ? 1 : 0)
+                      << " packet_shape_mode="
+                      << sanitize_forensic_token(two_stage_packet_shape_mode_diag)
+                      << " summary_mode="
+                      << sanitize_forensic_token(cbs_phase2_summary_mode)
+                      << " summary_plan_exists="
+                      << ((cbs_phase2_summary_attempted && phase2_plan_ready) ? 1
+                                                                              : 0)
+                      << " summary_injected_this_epoch="
+                      << (cbs_phase2_summary_injected_this_epoch ? 1 : 0)
+                      << " summary_factor_count_emitted="
+                      << cbs_phase2_summary_factor_count_emitted
+                      << " direct_local_candidate_count="
+                      << cbs_phase2_directly_removable_local_internal_candidate_slots
+                      << " direct_local_stage_a_packet_compatible_count="
+                      << two_stage_direct_local_stage_a_packet_compatible_count_diag
+                      << " summary_covered_crossing_count="
+                      << cbs_phase2_summary_covered_crossing_slots
+                      << " replay_requested_count="
+                      << cbs_phase2_summary_crossing_replay_requested_count
+                      << " stage_a_preflight_skip="
+                      << (stage_a_preflight_skip_for_origin_diag ? 1 : 0)
+                      << " stage_b_continued_after_stage_a_skip="
+                      << (stage_b_continued_after_stage_a_skip_for_origin_diag ? 1
+                                                                                : 0)
+                      << " two_stage_activation_reason="
+                      << sanitize_forensic_token(two_stage_activation_reason_diag)
+                      << " two_stage_non_activation_reason="
+                      << sanitize_forensic_token(two_stage_non_activation_reason_diag)
+                      << " activation_mode=two_stage_regime_selection_audit"
+                      << std::endl;
 	            std::cerr
 	                << std::setprecision(12)
 	                << "[CBS][HeartEpochDiag] curr_kf_id=" << curr_kf_id_
@@ -27092,6 +28723,102 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             if (has_map_at) {
               ++cbs_map_at_count_so_far_;
               cbs_crash_imminent_marker_epoch = true;
+            }
+            if (has_map_at) {
+              const long long first_remove_slot =
+                  cbs_update_packet_forensics.remove_analysis.first_slot;
+              const std::string first_remove_slot_class =
+                  sanitize_forensic_token(
+                      cbs_update_packet_forensics.remove_analysis.first_type);
+              std::string first_remove_slot_keys = "none";
+              if (first_remove_slot >= 0) {
+                first_remove_slot_keys = sanitize_forensic_token(
+                    format_factor_keys_for_slot(
+                        cbs_optimizer_->getFactorsUnsafe(),
+                        static_cast<size_t>(first_remove_slot)));
+              }
+              std::string summary_failure_reason_exact =
+                  summary_failure_reason_exact_for_origin_diag;
+              if (summary_failure_reason_exact == "none") {
+                if (cbs_phase2_first_summary_failure_reason != "none") {
+                  summary_failure_reason_exact = sanitize_forensic_token(
+                      cbs_phase2_first_summary_failure_reason);
+                } else if (cbs_phase2_first_expanded_summary_failure_reason !=
+                           "none") {
+                  summary_failure_reason_exact = sanitize_forensic_token(
+                      cbs_phase2_first_expanded_summary_failure_reason);
+                }
+              }
+              const std::string precise_origin_mode =
+                  classify_precise_exception_origin_mode(exception_phase_label);
+              if (!first_out_of_range_origin_diag_emitted_once) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][FirstOutOfRangeOriginDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " current_update_stage="
+                          << sanitize_forensic_token(
+                                 cbs_two_stage_current_update_stage)
+                          << " phase_label="
+                          << sanitize_forensic_token(exception_phase_label)
+                          << " exception_message="
+                          << sanitize_forensic_token(err_msg)
+                          << " stage_a_preflight_skip="
+                          << (stage_a_preflight_skip_for_origin_diag ? 1 : 0)
+                          << " stage_b_continued_after_stage_a_skip="
+                          << (stage_b_continued_after_stage_a_skip_for_origin_diag
+                                  ? 1
+                                  : 0)
+                          << " stage_b_factor_count="
+                          << stage_b_factor_count_for_origin_diag
+                          << " stage_b_value_count="
+                          << stage_b_value_count_for_origin_diag
+                          << " stage_b_remove_count="
+                          << stage_b_remove_count_for_origin_diag
+                          << " first_remove_slot=" << first_remove_slot
+                          << " first_remove_slot_class="
+                          << first_remove_slot_class
+                          << " first_remove_slot_keys="
+                          << first_remove_slot_keys
+                          << " summary_failure_reason_exact="
+                          << sanitize_forensic_token(summary_failure_reason_exact)
+                          << " origin_mode="
+                          << sanitize_forensic_token(precise_origin_mode)
+                          << std::endl;
+                first_out_of_range_origin_diag_emitted_once = true;
+              }
+              if (stage_b_continuation_seen_once &&
+                  !first_map_at_after_stage_b_continuation_diag_emitted_once) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][FirstMapAtAfterStageBContinuationDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " current_update_stage="
+                          << sanitize_forensic_token(
+                                 cbs_two_stage_current_update_stage)
+                          << " phase_label="
+                          << sanitize_forensic_token(exception_phase_label)
+                          << " exception_message="
+                          << sanitize_forensic_token(err_msg)
+                          << " stage_a_preflight_skip="
+                          << (stage_a_preflight_skip_for_origin_diag ? 1 : 0)
+                          << " stage_b_continued_after_stage_a_skip="
+                          << (stage_b_continued_after_stage_a_skip_for_origin_diag
+                                  ? 1
+                                  : 0)
+                          << " stage_b_factor_count="
+                          << stage_b_factor_count_for_origin_diag
+                          << " stage_b_value_count="
+                          << stage_b_value_count_for_origin_diag
+                          << " stage_b_remove_count="
+                          << stage_b_remove_count_for_origin_diag
+                          << " real_applied_total_remove_slots_count="
+                          << cbs_phase2_real_applied_total_remove_slots_count
+                          << " summary_failure_reason_exact="
+                          << sanitize_forensic_token(summary_failure_reason_exact)
+                          << " map_at_origin_mode="
+                          << sanitize_forensic_token(precise_origin_mode)
+                          << std::endl;
+                first_map_at_after_stage_b_continuation_diag_emitted_once = true;
+              }
             }
             if (err_msg.find("IndeterminantLinearSystemException") !=
                 std::string::npos) {
