@@ -163,6 +163,26 @@ DEFINE_double(cbs_belief_d_reset,
 DEFINE_double(cbs_belief_gamma,
               0.1,
               "CBS contraction gamma (used when alpha is adaptive).");
+DEFINE_bool(cbs_belief_enable_soft_reset,
+            true,
+            "Enable CBS soft-reset relaxation in belief contraction.");
+DEFINE_bool(cbs_use_anchored_receiver_local_for_merge,
+            true,
+            "If true, use anchored receiver-local covariance in CBS "
+            "belief-merge path.");
+DEFINE_double(cbs_receiver_local_anchor_rot_var,
+              1e-2,
+              "Rotation variance for anchored receiver-local covariance "
+              "used in CBS belief merge.");
+DEFINE_double(cbs_receiver_local_anchor_trans_var,
+              1e-1,
+              "Translation variance for anchored receiver-local covariance "
+              "used in CBS belief merge.");
+DEFINE_double(liorf_to_kimera_belief_factor_cov_scale,
+              1.0,
+              "Directional covariance scale applied on Kimera receiver when "
+              "factorizing incoming source=liorf beliefs. "
+              "C_factor = scale * C_msg.");
 //zy Step 40b
 // Number of CBS inner update rounds per backend epoch (first round uses new factors, later rounds are belief-only).
 DEFINE_int32(cbs_pose_rounds_per_epoch,
@@ -366,6 +386,18 @@ DEFINE_bool(
     "If true, for the first boundary Stage-A epoch only, keep Stage-A "
     "factors/values unchanged but force Stage-A removeFactorIndices empty "
     "(diagnostic isolation only).");
+DEFINE_int32(
+    cbs_stage_a_support_only_salvage_relocation_warmup_oldest_active_frame_id_max,
+    3,
+    "Bounded warm-up window for Stage-A support-only-salvage relocation. "
+    "When oldest_active_frame_id <= this threshold, keep support-only-salvage "
+    "remove slots deferred instead of relocating them into Stage-B.");
+DEFINE_int32(
+    cbs_stage_a_support_only_salvage_relocation_warmup_exit_extra_epochs,
+    1,
+    "Extra bounded hold after warm-up for Stage-A support-only-salvage "
+    "relocation. Effective defer window is "
+    "oldest_active_frame_id <= (warmup_max + exit_extra_epochs).");
 DEFINE_bool(
     cbs_diag_phase2_disable_overlap_guard,
     false,
@@ -421,6 +453,11 @@ DEFINE_bool(cbs_h2_publish_anchored_local_cov,
             true,
             "If true, publish H2 local covariance after adding a temporary "
             "pose anchor prior at the queried key (LIORF-aligned behavior).");
+DEFINE_bool(cbs_h2_drop_publish_on_cov_fallback,
+            true,
+            "If true, H2 local-cov mode drops outgoing belief publish when "
+            "local-only covariance is unavailable, instead of publishing a "
+            "fallback covariance with different semantics.");
 DEFINE_double(cbs_h2_local_cov_anchor_rot_var,
               1e-2,
               "Rotation variance for temporary pose-anchor prior used by H2 "
@@ -475,6 +512,61 @@ DEFINE_int64(cbs_rejected_source_max_backoff_ns,
              10000000000LL,  // 10s
              "Maximum per-source cooldown (ns) after repeated addBeliefs() "
              "rejections in CBS-heart mode.");
+DEFINE_bool(cbs_belief_health_gate_enabled,
+            true,
+            "If true, apply health-aware gating before CBS addBeliefs() "
+            "using disagreement/consistency/track-record checks.");
+DEFINE_double(cbs_belief_health_sender_margin,
+              0.05,
+              "Minimum sender-health minus receiver-health margin required "
+              "to accept external belief merge.");
+DEFINE_double(cbs_belief_health_disagreement_min_d2,
+              0.10,
+              "Minimum disagreement d^2 considered informative for "
+              "consistency-window gating.");
+DEFINE_double(cbs_belief_health_disagreement_consistency_max_d2,
+              40.0,
+              "Maximum disagreement d^2 treated as consistency-window "
+              "candidate.");
+DEFINE_double(cbs_belief_health_disagreement_reject_max_d2,
+              80.0,
+              "Reject incoming belief when disagreement d^2 exceeds this "
+              "threshold.");
+DEFINE_int32(cbs_belief_health_min_consistent_frames,
+             2,
+             "Minimum consecutive consistent observations before accepting "
+             "informative disagreement beliefs.");
+DEFINE_double(cbs_belief_health_hard_quarantine_d2,
+              150.0,
+              "Hard-quarantine threshold for disagreement d^2.");
+DEFINE_int64(cbs_belief_health_hard_quarantine_ns,
+             5000000000LL,  // 5s
+             "Hard-quarantine duration (ns) for a source after severe "
+             "overconfident disagreement.");
+DEFINE_double(cbs_belief_health_overconfident_trace_threshold,
+              5e-3,
+              "Incoming covariance trace threshold below which a belief is "
+              "treated as overconfident for health gating.");
+DEFINE_double(cbs_belief_health_covariance_inflation_factor,
+              4.0,
+              "Covariance inflation factor applied to overconfident incoming "
+              "beliefs before merge when disagreement is elevated.");
+DEFINE_double(cbs_belief_health_bounded_pull_max_rot_rad,
+              0.35,
+              "Maximum rotational pull (rad) allowed for one accepted "
+              "external belief merge.");
+DEFINE_double(cbs_belief_health_bounded_pull_max_trans_m,
+              0.75,
+              "Maximum translational pull (m) allowed for one accepted "
+              "external belief merge.");
+DEFINE_double(cbs_belief_health_extrinsic_rot_var,
+              1e-3,
+              "Rotation variance added to disagreement covariance model as "
+              "extrinsic uncertainty.");
+DEFINE_double(cbs_belief_health_extrinsic_trans_var,
+              1e-2,
+              "Translation variance added to disagreement covariance model as "
+              "extrinsic uncertainty.");
 #endif
 
 namespace {
@@ -505,8 +597,9 @@ inline bool useCbsOptimizerHeart() {
 
 inline bool useCbsH2LocalCovSidecar() {
 #ifdef KIMERA_USE_CBS
-  return FLAGS_use_cbs_optimizer && !FLAGS_cbs_replace_fixed_lag_optimizer &&
-         FLAGS_cbs_h2_local_cov_sidecar;
+  // H2 local-cov sidegraph can be used in both legacy fixed-lag and CBS-heart
+  // optimizer modes. The sidegraph itself carries the local-only contract.
+  return FLAGS_use_cbs_optimizer && FLAGS_cbs_h2_local_cov_sidecar;
 #else
   return false;
 #endif
@@ -765,6 +858,14 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
       static_cast<float>(FLAGS_cbs_belief_d_reset);
   cbs_params.gbp_update_params.gamma =
       static_cast<float>(FLAGS_cbs_belief_gamma);
+  cbs_params.gbp_update_params.enable_soft_reset =
+      FLAGS_cbs_belief_enable_soft_reset;
+  cbs_params.use_anchored_receiver_local_for_merge =
+      FLAGS_cbs_use_anchored_receiver_local_for_merge;
+  cbs_params.receiver_local_anchor_rot_var =
+      FLAGS_cbs_receiver_local_anchor_rot_var;
+  cbs_params.receiver_local_anchor_trans_var =
+      FLAGS_cbs_receiver_local_anchor_trans_var;
 
   cbs_optimizer_ = std::make_shared<cbs::BPSAM>(cbs_params);
   // LOG(INFO) << "CBS BPSAM scaffold initialized (inactive)."; (zy cancelled it)
@@ -780,7 +881,37 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   LOG(INFO) << "CBS belief contraction params: type=Contract, metric=Hellinger"
             << ", alpha=" << FLAGS_cbs_belief_contract_alpha
             << ", d_reset=" << FLAGS_cbs_belief_d_reset
-            << ", gamma=" << FLAGS_cbs_belief_gamma;
+            << ", gamma=" << FLAGS_cbs_belief_gamma
+            << ", soft_reset="
+            << (FLAGS_cbs_belief_enable_soft_reset ? "true" : "false");
+  LOG(INFO) << "CBS receiver-local merge params: anchored_local="
+            << (FLAGS_cbs_use_anchored_receiver_local_for_merge ? "true"
+                                                                 : "false")
+            << ", anchor_rot_var=" << FLAGS_cbs_receiver_local_anchor_rot_var
+            << ", anchor_trans_var="
+            << FLAGS_cbs_receiver_local_anchor_trans_var;
+  LOG(INFO) << "CBS directional belief-factor scale: source=liorf -> kimera, "
+            << "scale=" << FLAGS_liorf_to_kimera_belief_factor_cov_scale;
+  LOG(INFO) << "CBS belief health gate: enabled="
+            << (FLAGS_cbs_belief_health_gate_enabled ? "true" : "false")
+            << ", sender_margin=" << FLAGS_cbs_belief_health_sender_margin
+            << ", d2_min=" << FLAGS_cbs_belief_health_disagreement_min_d2
+            << ", d2_consistency_max="
+            << FLAGS_cbs_belief_health_disagreement_consistency_max_d2
+            << ", d2_reject_max="
+            << FLAGS_cbs_belief_health_disagreement_reject_max_d2
+            << ", d2_hard_quarantine="
+            << FLAGS_cbs_belief_health_hard_quarantine_d2
+            << ", min_consistent_frames="
+            << FLAGS_cbs_belief_health_min_consistent_frames
+            << ", hard_quarantine_ns="
+            << FLAGS_cbs_belief_health_hard_quarantine_ns
+            << ", pull_max_rot_rad="
+            << FLAGS_cbs_belief_health_bounded_pull_max_rot_rad
+            << ", pull_max_trans_m="
+            << FLAGS_cbs_belief_health_bounded_pull_max_trans_m
+            << ", cov_inflation="
+            << FLAGS_cbs_belief_health_covariance_inflation_factor;
   //zy Step 40e
   // Surface CBS pose-round controls at startup for reproducible experiments.
   LOG(INFO) << "CBS config: gkcm=" << (FLAGS_cbs_enable_gkcm ? "true" : "false")
@@ -789,6 +920,8 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << ", conv_rel=" << FLAGS_cbs_pose_convergence_rel_residual;
   LOG(INFO) << "CBS H2 local covariance extraction: anchored_publish="
             << (FLAGS_cbs_h2_publish_anchored_local_cov ? "true" : "false")
+            << ", drop_publish_on_cov_fallback="
+            << (FLAGS_cbs_h2_drop_publish_on_cov_fallback ? "true" : "false")
             << ", anchor_rot_var=" << FLAGS_cbs_h2_local_cov_anchor_rot_var
             << ", anchor_trans_var="
             << FLAGS_cbs_h2_local_cov_anchor_trans_var
@@ -1849,13 +1982,18 @@ void VioBackend::computeStateCovariance() {
     // Intuition: in CBS-heart mode, covariance must come from BPSAM marginals, not from the legacy fixed-lag smoother.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     
-    // Intuition: BPSAM exposes per-key marginals; we build a conservative block-diagonal [x(6), v(3), b(6)] covariance.
+    // Intuition: BPSAM exposes per-key marginals; we build a conservative
+    // block-diagonal [x(6), v(3), b(6)] covariance.
+    // Important: this seed must not be treated as valid output unless pose
+    // covariance is actually populated from BPSAM.
     state_covariance_lkf_ = gtsam::Matrix::Identity(15, 15) * 1e-6;
+    state_covariance_lkf_valid_ = false;
 
     const gtsam::Symbol pose_key(kPoseSymbolChar, curr_kf_id_);
     const gtsam::Symbol vel_key(kVelocitySymbolChar, curr_kf_id_);
     const gtsam::Symbol bias_key(kImuBiasSymbolChar, curr_kf_id_);
 
+    bool pose_covariance_valid = false;
     if (cbs_optimizer_->valueExists(pose_key)) {
       try {
         const gtsam::Matrix pose_cov = cbs_optimizer_->marginalCovariance(
@@ -1864,6 +2002,7 @@ void VioBackend::computeStateCovariance() {
             pose_cov.allFinite()) {
           state_covariance_lkf_.block(0, 0, 6, 6) =
               pose_cov.topLeftCorner(6, 6);
+          pose_covariance_valid = true;
         } else {
           VLOG(2) << "Invalid CBS pose covariance for key: " << pose_key;
         }
@@ -1913,10 +2052,15 @@ void VioBackend::computeStateCovariance() {
       VLOG(2) << "CBS bias key not found for covariance: " << bias_key;
     }
 
-    // Intuition: enforce numeric symmetry before publishing/consuming covariance downstream.
+    // Intuition: enforce numeric symmetry before publishing/consuming
+    // covariance downstream.
     state_covariance_lkf_ =
         0.5 * (state_covariance_lkf_ + state_covariance_lkf_.transpose());
-    state_covariance_lkf_valid_ = true;
+    state_covariance_lkf_valid_ = pose_covariance_valid;
+    if (!state_covariance_lkf_valid_) {
+      VLOG(1) << "CBS state covariance marked invalid for frame " << curr_kf_id_
+              << " (pose covariance unavailable).";
+    }
     return;
   }
 #endif
@@ -1972,7 +2116,7 @@ bool VioBackend::queryH2LocalPoseCovFromActiveSmoother(
   set_reason("none");
   set_source_path("unset");
 
-  if (!useCbsH2LocalCovSidecar() || useCbsOptimizerHeart()) {
+  if (!useCbsH2LocalCovSidecar()) {
     set_reason("h2_mode_inactive");
     return false;
   }
@@ -2307,7 +2451,7 @@ bool VioBackend::getLatestExternalPoseBelief(
     cbs_last_epoch_priors_injected = cbs_last_epoch_priors_injected_;
   }
 
-  if (useCbsH2LocalCovSidecar() && !useCbsOptimizerHeart() && !covariance_set) {
+  if (useCbsH2LocalCovSidecar() && !covariance_set) {
     gtsam::Pose3 local_pose = belief->W_Pose_B_;
     gtsam::Matrix66 local_cov = gtsam::Matrix66::Identity();
     std::string local_reason;
@@ -2341,13 +2485,16 @@ bool VioBackend::getLatestExternalPoseBelief(
   // In CBS mode, export covariance from BPSAM marginals so shared beliefs reflect the CBS state.
   if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
-    if (FLAGS_cbs_outgoing_cov_fastpath_when_no_external_effect &&
+    if (!covariance_set &&
+        FLAGS_cbs_outgoing_cov_fastpath_when_no_external_effect &&
         cbs_last_epoch_no_external_effect &&
         state_covariance_lkf_valid_ && state_covariance_lkf_.rows() >= 6 &&
         state_covariance_lkf_.cols() >= 6) {
       const gtsam::Matrix66 fallback_pose_cov =
           state_covariance_lkf_.topLeftCorner<6, 6>();
-      if (fallback_pose_cov.allFinite()) {
+      constexpr double kMinFastpathPoseTrace = 1e-5;
+      if (fallback_pose_cov.allFinite() &&
+          fallback_pose_cov.trace() > kMinFastpathPoseTrace) {
         belief->covariance_ = fallback_pose_cov;
         covariance_set = true;
         outgoing_cov_source = "state_covariance_fastpath_no_external_effect";
@@ -2417,10 +2564,34 @@ bool VioBackend::getLatestExternalPoseBelief(
   }
 #endif
 
+  if (!covariance_set && useCbsH2LocalCovSidecar() &&
+      FLAGS_cbs_h2_drop_publish_on_cov_fallback) {
+    h2_cov_fallback_used = true;
+    if (h2_cov_fallback_reason == "none") {
+      h2_cov_fallback_reason = "h2_local_cov_unavailable";
+    }
+#ifdef KIMERA_USE_CBS
+    ++cbs_h2_sidecar_fallback_cov_epochs_;
+#endif
+    std::cerr << std::setprecision(12)
+              << "[CBS][OutgoingBeliefDropDiag] timestamp_ns=" << timestamp_lkf_
+              << " frame_id=" << curr_kf_id_
+              << " pose_key=" << pose_symbol.key()
+              << " cbs_heart_active=" << (useCbsOptimizerHeart() ? 1 : 0)
+              << " h2_mode=" << (useCbsH2LocalCovSidecar() ? 1 : 0)
+              << " h2_sidecar_sync_ok=" << (cbs_h2_sidecar_sync_ok_ ? 1 : 0)
+              << " h2_sidecar_key_exists_for_outgoing="
+              << (h2_sidecar_key_exists_for_outgoing ? 1 : 0)
+              << " h2_cov_fallback_reason=" << h2_cov_fallback_reason
+              << " drop_reason=h2_local_cov_fallback_blocked"
+              << std::endl;
+    return false;
+  }
+
   // Optional safe path: only use backend covariance when it has been explicitly
   // computed and validated.
   if (!covariance_set) {
-    h2_cov_fallback_used = useCbsH2LocalCovSidecar() && !useCbsOptimizerHeart();
+    h2_cov_fallback_used = useCbsH2LocalCovSidecar();
     if (h2_cov_fallback_used && h2_cov_fallback_reason == "none") {
       h2_cov_fallback_reason = "legacy_covariance_fallback_path";
     }
@@ -2437,7 +2608,8 @@ bool VioBackend::getLatestExternalPoseBelief(
       }
     } else {
       // Legacy path (preserve existing behavior outside explicitly tuned runs).
-      if (state_covariance_lkf_.rows() >= 6 && state_covariance_lkf_.cols() >= 6) {
+      if (state_covariance_lkf_valid_ && state_covariance_lkf_.rows() >= 6 &&
+          state_covariance_lkf_.cols() >= 6) {
         belief->covariance_ = state_covariance_lkf_.topLeftCorner<6, 6>();
         covariance_set = true;
         outgoing_cov_source = "state_covariance_legacy";
@@ -2447,7 +2619,7 @@ bool VioBackend::getLatestExternalPoseBelief(
 
   // Fallback when covariance is unavailable.
   if (!covariance_set) {
-    h2_cov_fallback_used = useCbsH2LocalCovSidecar() && !useCbsOptimizerHeart();
+    h2_cov_fallback_used = useCbsH2LocalCovSidecar();
     if (h2_cov_fallback_used && h2_cov_fallback_reason == "none") {
       h2_cov_fallback_reason = "identity_or_conservative_covariance_fallback";
     }
@@ -2496,8 +2668,7 @@ bool VioBackend::getLatestExternalPoseBelief(
   }
 
 #ifdef KIMERA_USE_CBS
-  if (useCbsH2LocalCovSidecar() && !useCbsOptimizerHeart() &&
-      h2_cov_fallback_used) {
+  if (useCbsH2LocalCovSidecar() && h2_cov_fallback_used) {
     ++cbs_h2_sidecar_fallback_cov_epochs_;
   }
 #endif
@@ -2599,7 +2770,7 @@ bool VioBackend::getExternalPoseBeliefAtTimestamp(
   const gtsam::Symbol pose_symbol(kPoseSymbolChar, matched_frame_id);
 
 #ifdef KIMERA_USE_CBS
-  if (useCbsH2LocalCovSidecar() && !useCbsOptimizerHeart()) {
+  if (useCbsH2LocalCovSidecar()) {
     gtsam::Pose3 local_pose;
     gtsam::Matrix66 local_cov = gtsam::Matrix66::Identity();
     std::string local_reason;
@@ -3566,10 +3737,6 @@ bool VioBackend::refreshH2LocalCovariancePassiveSnapshot(
 
   if (!useCbsH2LocalCovSidecar()) {
     stats->failure_reason = "h2_mode_disabled";
-    return false;
-  }
-  if (useCbsOptimizerHeart()) {
-    stats->failure_reason = "heart_is_cbs";
     return false;
   }
   if (packet.local_factors.empty()) {
@@ -9174,6 +9341,7 @@ bool VioBackend::optimize(
   size_t num_external_beliefs_staged = 0;
   size_t num_external_beliefs_rejected = 0;
   size_t num_external_beliefs_accepted = 0;
+  size_t num_external_beliefs_accepted_direct = 0;
   size_t num_external_beliefs_rejected_keys_touched = 0;
   size_t num_external_beliefs_rejected_factors_touched = 0;
   size_t num_external_beliefs_dropped_bad_noise = 0;
@@ -9186,6 +9354,15 @@ bool VioBackend::optimize(
   // zy Step 33b
   constexpr cbs::AgentId kKimeraAgentId = static_cast<cbs::AgentId>('a');
   constexpr cbs::AgentId kLiorfAgentId = static_cast<cbs::AgentId>('b');
+  size_t num_external_beliefs_health_gate_rejected = 0u;
+  size_t num_external_beliefs_health_gate_quarantined = 0u;
+  size_t num_external_beliefs_health_gate_cov_inflated = 0u;
+  size_t num_external_beliefs_health_gate_pull_capped = 0u;
+  std::unordered_set<std::string> accepted_sources_for_health_track;
+  const size_t map_at_count_at_epoch_start = cbs_map_at_count_so_far_;
+  const size_t ils_count_at_epoch_start = cbs_bpsam_ilsretry_count_so_far_;
+  const size_t recovery_count_at_epoch_start = cbs_recovery_count_so_far_;
+  double receiver_health_score_for_epoch = cbs_receiver_health_score_;
   #endif
 
 
@@ -9216,6 +9393,68 @@ bool VioBackend::optimize(
                FLAGS_cbs_rejected_source_max_backoff_ns > 0
                    ? static_cast<Timestamp>(FLAGS_cbs_rejected_source_max_backoff_ns)
                    : kRejectedSourceInitialBackoffNs);
+#endif
+
+#ifdef KIMERA_USE_CBS
+  if (cbs_exchange_active && cbs_heart_active &&
+      FLAGS_cbs_belief_health_gate_enabled) {
+    double pose_jump_norm = 0.0;
+    if (cbs_receiver_health_pose_initialized_) {
+      const gtsam::Vector6 pose_jump =
+          gtsam::traits<gtsam::Pose3>::Logmap(
+              cbs_receiver_health_prev_pose_.between(W_Pose_B_lkf_from_state_));
+      pose_jump_norm = pose_jump.norm();
+      if (!std::isfinite(pose_jump_norm)) {
+        pose_jump_norm = 0.0;
+      }
+    }
+    cbs_receiver_health_pose_jump_ewma_ =
+        0.8 * cbs_receiver_health_pose_jump_ewma_ + 0.2 * pose_jump_norm;
+
+    double normalized_residual = cbs_receiver_health_residual_ewma_;
+    try {
+      CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+      const gtsam::Values est = cbs_optimizer_->calculateEstimate();
+      const double raw_error = cbs_optimizer_->getFactorsUnsafe().error(est);
+      const double denom = std::max(
+          1.0, static_cast<double>(cbs_optimizer_->getFactorsUnsafe().size()));
+      normalized_residual =
+          (std::isfinite(raw_error) && raw_error >= 0.0) ? raw_error / denom : 0.0;
+    } catch (...) {
+      normalized_residual = cbs_receiver_health_residual_ewma_;
+    }
+    cbs_receiver_health_residual_ewma_ =
+        0.8 * cbs_receiver_health_residual_ewma_ + 0.2 * normalized_residual;
+
+    const size_t map_at_delta =
+        (cbs_map_at_count_so_far_ >= cbs_receiver_health_prev_map_at_count_)
+            ? (cbs_map_at_count_so_far_ - cbs_receiver_health_prev_map_at_count_)
+            : 0u;
+    const size_t ils_delta =
+        (cbs_bpsam_ilsretry_count_so_far_ >= cbs_receiver_health_prev_ils_count_)
+            ? (cbs_bpsam_ilsretry_count_so_far_ -
+               cbs_receiver_health_prev_ils_count_)
+            : 0u;
+    const size_t recovery_delta =
+        (cbs_recovery_count_so_far_ >= cbs_receiver_health_prev_recovery_count_)
+            ? (cbs_recovery_count_so_far_ -
+               cbs_receiver_health_prev_recovery_count_)
+            : 0u;
+    const double stability_penalty = std::clamp(
+        static_cast<double>(map_at_delta + ils_delta + recovery_delta) / 3.0,
+        0.0,
+        1.0);
+    const double pose_penalty =
+        std::clamp(cbs_receiver_health_pose_jump_ewma_ / 1.5, 0.0, 1.0);
+    const double residual_penalty =
+        std::clamp(cbs_receiver_health_residual_ewma_ / 5.0, 0.0, 1.0);
+    receiver_health_score_for_epoch = std::clamp(
+        1.0 - 0.35 * pose_penalty - 0.35 * residual_penalty -
+            0.45 * stability_penalty,
+        0.05,
+        0.95);
+    cbs_receiver_health_score_ = receiver_health_score_for_epoch;
+  }
 #endif
 
   // zy
@@ -9562,6 +9801,12 @@ bool VioBackend::optimize(
             double pose_delta_rot_rad = std::numeric_limits<double>::quiet_NaN();
             double pose_delta_trans_m = std::numeric_limits<double>::quiet_NaN();
             double pose_delta_norm = std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_rot_rad_after_health =
+                std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_trans_m_after_health =
+                std::numeric_limits<double>::quiet_NaN();
+            double pose_delta_norm_after_health =
+                std::numeric_limits<double>::quiet_NaN();
             double pose_delta_rot_rad_before_align =
                 std::numeric_limits<double>::quiet_NaN();
             double pose_delta_trans_m_before_align =
@@ -9578,6 +9823,16 @@ bool VioBackend::optimize(
                 std::numeric_limits<double>::quiet_NaN();
             double div_hell_local_incoming_after_align =
                 std::numeric_limits<double>::quiet_NaN();
+            double disagreement_d2 = std::numeric_limits<double>::quiet_NaN();
+            double sender_health_score = std::numeric_limits<double>::quiet_NaN();
+            bool health_gate_passed = true;
+            bool hard_quarantine_applied = false;
+            bool health_cov_inflated = false;
+            bool health_bounded_pull_applied = false;
+            double health_bounded_pull_scale = 1.0;
+            std::string health_gate_reason = "not_evaluated";
+            int health_consistent_streak = 0;
+            int health_inconsistent_streak = 0;
             gtsam::Pose3 current_pose_estimate;
             bool have_current_pose_estimate = false;
             double receiver_local_tx = std::numeric_limits<double>::quiet_NaN();
@@ -9606,6 +9861,8 @@ bool VioBackend::optimize(
 
             gtsam::Matrix66 receiver_local_cov_for_diag = gtsam::Matrix66::Zero();
             bool have_receiver_local_cov_for_diag = false;
+            gtsam::Matrix66 receiver_local_cov_for_health = gtsam::Matrix66::Zero();
+            bool have_receiver_local_cov_for_health = false;
             if (FLAGS_cbs_query_receiver_local_cov_for_diag) {
               const auto cov_query_start = std::chrono::steady_clock::now();
               if (have_current_pose_estimate && cbs_optimizer_ &&
@@ -9620,6 +9877,8 @@ bool VioBackend::optimize(
                     receiver_local_cov_for_diag =
                         local_cov_dynamic.block<6, 6>(0, 0);
                     have_receiver_local_cov_for_diag = true;
+                    receiver_local_cov_for_health = receiver_local_cov_for_diag;
+                    have_receiver_local_cov_for_health = true;
                   }
                 } catch (...) {
                   have_receiver_local_cov_for_diag = false;
@@ -9675,6 +9934,265 @@ bool VioBackend::optimize(
               }
             }
 
+            if (accepted_by_cbs && cbs_heart_active &&
+                FLAGS_cbs_belief_health_gate_enabled) {
+              auto& source_health = cbs_belief_source_health_[prior.source_];
+              if (source_health.first_seen_timestamp_ns < 0) {
+                source_health.first_seen_timestamp_ns = timestamp_kf_nsec;
+              }
+              source_health.last_seen_timestamp_ns = timestamp_kf_nsec;
+
+              if (source_health.hard_quarantine_until_ns > timestamp_kf_nsec) {
+                hard_quarantine_applied = true;
+                health_gate_passed = false;
+                health_gate_reason = "hard_quarantine_active";
+                ++source_health.quarantined_count;
+                ++num_external_beliefs_health_gate_quarantined;
+              } else if (!have_current_pose_estimate) {
+                health_gate_passed = false;
+                health_gate_reason = "receiver_pose_unavailable";
+              } else {
+                if (!have_receiver_local_cov_for_health && cbs_optimizer_ &&
+                    cbs_optimizer_->valueExists(pose_symbol)) {
+                  const auto cov_query_start = std::chrono::steady_clock::now();
+                  try {
+                    const gtsam::Matrix local_cov_dynamic =
+                        cbs_optimizer_->marginalCovariance(
+                            pose_symbol, cbs::BPSAM::MarginalizationType::LOCAL);
+                    if (local_cov_dynamic.rows() >= 6 &&
+                        local_cov_dynamic.cols() >= 6 &&
+                        local_cov_dynamic.block<6, 6>(0, 0).allFinite()) {
+                      receiver_local_cov_for_health =
+                          local_cov_dynamic.block<6, 6>(0, 0);
+                      have_receiver_local_cov_for_health = true;
+                    }
+                  } catch (...) {
+                    have_receiver_local_cov_for_health = false;
+                  }
+                  stage_cov_query_ms +=
+                      elapsedMs(cov_query_start, std::chrono::steady_clock::now());
+                }
+                if (!have_receiver_local_cov_for_health) {
+                  receiver_local_cov_for_health.setZero();
+                  receiver_local_cov_for_health.topLeftCorner<3, 3>()
+                      .diagonal()
+                      .setConstant(0.5);
+                  receiver_local_cov_for_health.bottomRightCorner<3, 3>()
+                      .diagonal()
+                      .setConstant(0.5);
+                  have_receiver_local_cov_for_health = true;
+                }
+
+                const gtsam::Vector6 delta_vec =
+                    gtsam::traits<gtsam::Pose3>::Logmap(
+                        current_pose_estimate.between(incoming_pose_aligned));
+                gtsam::Matrix66 sigma_extrinsic = gtsam::Matrix66::Zero();
+                sigma_extrinsic.topLeftCorner<3, 3>().diagonal().setConstant(
+                    std::max(1e-9, FLAGS_cbs_belief_health_extrinsic_rot_var));
+                sigma_extrinsic.bottomRightCorner<3, 3>().diagonal().setConstant(
+                    std::max(1e-9, FLAGS_cbs_belief_health_extrinsic_trans_var));
+                gtsam::Matrix66 disagreement_cov =
+                    receiver_local_cov_for_health + cov + sigma_extrinsic;
+                disagreement_cov =
+                    0.5 * (disagreement_cov + disagreement_cov.transpose());
+                for (int i = 0; i < 6; ++i) {
+                  if (!std::isfinite(disagreement_cov(i, i)) ||
+                      disagreement_cov(i, i) < 1e-8) {
+                    disagreement_cov(i, i) = 1e-8;
+                  }
+                }
+
+                Eigen::LDLT<gtsam::Matrix66> d2_ldlt(disagreement_cov);
+                if (d2_ldlt.info() == Eigen::Success) {
+                  const gtsam::Vector6 solved = d2_ldlt.solve(delta_vec);
+                  if (solved.allFinite()) {
+                    disagreement_d2 = delta_vec.dot(solved);
+                  }
+                }
+                if (!std::isfinite(disagreement_d2) || disagreement_d2 < 0.0) {
+                  disagreement_d2 = std::numeric_limits<double>::quiet_NaN();
+                }
+
+                if (std::isfinite(disagreement_d2)) {
+                  if (!std::isfinite(source_health.ewma_disagreement_d2)) {
+                    source_health.ewma_disagreement_d2 = disagreement_d2;
+                  } else {
+                    source_health.ewma_disagreement_d2 =
+                        0.8 * source_health.ewma_disagreement_d2 +
+                        0.2 * disagreement_d2;
+                  }
+                  if (disagreement_d2 <=
+                      FLAGS_cbs_belief_health_disagreement_consistency_max_d2) {
+                    ++source_health.consistent_streak;
+                    source_health.inconsistent_streak = 0;
+                  } else {
+                    ++source_health.inconsistent_streak;
+                    source_health.consistent_streak = 0;
+                  }
+                } else {
+                  ++source_health.inconsistent_streak;
+                  source_health.consistent_streak = 0;
+                }
+                health_consistent_streak = source_health.consistent_streak;
+                health_inconsistent_streak = source_health.inconsistent_streak;
+
+                const double incoming_trace = cov.trace();
+                const bool incoming_overconfident =
+                    std::isfinite(incoming_trace) &&
+                    incoming_trace <
+                        FLAGS_cbs_belief_health_overconfident_trace_threshold;
+                if (incoming_overconfident && std::isfinite(disagreement_d2) &&
+                    disagreement_d2 >= FLAGS_cbs_belief_health_hard_quarantine_d2) {
+                  source_health.hard_quarantine_until_ns =
+                      timestamp_kf_nsec +
+                      std::max<Timestamp>(
+                          0, FLAGS_cbs_belief_health_hard_quarantine_ns);
+                  hard_quarantine_applied = true;
+                  health_gate_passed = false;
+                  health_gate_reason = "hard_quarantine_overconfident_mismatch";
+                  ++source_health.quarantined_count;
+                  ++num_external_beliefs_health_gate_quarantined;
+                } else {
+                  if (incoming_overconfident && std::isfinite(disagreement_d2) &&
+                      disagreement_d2 >
+                          FLAGS_cbs_belief_health_disagreement_consistency_max_d2) {
+                    cov *= std::max(
+                        1.0, FLAGS_cbs_belief_health_covariance_inflation_factor);
+                    std::string inflate_reason;
+                    const PoseCovarianceStatus inflate_status =
+                        sanitizePoseCovariance(&cov, &inflate_reason);
+                    if (inflate_status != PoseCovarianceStatus::kRejected) {
+                      health_cov_inflated = true;
+                      ++num_external_beliefs_health_gate_cov_inflated;
+                      ++source_health.covariance_inflated_count;
+                    }
+                  }
+
+                  const double ewma_d2 =
+                      std::isfinite(source_health.ewma_disagreement_d2)
+                          ? source_health.ewma_disagreement_d2
+                          : FLAGS_cbs_belief_health_disagreement_reject_max_d2;
+                  const double consistency_score =
+                      std::exp(-std::clamp(ewma_d2, 0.0, 200.0) / 40.0);
+                  const double accept_ratio =
+                      static_cast<double>(source_health.accepted_count + 1u) /
+                      static_cast<double>(source_health.accepted_count +
+                                          source_health.rejected_count + 2u);
+                  const double track_score = std::clamp(
+                      0.5 + 0.5 * source_health.recent_effect_score, 0.0, 1.0);
+                  const double stability_penalty = std::clamp(
+                      static_cast<double>(source_health.inconsistent_streak) / 5.0,
+                      0.0,
+                      1.0);
+                  sender_health_score = std::clamp(
+                      0.10 + 0.45 * consistency_score + 0.20 * accept_ratio +
+                          0.25 * track_score - 0.20 * stability_penalty,
+                      0.0,
+                      1.0);
+                  source_health.health_score = sender_health_score;
+
+                  if (std::isfinite(disagreement_d2) &&
+                      disagreement_d2 >
+                          FLAGS_cbs_belief_health_disagreement_reject_max_d2) {
+                    health_gate_passed = false;
+                    health_gate_reason = "disagreement_d2_too_large";
+                  } else {
+                    const bool needs_window =
+                        std::isfinite(disagreement_d2) &&
+                        disagreement_d2 >=
+                            FLAGS_cbs_belief_health_disagreement_min_d2;
+                    if (needs_window &&
+                        source_health.consistent_streak <
+                            std::max(1, FLAGS_cbs_belief_health_min_consistent_frames)) {
+                      health_gate_passed = false;
+                      health_gate_reason = "insufficient_consistency_window";
+                    } else if (sender_health_score + 1e-9 <
+                               receiver_health_score_for_epoch +
+                                   FLAGS_cbs_belief_health_sender_margin) {
+                      health_gate_passed = false;
+                      health_gate_reason = "sender_not_healthier_than_receiver";
+                    } else {
+                      health_gate_reason = "passed";
+                    }
+                  }
+
+                  if (health_gate_passed) {
+                    const gtsam::Vector6 rel_log =
+                        gtsam::traits<gtsam::Pose3>::Logmap(
+                            current_pose_estimate.between(incoming_pose_aligned));
+                    const double rel_rot = rel_log.head<3>().norm();
+                    const double rel_trans = rel_log.tail<3>().norm();
+                    double rot_scale = 1.0;
+                    double trans_scale = 1.0;
+                    if (rel_rot > 1e-12) {
+                      rot_scale = FLAGS_cbs_belief_health_bounded_pull_max_rot_rad /
+                                  rel_rot;
+                    }
+                    if (rel_trans > 1e-12) {
+                      trans_scale =
+                          FLAGS_cbs_belief_health_bounded_pull_max_trans_m / rel_trans;
+                    }
+                    health_bounded_pull_scale =
+                        std::clamp(std::min(rot_scale, trans_scale), 0.0, 1.0);
+                    if (health_bounded_pull_scale < 1.0) {
+                      const gtsam::Pose3 capped_rel =
+                          gtsam::traits<gtsam::Pose3>::Expmap(
+                              health_bounded_pull_scale * rel_log);
+                      incoming_pose_aligned =
+                          current_pose_estimate.compose(capped_rel);
+                      health_bounded_pull_applied = true;
+                      ++num_external_beliefs_health_gate_pull_capped;
+                      ++source_health.bounded_pull_count;
+                      const gtsam::Vector6 bounded_delta =
+                          gtsam::traits<gtsam::Pose3>::Logmap(
+                              current_pose_estimate.between(incoming_pose_aligned));
+                      pose_delta_rot_rad_after_health = bounded_delta.head<3>().norm();
+                      pose_delta_trans_m_after_health = bounded_delta.tail<3>().norm();
+                      pose_delta_norm_after_health = bounded_delta.norm();
+                      pose_delta_rot_rad = pose_delta_rot_rad_after_health;
+                      pose_delta_trans_m = pose_delta_trans_m_after_health;
+                      pose_delta_norm = pose_delta_norm_after_health;
+                    }
+                  }
+                }
+              }
+
+              if (!health_gate_passed) {
+                ++num_external_beliefs_health_gate_rejected;
+                ++num_external_beliefs_rejected;
+                ++source_health.rejected_count;
+                source_health.last_decision_reason = health_gate_reason;
+                accepted_by_cbs = false;
+              }
+            }
+
+            if (cbs_heart_active && FLAGS_cbs_belief_health_gate_enabled) {
+              std::cerr << std::setprecision(12)
+                        << "[CBS][BeliefHealthDiag]"
+                        << " curr_kf_id=" << cur_id
+                        << " source=" << prior.source_
+                        << " source_seq=" << prior.source_seq_
+                        << " key=" << pose_symbol.key()
+                        << " disagreement_d2=" << disagreement_d2
+                        << " sender_health_score=" << sender_health_score
+                        << " receiver_health_score="
+                        << receiver_health_score_for_epoch
+                        << " health_consistent_streak=" << health_consistent_streak
+                        << " health_inconsistent_streak="
+                        << health_inconsistent_streak
+                        << " health_gate_passed=" << (health_gate_passed ? 1 : 0)
+                        << " hard_quarantine_applied="
+                        << (hard_quarantine_applied ? 1 : 0)
+                        << " health_cov_inflated="
+                        << (health_cov_inflated ? 1 : 0)
+                        << " health_bounded_pull_applied="
+                        << (health_bounded_pull_applied ? 1 : 0)
+                        << " health_bounded_pull_scale="
+                        << health_bounded_pull_scale
+                        << " health_gate_reason=" << health_gate_reason
+                        << std::endl;
+            }
+
             bool alignment_updated = false;
             gtsam::Pose3 alignment_update = gtsam::Pose3();
             if (alignment_mode_enabled && have_current_pose_estimate) {
@@ -9694,28 +10212,123 @@ bool VioBackend::optimize(
             const gtsam::Quaternion alignment_update_q =
                 alignment_update.rotation().toQuaternion();
 
-            const gtsam::Vector6 mu =
-                gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose_aligned);
-            gbp::Gaussian belief(pose_symbol, mu, cov, 1);
-            std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
-                single_belief;
-            single_belief[pose_symbol].emplace_back(sender_id, belief);
-            ++num_external_beliefs_staged;
-            const auto add_beliefs_start = std::chrono::steady_clock::now();
-            const size_t rejected_count =
-                static_cast<size_t>(cbs_optimizer_->addBeliefs(single_belief));
-            stage_add_beliefs_ms +=
-                elapsedMs(add_beliefs_start, std::chrono::steady_clock::now());
-            num_external_beliefs_rejected += rejected_count;
-            if (rejected_count > 0u) {
-              num_external_beliefs_rejected_keys_touched += single_belief.size();
-              size_t touched_factors = 0u;
-              for (const auto& key_beliefs : single_belief) {
-                touched_factors += key_beliefs.second.size();
+            size_t rejected_count = 0u;
+            bool cbs_add_beliefs_attempted = false;
+            bool scale_active_for_factorization = false;
+            double belief_factor_scale_applied = 1.0;
+            double belief_cov_raw_trace = std::numeric_limits<double>::quiet_NaN();
+            double belief_cov_scaled_trace = std::numeric_limits<double>::quiet_NaN();
+            std::string belief_factorization_mode = "raw_incoming_cov";
+            std::string belief_scale_reason = "none";
+            if (health_gate_passed) {
+              gtsam::Matrix66 cov_for_factorization = cov;
+              belief_cov_raw_trace = cov_for_factorization.trace();
+              if (prior.source_ == "liorf") {
+                const double configured_scale =
+                    FLAGS_liorf_to_kimera_belief_factor_cov_scale;
+                belief_factor_scale_applied = configured_scale;
+                if (!std::isfinite(configured_scale) || configured_scale <= 0.0) {
+                  accepted_by_cbs = false;
+                  belief_factorization_mode = "invalid_liorf_cov_scale_config";
+                  belief_scale_reason = "invalid_nonpositive_or_nonfinite_scale";
+                  ++num_external_beliefs_dropped_bad_noise;
+                  ++num_external_beliefs_cov_rejected;
+                } else if (std::abs(configured_scale - 1.0) > 1e-12) {
+                  cov_for_factorization *= configured_scale;
+                  std::string scale_cov_reason = "none";
+                  const PoseCovarianceStatus scaled_cov_status =
+                      sanitizePoseCovariance(&cov_for_factorization, &scale_cov_reason);
+                  if (scaled_cov_status == PoseCovarianceStatus::kRejected) {
+                    accepted_by_cbs = false;
+                    belief_factorization_mode =
+                        "liorf_scaled_cov_rejected_after_sanitize";
+                    belief_scale_reason = scale_cov_reason;
+                    ++num_external_beliefs_dropped_bad_noise;
+                    ++num_external_beliefs_cov_rejected;
+                  } else {
+                    if (scaled_cov_status == PoseCovarianceStatus::kRegularized) {
+                      ++num_external_beliefs_cov_regularized;
+                      belief_scale_reason = "scaled_cov_regularized";
+                    } else {
+                      belief_scale_reason = "scaled_cov_ok";
+                    }
+                    scale_active_for_factorization = true;
+                    belief_factorization_mode =
+                        "liorf_receiver_side_factorization_cov_scale";
+                  }
+                } else {
+                  belief_factorization_mode = "liorf_no_scale_identity";
+                  belief_scale_reason = "identity_scale";
+                }
+              } else {
+                belief_factor_scale_applied = 1.0;
+                belief_factorization_mode = "non_liorf_source_no_scale";
+                belief_scale_reason = "source_not_liorf";
               }
-              num_external_beliefs_rejected_factors_touched += touched_factors;
+              belief_cov_scaled_trace = cov_for_factorization.trace();
+              std::cerr << std::setprecision(12)
+                        << "[CBS][IncomingBeliefFactorScaleDiag]"
+                        << " curr_kf_id=" << cur_id
+                        << " source_label=" << prior.source_
+                        << " raw_trace=" << belief_cov_raw_trace
+                        << " scaled_trace=" << belief_cov_scaled_trace
+                        << " scale_applied=" << belief_factor_scale_applied
+                        << " scaling_active="
+                        << (scale_active_for_factorization ? 1 : 0)
+                        << " factorization_mode=" << belief_factorization_mode
+                        << " scale_reason=" << belief_scale_reason
+                        << std::endl;
+
+              if (accepted_by_cbs) {
+                const gtsam::Vector6 mu =
+                    gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose_aligned);
+                gbp::Gaussian belief(pose_symbol, mu, cov_for_factorization, 1);
+                std::map<gtsam::Key,
+                         std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
+                    single_belief;
+                single_belief[pose_symbol].emplace_back(sender_id, belief);
+                ++num_external_beliefs_staged;
+                cbs_add_beliefs_attempted = true;
+                const auto add_beliefs_start = std::chrono::steady_clock::now();
+                rejected_count =
+                    static_cast<size_t>(cbs_optimizer_->addBeliefs(single_belief));
+                stage_add_beliefs_ms +=
+                    elapsedMs(add_beliefs_start, std::chrono::steady_clock::now());
+                num_external_beliefs_rejected += rejected_count;
+                if (rejected_count > 0u) {
+                  num_external_beliefs_rejected_keys_touched += single_belief.size();
+                  size_t touched_factors = 0u;
+                  for (const auto& key_beliefs : single_belief) {
+                    touched_factors += key_beliefs.second.size();
+                  }
+                  num_external_beliefs_rejected_factors_touched += touched_factors;
+                }
+                accepted_by_cbs = (rejected_count == 0u);
+              } else {
+                rejected_count = 1u;
+              }
+            } else {
+              // Health-gate rejection is authoritative: do not stage or call
+              // addBeliefs() for this belief.
+              accepted_by_cbs = false;
+              rejected_count = 1u;
             }
-            accepted_by_cbs = (rejected_count == 0u);
+
+            if (cbs_heart_active && FLAGS_cbs_belief_health_gate_enabled &&
+                cbs_add_beliefs_attempted) {
+              auto& source_health = cbs_belief_source_health_[prior.source_];
+              if (accepted_by_cbs) {
+                ++source_health.accepted_count;
+                source_health.last_decision_reason = "accepted";
+                accepted_sources_for_health_track.insert(prior.source_);
+              } else {
+                ++source_health.rejected_count;
+                if (source_health.last_decision_reason == "none" ||
+                    source_health.last_decision_reason == "passed") {
+                  source_health.last_decision_reason = "cbs_rejected";
+                }
+              }
+            }
 
             LOG(INFO) << "[CBS][KimeraPrior] key=" << pose_symbol.key()
                       << ", matched_frame_id=" << matched_frame_id
@@ -9792,7 +10405,36 @@ bool VioBackend::optimize(
                       << ", delta_local_incoming_rot_rad_after_align="
                       << pose_delta_rot_rad_after_align
                       << ", delta_local_incoming_norm_after_align="
-                      << pose_delta_norm_after_align;
+                      << pose_delta_norm_after_align
+                      << ", delta_local_incoming_trans_m_after_health="
+                      << pose_delta_trans_m_after_health
+                      << ", delta_local_incoming_rot_rad_after_health="
+                      << pose_delta_rot_rad_after_health
+                      << ", delta_local_incoming_norm_after_health="
+                      << pose_delta_norm_after_health
+                      << ", health_receiver_score="
+                      << receiver_health_score_for_epoch
+                      << ", health_sender_score=" << sender_health_score
+                      << ", health_disagreement_d2=" << disagreement_d2
+                      << ", health_gate_reason=" << health_gate_reason
+                      << ", health_cov_inflated="
+                      << (health_cov_inflated ? 1 : 0)
+                      << ", health_bounded_pull_applied="
+                      << (health_bounded_pull_applied ? 1 : 0)
+                      << ", health_bounded_pull_scale="
+                      << health_bounded_pull_scale
+                      << ", health_hard_quarantine="
+                      << (hard_quarantine_applied ? 1 : 0)
+                      << ", incoming_factor_scale_active="
+                      << (scale_active_for_factorization ? 1 : 0)
+                      << ", incoming_factor_scale_applied="
+                      << belief_factor_scale_applied
+                      << ", incoming_factor_cov_trace_raw="
+                      << belief_cov_raw_trace
+                      << ", incoming_factor_cov_trace_scaled="
+                      << belief_cov_scaled_trace
+                      << ", incoming_factorization_mode="
+                      << belief_factorization_mode;
           }
 
           const double stage_total_ms =
@@ -9826,6 +10468,7 @@ bool VioBackend::optimize(
             continue;
           }
 
+          ++num_external_beliefs_accepted_direct;
           ++num_external_priors_injected;
 #ifdef KIMERA_USE_CBS
           if (cbs_heart_active && !prior.source_.empty()) {
@@ -9906,10 +10549,7 @@ bool VioBackend::optimize(
        num_external_beliefs_cov_regularized > 0 ||
        num_external_beliefs_dropped_unknown_source > 0 ||
        num_external_beliefs_dropped_self_source > 0)) {
-    num_external_beliefs_accepted =
-        (num_external_beliefs_staged >= num_external_beliefs_rejected)
-            ? (num_external_beliefs_staged - num_external_beliefs_rejected)
-            : 0u;
+    num_external_beliefs_accepted = num_external_beliefs_accepted_direct;
     LOG_EVERY_N(INFO, 20) << "CBS addBeliefs: staged="
                           << num_external_beliefs_staged
                           << ", rejected=" << num_external_beliefs_rejected
@@ -9948,10 +10588,7 @@ bool VioBackend::optimize(
 
 #ifdef KIMERA_USE_CBS
   if (cbs_exchange_active) {
-    num_external_beliefs_accepted =
-        (num_external_beliefs_staged >= num_external_beliefs_rejected)
-            ? (num_external_beliefs_staged - num_external_beliefs_rejected)
-            : 0u;
+    num_external_beliefs_accepted = num_external_beliefs_accepted_direct;
     std::cerr << std::setprecision(12)
               << "[CBS][ExternalPriorDiag] timestamp_ns=" << timestamp_kf_nsec
               << " cbs_heart_active=" << (cbs_heart_active ? 1 : 0)
@@ -9982,6 +10619,16 @@ bool VioBackend::optimize(
               << num_external_beliefs_dropped_unknown_source
               << " beliefs_self_source="
               << num_external_beliefs_dropped_self_source
+              << " beliefs_health_gate_rejected="
+              << num_external_beliefs_health_gate_rejected
+              << " beliefs_health_gate_quarantined="
+              << num_external_beliefs_health_gate_quarantined
+              << " beliefs_health_cov_inflated="
+              << num_external_beliefs_health_gate_cov_inflated
+              << " beliefs_health_pull_capped="
+              << num_external_beliefs_health_gate_pull_capped
+              << " receiver_health_score="
+              << receiver_health_score_for_epoch
               << " queue_size_now=" << external_queue_size_now << std::endl;
 
     const double ext_queue_total_ms = ext_queue_scan_filter_ms;
@@ -10016,7 +10663,33 @@ bool VioBackend::optimize(
         << num_external_beliefs_rejected_keys_touched
         << " rejected_factors_touched="
         << num_external_beliefs_rejected_factors_touched
+        << " beliefs_health_gate_rejected="
+        << num_external_beliefs_health_gate_rejected
+        << " beliefs_health_gate_quarantined="
+        << num_external_beliefs_health_gate_quarantined
+        << " beliefs_health_cov_inflated="
+        << num_external_beliefs_health_gate_cov_inflated
+        << " beliefs_health_pull_capped="
+        << num_external_beliefs_health_gate_pull_capped
+        << " receiver_health_score=" << receiver_health_score_for_epoch
         << " queue_size_now=" << external_queue_size_now << std::endl;
+    std::cerr << std::setprecision(12)
+              << "[CBS][BeliefHealthEpochDiag]"
+              << " curr_kf_id=" << cur_id
+              << " receiver_health_score=" << receiver_health_score_for_epoch
+              << " source_count=" << cbs_belief_source_health_.size()
+              << " beliefs_considered=" << num_external_beliefs_considered
+              << " beliefs_accepted=" << num_external_beliefs_accepted
+              << " beliefs_health_gate_rejected="
+              << num_external_beliefs_health_gate_rejected
+              << " beliefs_health_gate_quarantined="
+              << num_external_beliefs_health_gate_quarantined
+              << " beliefs_health_cov_inflated="
+              << num_external_beliefs_health_gate_cov_inflated
+              << " beliefs_health_pull_capped="
+              << num_external_beliefs_health_gate_pull_capped
+              << " health_mode=sender_gt_receiver_margin_plus_consistency_window"
+              << std::endl;
   }
 
   cbs_no_external_effect_epoch =
@@ -10508,7 +11181,7 @@ bool VioBackend::optimize(
   bool h2_sidecar_packet_ready = false;
   std::string h2_sidecar_packet_failure_reason;
   std::string h2_sidecar_packet_failure_key;
-  if (useCbsH2LocalCovSidecar() && !useCbsOptimizerHeart()) {
+  if (useCbsH2LocalCovSidecar()) {
     h2_sidecar_packet.smart_factor_replacements = cbs_smart_factor_replacements;
     h2_sidecar_packet.filtered_external_factor_count =
         (new_factors_tmp.size() > local_heart_factor_count)
@@ -10710,8 +11383,6 @@ bool VioBackend::optimize(
         if (h2_sidecar_packet_ready) {
           h2_sync_ok = refreshH2LocalCovariancePassiveSnapshot(
               h2_sidecar_packet, cur_id, &h2_stats);
-        } else if (useCbsOptimizerHeart()) {
-          h2_stats.failure_reason = "heart_is_cbs";
         } else if (!h2_sidecar_packet_failure_reason.empty()) {
           h2_stats.failure_reason = h2_sidecar_packet_failure_reason;
           h2_stats.first_failure_reason = h2_sidecar_packet_failure_reason;
@@ -11391,6 +12062,54 @@ bool VioBackend::optimize(
       LOG(ERROR) << "Smoother is not ok! Not updating Backend state.";
     }
   }
+#ifdef KIMERA_USE_CBS
+  if (cbs_exchange_active && cbs_heart_active &&
+      FLAGS_cbs_belief_health_gate_enabled) {
+    const size_t epoch_map_at_delta =
+        (cbs_map_at_count_so_far_ >= map_at_count_at_epoch_start)
+            ? (cbs_map_at_count_so_far_ - map_at_count_at_epoch_start)
+            : 0u;
+    const size_t epoch_ils_delta =
+        (cbs_bpsam_ilsretry_count_so_far_ >= ils_count_at_epoch_start)
+            ? (cbs_bpsam_ilsretry_count_so_far_ - ils_count_at_epoch_start)
+            : 0u;
+    const size_t epoch_recovery_delta =
+        (cbs_recovery_count_so_far_ >= recovery_count_at_epoch_start)
+            ? (cbs_recovery_count_so_far_ - recovery_count_at_epoch_start)
+            : 0u;
+    const bool epoch_unstable = !is_smoother_ok || epoch_map_at_delta > 0u ||
+                                epoch_ils_delta > 0u ||
+                                epoch_recovery_delta > 0u;
+    const double effect_signal = epoch_unstable ? -1.0 : 1.0;
+    for (const auto& source : accepted_sources_for_health_track) {
+      auto it = cbs_belief_source_health_.find(source);
+      if (it == cbs_belief_source_health_.end()) {
+        continue;
+      }
+      it->second.recent_effect_score = std::clamp(
+          0.8 * it->second.recent_effect_score + 0.2 * effect_signal, -1.0, 1.0);
+    }
+    cbs_receiver_health_prev_map_at_count_ = cbs_map_at_count_so_far_;
+    cbs_receiver_health_prev_ils_count_ = cbs_bpsam_ilsretry_count_so_far_;
+    cbs_receiver_health_prev_recovery_count_ = cbs_recovery_count_so_far_;
+    if (is_smoother_ok) {
+      cbs_receiver_health_prev_pose_ = W_Pose_B_lkf_from_state_;
+      cbs_receiver_health_pose_initialized_ = true;
+    }
+    std::cerr << std::setprecision(12)
+              << "[CBS][BeliefHealthTrackDiag]"
+              << " curr_kf_id=" << cur_id
+              << " accepted_sources_count="
+              << accepted_sources_for_health_track.size()
+              << " epoch_unstable=" << (epoch_unstable ? 1 : 0)
+              << " epoch_map_at_delta=" << epoch_map_at_delta
+              << " epoch_ils_delta=" << epoch_ils_delta
+              << " epoch_recovery_delta=" << epoch_recovery_delta
+              << " receiver_health_score=" << cbs_receiver_health_score_
+              << " track_mode=post_epoch_effect_feedback"
+              << std::endl;
+  }
+#endif
   return is_smoother_ok;
 }
 /// Private methods.
@@ -21985,8 +22704,153 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   stage_a_direct_local_packet_compatible_count == 0u &&
                   !update_a_params.removeFactorIndices.empty();
               if (stage_a_support_poor_remove_heavy_shape_for_support_only_salvage) {
+                gtsam::FactorIndices
+                    stage_a_support_only_salvage_relocated_remove_slots =
+                        update_a_params.removeFactorIndices;
                 const size_t stage_a_support_only_salvage_cleared_remove_count =
-                    update_a_params.removeFactorIndices.size();
+                    stage_a_support_only_salvage_relocated_remove_slots.size();
+                size_t stage_a_support_only_salvage_relocated_to_stage_b_count =
+                    0u;
+                const FrameId stage_a_support_only_salvage_relocation_warmup_oldest_active_frame_id_max =
+                    static_cast<FrameId>(std::max(
+                        1, FLAGS_cbs_stage_a_support_only_salvage_relocation_warmup_oldest_active_frame_id_max));
+                const FrameId stage_a_support_only_salvage_relocation_warmup_exit_extra_epochs =
+                    static_cast<FrameId>(std::max(
+                        0, FLAGS_cbs_stage_a_support_only_salvage_relocation_warmup_exit_extra_epochs));
+                const FrameId stage_a_support_only_salvage_relocation_warmup_effective_oldest_active_frame_id_max =
+                    stage_a_support_only_salvage_relocation_warmup_oldest_active_frame_id_max +
+                    stage_a_support_only_salvage_relocation_warmup_exit_extra_epochs;
+                const bool stage_a_support_only_salvage_boundary_warmup_epoch =
+                    lag_window_state.oldest_active_frame_id <=
+                    stage_a_support_only_salvage_relocation_warmup_effective_oldest_active_frame_id_max;
+                const bool stage_a_support_only_salvage_defer_to_next_epoch =
+                    cbs_phase2_boundary_transition_this_epoch ||
+                    stage_a_support_only_salvage_boundary_warmup_epoch;
+                size_t stage_a_support_only_salvage_relocation_rejected_nonlive_count =
+                    0u;
+                size_t stage_a_support_only_salvage_relocation_rejected_new_packet_overlap_count =
+                    0u;
+                long long stage_a_support_only_salvage_relocation_first_rejected_slot =
+                    -1ll;
+                std::string
+                    stage_a_support_only_salvage_relocation_first_rejected_slot_class =
+                        "none";
+                std::string
+                    stage_a_support_only_salvage_relocation_first_rejected_slot_keys =
+                        "none";
+                std::string
+                    stage_a_support_only_salvage_relocation_first_rejected_reason =
+                        "none";
+                std::vector<size_t>
+                    stage_a_support_only_salvage_relocation_rejected_slots_for_defer;
+                stage_a_support_only_salvage_relocation_rejected_slots_for_defer
+                    .reserve(stage_a_support_only_salvage_relocated_remove_slots.size());
+                if (!stage_a_support_only_salvage_defer_to_next_epoch) {
+                  const auto& stage_a_support_only_salvage_relocation_factors =
+                      cbs_optimizer_->getFactorsUnsafe();
+                  std::unordered_set<gtsam::Key>
+                      stage_a_support_only_salvage_stage_b_new_packet_keys;
+                  stage_a_support_only_salvage_stage_b_new_packet_keys.reserve(
+                      cbs_current_epoch_new_vio_factors.size() * 3u +
+                      new_values.size());
+                  for (size_t idx = 0u; idx < cbs_current_epoch_new_vio_factors.size();
+                       ++idx) {
+                    const auto& factor_ptr = cbs_current_epoch_new_vio_factors.at(idx);
+                    if (!factor_ptr) {
+                      continue;
+                    }
+                    for (const gtsam::Key key : factor_ptr->keys()) {
+                      stage_a_support_only_salvage_stage_b_new_packet_keys.insert(
+                          key);
+                    }
+                  }
+                  for (const auto& kv : new_values) {
+                    stage_a_support_only_salvage_stage_b_new_packet_keys.insert(
+                        kv.key);
+                  }
+                  for (const size_t slot :
+                       stage_a_support_only_salvage_relocated_remove_slots) {
+                    const bool slot_live =
+                        stage_a_support_only_salvage_relocation_factors.exists(slot) &&
+                        stage_a_support_only_salvage_relocation_factors.at(slot);
+                    bool overlaps_stage_b_new_packet = false;
+                    if (slot_live) {
+                      const auto& factor_ptr =
+                          stage_a_support_only_salvage_relocation_factors.at(slot);
+                      for (const gtsam::Key key : factor_ptr->keys()) {
+                        if (stage_a_support_only_salvage_stage_b_new_packet_keys
+                                .count(key) > 0u) {
+                          overlaps_stage_b_new_packet = true;
+                          break;
+                        }
+                      }
+                    }
+                    if (slot_live && !overlaps_stage_b_new_packet) {
+                      if (update_b_remove_slots_set.insert(slot).second) {
+                        update_b_params.removeFactorIndices.push_back(slot);
+                        ++stage_a_support_only_salvage_relocated_to_stage_b_count;
+                      }
+                    } else {
+                      stage_a_support_only_salvage_relocation_rejected_slots_for_defer
+                          .push_back(slot);
+                      if (!slot_live) {
+                        ++stage_a_support_only_salvage_relocation_rejected_nonlive_count;
+                      } else if (overlaps_stage_b_new_packet) {
+                        ++stage_a_support_only_salvage_relocation_rejected_new_packet_overlap_count;
+                      }
+                      if (stage_a_support_only_salvage_relocation_first_rejected_slot <
+                          0) {
+                        stage_a_support_only_salvage_relocation_first_rejected_slot =
+                            static_cast<long long>(slot);
+                        if (slot_live) {
+                          stage_a_support_only_salvage_relocation_first_rejected_slot_class =
+                              sanitize_forensic_token(
+                                  classify_forensic_remove_factor_class(
+                                      stage_a_support_only_salvage_relocation_factors
+                                          .at(slot)));
+                          stage_a_support_only_salvage_relocation_first_rejected_slot_keys =
+                              sanitize_forensic_token(format_factor_keys_for_slot(
+                                  stage_a_support_only_salvage_relocation_factors,
+                                  slot));
+                        } else {
+                          stage_a_support_only_salvage_relocation_first_rejected_slot_class =
+                              "missing_slot";
+                          stage_a_support_only_salvage_relocation_first_rejected_slot_keys =
+                              "none";
+                        }
+                        stage_a_support_only_salvage_relocation_first_rejected_reason =
+                            !slot_live
+                                ? "relocation_slot_not_live_in_stage_b_preflight"
+                                : "relocation_slot_overlaps_stage_b_new_packet_keys";
+                      }
+                    }
+                  }
+                  if (!stage_a_support_only_salvage_relocation_rejected_slots_for_defer
+                           .empty()) {
+                    std::unordered_set<size_t>
+                        pending_relocation_rejected_slots_for_defer(
+                            cbs_phase2_deferred_lag_remove_packet_slots_.begin(),
+                            cbs_phase2_deferred_lag_remove_packet_slots_.end());
+                    pending_relocation_rejected_slots_for_defer.insert(
+                        stage_a_support_only_salvage_relocation_rejected_slots_for_defer
+                            .begin(),
+                        stage_a_support_only_salvage_relocation_rejected_slots_for_defer
+                            .end());
+                    cbs_phase2_deferred_lag_remove_packet_slots_.assign(
+                        pending_relocation_rejected_slots_for_defer.begin(),
+                        pending_relocation_rejected_slots_for_defer.end());
+                    std::sort(cbs_phase2_deferred_lag_remove_packet_slots_.begin(),
+                              cbs_phase2_deferred_lag_remove_packet_slots_.end());
+                    cbs_phase2_deferred_lag_remove_packet_pending_ =
+                        !cbs_phase2_deferred_lag_remove_packet_slots_.empty();
+                    cbs_phase2_deferred_lag_remove_packet_source_kf_id_ = curr_kf_id_;
+                    cbs_phase2_deferred_lag_remove_packet_size =
+                        cbs_phase2_deferred_lag_remove_packet_slots_.size();
+                    cbs_phase2_deferred_lag_remove_packet_slots_preview =
+                        sanitize_forensic_token(format_factor_slots_preview(
+                            cbs_phase2_deferred_lag_remove_packet_slots_, 8u));
+                  }
+                }
                 update_a_params.removeFactorIndices.clear();
                 std::cerr
                     << std::setprecision(12)
@@ -22002,10 +22866,39 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << " stage_a_values_count=0"
                     << " cleared_stage_a_remove_count="
                     << stage_a_support_only_salvage_cleared_remove_count
+                    << " relocated_to_stage_b_remove_count="
+                    << stage_a_support_only_salvage_relocated_to_stage_b_count
+                    << " relocation_rejected_nonlive_count="
+                    << stage_a_support_only_salvage_relocation_rejected_nonlive_count
+                    << " relocation_rejected_new_packet_overlap_count="
+                    << stage_a_support_only_salvage_relocation_rejected_new_packet_overlap_count
+                    << " first_relocation_rejected_slot="
+                    << stage_a_support_only_salvage_relocation_first_rejected_slot
+                    << " first_relocation_rejected_slot_class="
+                    << sanitize_forensic_token(
+                           stage_a_support_only_salvage_relocation_first_rejected_slot_class)
+                    << " first_relocation_rejected_slot_keys="
+                    << sanitize_forensic_token(
+                           stage_a_support_only_salvage_relocation_first_rejected_slot_keys)
+                    << " first_relocation_rejected_reason="
+                    << sanitize_forensic_token(
+                           stage_a_support_only_salvage_relocation_first_rejected_reason)
+                    << " stage_b_remove_count_after_salvage="
+                    << update_b_params.removeFactorIndices.size()
                     << " salvage_reason="
                     << "stage_a_support_poor_remove_heavy_packet_after_remove_sanitization"
+                    << " relocation_deferred_due_to_boundary_transition="
+                    << (stage_a_support_only_salvage_defer_to_next_epoch ? 1 : 0)
+                    << " relocation_deferred_due_to_boundary_warmup="
+                    << (stage_a_support_only_salvage_boundary_warmup_epoch ? 1 : 0)
+                    << " relocation_warmup_oldest_active_frame_id_max="
+                    << stage_a_support_only_salvage_relocation_warmup_oldest_active_frame_id_max
+                    << " relocation_warmup_exit_extra_epochs="
+                    << stage_a_support_only_salvage_relocation_warmup_exit_extra_epochs
+                    << " relocation_warmup_effective_oldest_active_frame_id_max="
+                    << stage_a_support_only_salvage_relocation_warmup_effective_oldest_active_frame_id_max
                     << " salvage_mode="
-                    << "stage_a_support_only_salvage_clear_remove_then_run_stage_a_update"
+                    << "stage_a_support_only_salvage_relocate_remove_to_stage_b_then_run_stage_a_update"
                     << std::endl;
               }
               remove_update_attempted_this_attempt =
@@ -22738,10 +23631,19 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       stage_a_values.empty() &&
                       stage_a_direct_local_packet_compatible_count == 0u &&
                       !update_a_params.removeFactorIndices.empty();
+              const bool stage_a_support_only_summary_no_remove_preflight_skip =
+                  stage_a_direct_local_packet_shape_mode ==
+                      "no_direct_local_removable_candidates" &&
+                  cbs_phase2_two_stage_update_a_summary_factor_count > 0u &&
+                  stage_a_root_bootstrap_support_factor_count == 0u &&
+                  stage_a_values.empty() &&
+                  stage_a_direct_local_packet_compatible_count == 0u &&
+                  update_a_params.removeFactorIndices.empty();
               const bool stage_a_missing_support_preflight_skip =
                   stage_a_summary_only_missing_support_preflight_skip ||
                   stage_a_zero_support_remove_only_preflight_skip ||
-                  stage_a_support_poor_remove_heavy_after_sanitization_preflight_skip;
+                  stage_a_support_poor_remove_heavy_after_sanitization_preflight_skip ||
+                  stage_a_support_only_summary_no_remove_preflight_skip;
               stage_a_preflight_skip_for_origin_diag =
                   stage_a_missing_support_preflight_skip;
               std::string stage_a_missing_support_preflight_skip_reason = "none";
@@ -22924,6 +23826,11 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     "stage_a_support_poor_remove_heavy_packet_after_remove_sanitization";
                 stage_a_missing_support_preflight_contract_mode =
                     "stage_a_packet_contract_skip_defer_on_support_poor_remove_heavy_after_remove_sanitization";
+              } else if (stage_a_support_only_summary_no_remove_preflight_skip) {
+                stage_a_missing_support_preflight_skip_reason =
+                    "stage_a_support_only_summary_no_remove_packet_preflight";
+                stage_a_missing_support_preflight_contract_mode =
+                    "stage_a_packet_contract_skip_defer_on_support_only_summary_no_remove_preflight";
               }
               std::cerr << std::setprecision(12)
                         << "[CBS][StageASummaryOnlySupportPreflightDiag]"
@@ -24851,6 +25758,89 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               }
               if (stage_b_remove_slots_filtered) {
                 update_b_params.removeFactorIndices = stage_b_remove_filtered;
+              }
+              const size_t stage_b_remove_count_before_sanitization =
+                  update_b_params.removeFactorIndices.size();
+              size_t stage_b_remove_sanitization_dropped_missing_slot_count = 0u;
+              long long stage_b_remove_sanitization_first_dropped_slot = -1;
+              std::string stage_b_remove_sanitization_first_dropped_slot_class =
+                  "none";
+              std::string stage_b_remove_sanitization_first_dropped_slot_keys =
+                  "none";
+              if (!update_b_params.removeFactorIndices.empty()) {
+                gtsam::FactorIndices sanitized_stage_b_remove_slots;
+                sanitized_stage_b_remove_slots.reserve(
+                    update_b_params.removeFactorIndices.size());
+                std::unordered_set<size_t> stage_b_remove_seen_slots;
+                stage_b_remove_seen_slots.reserve(
+                    update_b_params.removeFactorIndices.size());
+                for (const size_t slot : update_b_params.removeFactorIndices) {
+                  const bool slot_live = stage_b_optimizer_factors.exists(slot) &&
+                                         stage_b_optimizer_factors.at(slot);
+                  const bool keep_slot =
+                      slot_live && stage_b_remove_seen_slots.insert(slot).second;
+                  if (keep_slot) {
+                    sanitized_stage_b_remove_slots.push_back(slot);
+                    continue;
+                  }
+                  ++stage_b_remove_sanitization_dropped_missing_slot_count;
+                  if (stage_b_remove_sanitization_first_dropped_slot < 0) {
+                    stage_b_remove_sanitization_first_dropped_slot =
+                        static_cast<long long>(slot);
+                    if (slot_live) {
+                      stage_b_remove_sanitization_first_dropped_slot_class =
+                          sanitize_forensic_token(
+                              classify_forensic_remove_factor_class(
+                                  stage_b_optimizer_factors.at(slot)));
+                      stage_b_remove_sanitization_first_dropped_slot_keys =
+                          sanitize_forensic_token(format_factor_keys_for_slot(
+                              stage_b_optimizer_factors, slot));
+                    } else {
+                      const auto metadata_it =
+                          cbs_phase2_summary_covered_crossing_replay_metadata_map.find(
+                              slot);
+                      if (metadata_it !=
+                              cbs_phase2_summary_covered_crossing_replay_metadata_map
+                                  .end() &&
+                          !metadata_it->second.factor_class.empty()) {
+                        stage_b_remove_sanitization_first_dropped_slot_class =
+                            sanitize_forensic_token(
+                                metadata_it->second.factor_class);
+                        stage_b_remove_sanitization_first_dropped_slot_keys =
+                            sanitize_forensic_token(metadata_it->second.factor_keys);
+                      } else {
+                        stage_b_remove_sanitization_first_dropped_slot_class =
+                            "missing_slot";
+                        stage_b_remove_sanitization_first_dropped_slot_keys =
+                            "none";
+                      }
+                    }
+                  }
+                }
+                update_b_params.removeFactorIndices.swap(
+                    sanitized_stage_b_remove_slots);
+              }
+              if (stage_b_remove_sanitization_dropped_missing_slot_count > 0u) {
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageBRemoveSanitizationDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " original_stage_b_remove_count="
+                          << stage_b_remove_count_before_sanitization
+                          << " sanitized_stage_b_remove_count="
+                          << update_b_params.removeFactorIndices.size()
+                          << " dropped_missing_slot_count="
+                          << stage_b_remove_sanitization_dropped_missing_slot_count
+                          << " first_dropped_slot="
+                          << stage_b_remove_sanitization_first_dropped_slot
+                          << " first_dropped_slot_class="
+                          << sanitize_forensic_token(
+                                 stage_b_remove_sanitization_first_dropped_slot_class)
+                          << " first_dropped_slot_keys="
+                          << sanitize_forensic_token(
+                                 stage_b_remove_sanitization_first_dropped_slot_keys)
+                          << " sanitization_mode="
+                          << "stage_b_remove_slot_sanitize_drop_missing_or_nonlive_or_duplicate"
+                          << std::endl;
               }
               gtsam::NonlinearFactorGraph stage_b_factors_for_update;
               const gtsam::NonlinearFactorGraph* stage_b_factors_for_update_ptr =

@@ -995,6 +995,35 @@ class VioBackend {
   std::map<std::string, Timestamp> external_source_retry_after_ns_;
   std::map<std::string, Timestamp> external_source_retry_backoff_ns_;
 
+  // Health-aware CBS belief-gate state (runtime, per external source).
+  struct CbsBeliefSourceHealthState {
+    double health_score = 0.5;
+    double ewma_disagreement_d2 = std::numeric_limits<double>::quiet_NaN();
+    double ewma_hellinger = std::numeric_limits<double>::quiet_NaN();
+    double recent_effect_score = 0.0;
+    size_t accepted_count = 0u;
+    size_t rejected_count = 0u;
+    size_t quarantined_count = 0u;
+    size_t covariance_inflated_count = 0u;
+    size_t bounded_pull_count = 0u;
+    int consistent_streak = 0;
+    int inconsistent_streak = 0;
+    Timestamp first_seen_timestamp_ns = -1;
+    Timestamp last_seen_timestamp_ns = -1;
+    Timestamp hard_quarantine_until_ns =
+        std::numeric_limits<Timestamp>::lowest();
+    std::string last_decision_reason = "none";
+  };
+  std::map<std::string, CbsBeliefSourceHealthState> cbs_belief_source_health_;
+  double cbs_receiver_health_score_ = 0.5;
+  double cbs_receiver_health_pose_jump_ewma_ = 0.0;
+  double cbs_receiver_health_residual_ewma_ = 0.0;
+  bool cbs_receiver_health_pose_initialized_ = false;
+  gtsam::Pose3 cbs_receiver_health_prev_pose_ = gtsam::Pose3();
+  size_t cbs_receiver_health_prev_map_at_count_ = 0u;
+  size_t cbs_receiver_health_prev_ils_count_ = 0u;
+  size_t cbs_receiver_health_prev_recovery_count_ = 0u;
+
   // zy Step 3_b
   // this map lets us match incoming belief timestamps to Kimera frame IDs, including old poses.
   mutable std::mutex timestamp_to_kf_id_map_mutex_;
