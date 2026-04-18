@@ -37,17 +37,33 @@ find_package(Pangolin QUIET)
 # Step 10a
 option(KIMERA_USE_CBS "Build Kimera-VIO with CBS/BPSAM integration hooks" OFF)
 if(KIMERA_USE_CBS)
-  set(_CBS_SRC_HINT "${CMAKE_CURRENT_SOURCE_DIR}/../../../cbs_ws/src")
+  set(_CBS_WS_HINT "${CMAKE_CURRENT_SOURCE_DIR}/../../../cbs_ws")
+  set(_CBS_SRC_HINT "${_CBS_WS_HINT}/src")
 
-  if(NOT cbs_DIR AND EXISTS "${_CBS_SRC_HINT}/cbs/build/cbsConfig.cmake")
-    set(cbs_DIR "${_CBS_SRC_HINT}/cbs/build" CACHE PATH
-        "Directory containing cbsConfig.cmake")
+  if(NOT cbs_DIR)
+    if(EXISTS "${_CBS_WS_HINT}/devel/lib/cmake/cbs/cbsConfig.cmake")
+      set(cbs_DIR "${_CBS_WS_HINT}/devel/lib/cmake/cbs" CACHE PATH
+          "Directory containing cbsConfig.cmake")
+    elseif(EXISTS "${_CBS_WS_HINT}/build/cbs/cbsConfig.cmake")
+      set(cbs_DIR "${_CBS_WS_HINT}/build/cbs" CACHE PATH
+          "Directory containing cbsConfig.cmake")
+    elseif(EXISTS "${_CBS_SRC_HINT}/cbs/build/cbsConfig.cmake")
+      set(cbs_DIR "${_CBS_SRC_HINT}/cbs/build" CACHE PATH
+          "Directory containing cbsConfig.cmake")
+    endif()
   endif()
 
-  if(NOT aria_common_DIR AND
-     EXISTS "${_CBS_SRC_HINT}/aria_common/build/aria_commonConfig.cmake")
-    set(aria_common_DIR "${_CBS_SRC_HINT}/aria_common/build" CACHE PATH
-        "Directory containing aria_commonConfig.cmake")
+  if(NOT aria_common_DIR)
+    if(EXISTS "${_CBS_WS_HINT}/devel/lib/cmake/aria_common/aria_commonConfig.cmake")
+      set(aria_common_DIR "${_CBS_WS_HINT}/devel/lib/cmake/aria_common" CACHE PATH
+          "Directory containing aria_commonConfig.cmake")
+    elseif(EXISTS "${_CBS_WS_HINT}/build/aria_common/aria_commonConfig.cmake")
+      set(aria_common_DIR "${_CBS_WS_HINT}/build/aria_common" CACHE PATH
+          "Directory containing aria_commonConfig.cmake")
+    elseif(EXISTS "${_CBS_SRC_HINT}/aria_common/build/aria_commonConfig.cmake")
+      set(aria_common_DIR "${_CBS_SRC_HINT}/aria_common/build" CACHE PATH
+          "Directory containing aria_commonConfig.cmake")
+    endif()
   endif()
 
   find_package(cbs REQUIRED CONFIG)

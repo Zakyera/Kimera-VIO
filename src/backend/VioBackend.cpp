@@ -129,6 +129,10 @@ DEFINE_int32(external_prior_max_per_optimize,
              400,
              "Maximum number of external priors processed in one optimize() "
              "cycle before deferring the remainder.");
+DEFINE_bool(cbs_diag_external_prior_lifecycle,
+            false,
+            "If true, emit per-prior lifecycle diagnostics while processing "
+            "the external prior queue.");
 DEFINE_bool(external_pose_belief_safe_covariance_fallback,
             false,
             "If true, publish external pose beliefs with a safe covariance "
@@ -2350,6 +2354,11 @@ bool VioBackend::getLatestExternalPoseBelief(
   size_t cbs_last_epoch_beliefs_accepted = 0u;
   size_t cbs_last_epoch_priors_injected = 0u;
   const gtsam::Symbol pose_symbol(kPoseSymbolChar, curr_kf_id_);
+  const auto pose_symbol_token = [](const gtsam::Symbol& symbol) {
+    std::ostringstream oss;
+    oss << symbol.chr() << symbol.index();
+    return oss.str();
+  };
   std::string outgoing_mean_source = "heart_state";
   std::string outgoing_cov_source = "unset";
   std::string h2_outgoing_cov_source_path = "unset";
@@ -2476,15 +2485,110 @@ bool VioBackend::getLatestExternalPoseBelief(
       outgoing_diag_emit_ms +=
           elapsedMs(emit_diag_start, std::chrono::steady_clock::now());
     } else {
+      h2_cov_fallback_used = true;
       h2_cov_fallback_reason = local_reason.empty()
                                    ? "h2_local_snapshot_query_failed"
                                    : local_reason;
+      // Strict local-only covariance contract: if current pose key is absent
+      // in the sidecar snapshot, try latest pose key in the SAME local
+      // snapshot (never fall back to non-local covariance sources).
+      gtsam::Symbol latest_snapshot_pose_symbol = pose_symbol;
+      bool found_latest_snapshot_pose_symbol = false;
+      {
+        std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+        if (h2_local_snapshot_valid_) {
+          for (const gtsam::Key key : h2_local_values_snapshot_.keys()) {
+            const gtsam::Symbol candidate_symbol(key);
+            if (candidate_symbol.chr() != kPoseSymbolChar) {
+              continue;
+            }
+            if (!found_latest_snapshot_pose_symbol ||
+                candidate_symbol.index() > latest_snapshot_pose_symbol.index()) {
+              latest_snapshot_pose_symbol = candidate_symbol;
+              found_latest_snapshot_pose_symbol = true;
+            }
+          }
+        }
+      }
+      if (found_latest_snapshot_pose_symbol &&
+          latest_snapshot_pose_symbol.index() != pose_symbol.index()) {
+        gtsam::Pose3 latest_local_pose = belief->W_Pose_B_;
+        gtsam::Matrix66 latest_local_cov = gtsam::Matrix66::Identity();
+        std::string latest_local_reason;
+        std::string latest_local_source_path;
+        const auto latest_cov_query_start = std::chrono::steady_clock::now();
+        const bool latest_local_ok = queryH2LocalPoseCovFromActiveSmoother(
+            latest_snapshot_pose_symbol,
+            &latest_local_pose,
+            &latest_local_cov,
+            &latest_local_reason,
+            &latest_local_source_path);
+        outgoing_cov_query_ms +=
+            elapsedMs(latest_cov_query_start, std::chrono::steady_clock::now());
+        if (latest_local_ok) {
+          h2_sidecar_key_exists_for_outgoing = true;
+          belief->W_Pose_B_ = latest_local_pose;
+          belief->covariance_ = latest_local_cov;
+          covariance_set = true;
+          outgoing_mean_source = "h2_local_snapshot_graph_latest_pose_fallback";
+          outgoing_cov_source = "h2_sidecar_local_only_latest_pose_fallback";
+          h2_outgoing_cov_source_path = latest_local_source_path.empty()
+                                            ? "h2_sidecar_local_only_latest_pose_fallback"
+                                            : latest_local_source_path;
+          std::ostringstream reason_stream;
+          reason_stream
+              << "h2_sidecar_missing_curr_key_use_latest_local_snapshot_pose_key:"
+              << pose_symbol_token(latest_snapshot_pose_symbol);
+          h2_cov_fallback_reason = reason_stream.str();
+          const auto emit_diag_start = std::chrono::steady_clock::now();
+          emit_outgoing_cov_diag(
+              belief->covariance_, std::nullopt, h2_outgoing_cov_source_path.c_str());
+          outgoing_diag_emit_ms +=
+              elapsedMs(emit_diag_start, std::chrono::steady_clock::now());
+        } else if (!latest_local_reason.empty()) {
+          h2_cov_fallback_reason +=
+              "|latest_local_snapshot_pose_key_query_failed:" + latest_local_reason;
+        }
+      }
     }
   }
 
   // In CBS mode, export covariance from BPSAM marginals so shared beliefs reflect the CBS state.
-  if (useCbsOptimizerHeart()) {
+  if (useCbsOptimizerHeart() && !useCbsH2LocalCovSidecar()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
+    gtsam::Symbol cov_query_pose_symbol = pose_symbol;
+    bool cov_query_pose_symbol_fell_back = false;
+    if (!cbs_optimizer_->valueExists(cov_query_pose_symbol)) {
+      size_t latest_pose_index = 0u;
+      bool found_latest_pose = false;
+      const auto& variable_index = cbs_optimizer_->getVariableIndex();
+      for (const auto& key_slots_pair : variable_index) {
+        const gtsam::Symbol candidate_symbol(key_slots_pair.first);
+        if (candidate_symbol.chr() != kPoseSymbolChar) {
+          continue;
+        }
+        if (!cbs_optimizer_->valueExists(candidate_symbol)) {
+          continue;
+        }
+        if (!found_latest_pose || candidate_symbol.index() > latest_pose_index) {
+          latest_pose_index = candidate_symbol.index();
+          cov_query_pose_symbol = candidate_symbol;
+          found_latest_pose = true;
+        }
+      }
+      if (found_latest_pose) {
+        cov_query_pose_symbol_fell_back =
+            (cov_query_pose_symbol.index() != pose_symbol.index());
+        if (cov_query_pose_symbol_fell_back) {
+          h2_cov_fallback_used = useCbsH2LocalCovSidecar();
+          std::ostringstream reason_stream;
+          reason_stream << "h2_sidecar_missing_curr_key_use_latest_pose_key:x"
+                        << cov_query_pose_symbol.index();
+          h2_cov_fallback_reason = reason_stream.str();
+        }
+      }
+    }
+
     if (!covariance_set &&
         FLAGS_cbs_outgoing_cov_fastpath_when_no_external_effect &&
         cbs_last_epoch_no_external_effect &&
@@ -2511,24 +2615,31 @@ bool VioBackend::getLatestExternalPoseBelief(
 
     if (!covariance_set) {
       try {
-        if (cbs_optimizer_->valueExists(pose_symbol)) {
+        if (cbs_optimizer_->valueExists(cov_query_pose_symbol)) {
           const auto cov_query_start = std::chrono::steady_clock::now();
           // Match CBS pose-sharing stage: export pose covariance from LOCAL
           // marginalization (exclude belief factors from covariance computation).
           const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(
-              pose_symbol, cbs::BPSAM::MarginalizationType::LOCAL);
+              cov_query_pose_symbol, cbs::BPSAM::MarginalizationType::LOCAL);
           if (cov.rows() >= 6 && cov.cols() >= 6 && cov.allFinite()) {
             belief->covariance_ = cov.topLeftCorner(6, 6);
             covariance_set = true;
-            outgoing_cov_source =
-                FLAGS_cbs_outgoing_query_full_cov_for_diag
-                    ? "cbs_local_marginal_with_full_diag"
-                    : "cbs_local_marginal";
+            if (cov_query_pose_symbol_fell_back) {
+              outgoing_cov_source =
+                  FLAGS_cbs_outgoing_query_full_cov_for_diag
+                      ? "cbs_local_marginal_latest_pose_fallback_with_full_diag"
+                      : "cbs_local_marginal_latest_pose_fallback";
+            } else {
+              outgoing_cov_source =
+                  FLAGS_cbs_outgoing_query_full_cov_for_diag
+                      ? "cbs_local_marginal_with_full_diag"
+                      : "cbs_local_marginal";
+            }
             std::optional<gtsam::Matrix66> fused_cov_opt = std::nullopt;
             if (FLAGS_cbs_outgoing_query_full_cov_for_diag) {
               try {
                 const gtsam::Matrix full_cov = cbs_optimizer_->marginalCovariance(
-                    pose_symbol, cbs::BPSAM::MarginalizationType::FULL);
+                    cov_query_pose_symbol, cbs::BPSAM::MarginalizationType::FULL);
                 if (full_cov.rows() >= 6 && full_cov.cols() >= 6 &&
                     full_cov.allFinite()) {
                   fused_cov_opt = full_cov.topLeftCorner(6, 6);
@@ -2555,7 +2666,8 @@ bool VioBackend::getLatestExternalPoseBelief(
                 elapsedMs(cov_query_start, std::chrono::steady_clock::now());
           }
         } else {
-          VLOG(2) << "CBS value not found for pose key: " << pose_symbol;
+          VLOG(2) << "CBS value not found for pose key: "
+                  << cov_query_pose_symbol;
         }
       } catch (const std::exception& e) {
         VLOG(2) << "CBS marginal covariance query failed: " << e.what();
@@ -2564,8 +2676,7 @@ bool VioBackend::getLatestExternalPoseBelief(
   }
 #endif
 
-  if (!covariance_set && useCbsH2LocalCovSidecar() &&
-      FLAGS_cbs_h2_drop_publish_on_cov_fallback) {
+  if (!covariance_set && useCbsH2LocalCovSidecar()) {
     h2_cov_fallback_used = true;
     if (h2_cov_fallback_reason == "none") {
       h2_cov_fallback_reason = "h2_local_cov_unavailable";
@@ -2583,7 +2694,7 @@ bool VioBackend::getLatestExternalPoseBelief(
               << " h2_sidecar_key_exists_for_outgoing="
               << (h2_sidecar_key_exists_for_outgoing ? 1 : 0)
               << " h2_cov_fallback_reason=" << h2_cov_fallback_reason
-              << " drop_reason=h2_local_cov_fallback_blocked"
+              << " drop_reason=h2_local_cov_required_source_contract"
               << std::endl;
     return false;
   }
@@ -3168,6 +3279,10 @@ void VioBackend::enqueueExternalPosePrior(
 
   ExternalPosePrior prior;
   prior.timestamp_kf_nsec_ = timestamp_kf_nsec;
+  prior.receive_wall_timestamp_ns_ = static_cast<int64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
   prior.W_Pose_B_ = W_Pose_B;
   prior.noise_model_ = noise_model;
     
@@ -3317,29 +3432,136 @@ bool VioBackend::isPoseKeyActiveInOptimizer(
 
 /* -------------------------------------------------------------------------- */
 bool VioBackend::isReceiverLocalBeliefReadyForCbs(
-    const gtsam::Symbol& pose_symbol) const {
+    const gtsam::Symbol& pose_symbol,
+    ReceiverLocalBeliefReadinessState* readiness_state,
+    std::string* failure_reason,
+    std::string* failure_exception_text) const {
 #ifdef KIMERA_USE_CBS
+  if (failure_exception_text) {
+    *failure_exception_text = "none";
+  }
+  if (readiness_state) {
+    *readiness_state =
+        ReceiverLocalBeliefReadinessState::kMissingInOptimizerAndNewValues;
+  }
   if (!useCbsOptimizerHeart()) {
+    if (readiness_state) {
+      *readiness_state = ReceiverLocalBeliefReadinessState::kReadyInOptimizer;
+    }
+    if (failure_reason) {
+      *failure_reason = "cbs_heart_disabled";
+    }
     return true;
   }
   CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
 
   if (!cbs_optimizer_->valueExists(pose_symbol)) {
+    const bool pending_in_new_values = new_values_.exists(pose_symbol);
+    if (readiness_state) {
+      *readiness_state =
+          pending_in_new_values
+              ? ReceiverLocalBeliefReadinessState::
+                    kPendingInNewValuesNotCommitted
+              : ReceiverLocalBeliefReadinessState::
+                    kMissingInOptimizerAndNewValues;
+    }
+    if (failure_reason) {
+      *failure_reason =
+          pending_in_new_values ? "value_pending_new_values" : "value_missing";
+    }
     return false;
   }
+  if (readiness_state) {
+    *readiness_state = ReceiverLocalBeliefReadinessState::kReadyInOptimizer;
+  }
+
+  const auto try_anchored_readiness_after_local_failure =
+      [&](const std::string& local_failure_reason,
+          const std::string& local_exception_text) -> bool {
+    if (!FLAGS_cbs_use_anchored_receiver_local_for_merge) {
+      if (failure_reason) {
+        *failure_reason = local_failure_reason;
+      }
+      if (failure_exception_text) {
+        *failure_exception_text =
+            local_exception_text.empty() ? "none" : local_exception_text;
+      }
+      return false;
+    }
+
+    gtsam::Pose3 anchored_pose_dummy;
+    gtsam::Matrix66 anchored_cov_dummy = gtsam::Matrix66::Zero();
+    std::string anchored_reason = "none";
+    std::string anchored_source_path = "unset";
+    const bool anchored_query_ok = queryH2LocalPoseCovFromActiveSmoother(
+        pose_symbol,
+        &anchored_pose_dummy,
+        &anchored_cov_dummy,
+        &anchored_reason,
+        &anchored_source_path);
+    const bool anchored_source_semantic_ok =
+        anchored_query_ok &&
+        (anchored_source_path.find("anchor") != std::string::npos);
+
+    if (failure_exception_text) {
+      std::ostringstream oss;
+      oss << "local_failure_reason=" << local_failure_reason
+          << ";local_exception="
+          << (local_exception_text.empty() ? "none" : local_exception_text)
+          << ";anchored_query_attempted=1"
+          << ";anchored_query_ok=" << (anchored_query_ok ? 1 : 0)
+          << ";anchored_ready=" << (anchored_source_semantic_ok ? 1 : 0)
+          << ";anchored_source=" << anchored_source_path
+          << ";anchored_reason=" << anchored_reason;
+      *failure_exception_text = oss.str();
+    }
+
+    if (anchored_source_semantic_ok) {
+      if (failure_reason) {
+        *failure_reason = "anchored_local_ready_after_local_throw";
+      }
+      return true;
+    }
+
+    if (failure_reason) {
+      *failure_reason = local_failure_reason;
+    }
+    return false;
+  };
 
   try {
     const gtsam::Matrix cov = cbs_optimizer_->marginalCovariance(
         pose_symbol, cbs::BPSAM::MarginalizationType::LOCAL);
-    return cov.rows() >= 6 && cov.cols() >= 6 &&
-           cov.topLeftCorner(6, 6).allFinite();
-  } catch (const std::exception&) {
-    return false;
+    if (cov.rows() < 6 || cov.cols() < 6) {
+      return try_anchored_readiness_after_local_failure("local_cov_dim_invalid",
+                                                        "none");
+    }
+    if (!cov.topLeftCorner(6, 6).allFinite()) {
+      return try_anchored_readiness_after_local_failure("local_cov_nonfinite",
+                                                        "none");
+    }
+    if (failure_exception_text) {
+      *failure_exception_text = "none";
+    }
+    if (failure_reason) {
+      *failure_reason = "ready";
+    }
+    return true;
+  } catch (const std::exception& e) {
+    const std::string local_exception =
+        e.what() ? std::string(e.what()) : "std::exception";
+    return try_anchored_readiness_after_local_failure("local_cov_query_throw",
+                                                      local_exception);
   } catch (...) {
-    return false;
+    return try_anchored_readiness_after_local_failure(
+        "local_cov_query_throw_unknown", "unknown_exception");
   }
 #else
   (void)pose_symbol;
+  (void)readiness_state;
+  if (failure_reason) {
+    *failure_reason = "cbs_not_compiled";
+  }
   return false;
 #endif
 }
@@ -9311,6 +9533,7 @@ bool VioBackend::optimize(
   // H2 sidecar filtering only needs external-prior pointers from this epoch's
   // packet construction; clear stale pointers from previous optimize rounds.
   cbs_external_prior_factor_ptrs_.clear();
+  cbs_pending_prior_packet_probe_targets_.clear();
 #endif
 
   size_t num_external_priors_injected = 0;
@@ -9321,9 +9544,77 @@ bool VioBackend::optimize(
   size_t num_external_priors_dropped_disabled_mode = 0;
   size_t num_external_priors_deferred_budget = 0;
   size_t num_external_priors_deferred_no_local_receiver_state = 0;
+  size_t num_external_priors_deferred_matched_wait = 0;
+  size_t num_external_priors_deferred_generic_backoff = 0;
+  size_t num_external_priors_ready_in_optimizer_state = 0;
+  size_t num_external_priors_pending_in_new_values_state = 0;
+  size_t num_external_priors_missing_in_optimizer_and_new_values_state = 0;
+  size_t num_external_priors_rescued_by_post_update_retry = 0;
   size_t num_external_priors_fast_skipped = 0;
   size_t num_external_priors_source_backoff_skipped = 0;
   size_t num_external_priors_considered = 0;
+  std::string first_no_local_receiver_state_reason = "none";
+
+  struct PendingPostUpdateRetryPrior {
+    ExternalPosePrior prior;
+    FrameId matched_frame_id = -1;
+    Timestamp matched_timestamp_ns = -1;
+    bool sample_visibility_diag = false;
+    bool in_update_packet_new_values = false;
+    bool was_in_new_values_before_update = false;
+    bool in_global_state_before_update = false;
+    FrameId curr_kf_id_before_update = -1;
+    bool target_is_current_frame_pose = false;
+    bool value_exists_in_optimizer_before_update = false;
+    bool estimate_exists_before_update = false;
+    bool variable_index_contains_before_update = false;
+    bool touched_by_delete_slots_before_update = false;
+    bool touched_by_extra_remove_slots_before_update = false;
+  };
+  std::vector<PendingPostUpdateRetryPrior> pending_post_update_retry_priors;
+  struct PostUpdateRetryH2AuditEntry {
+    std::string source = "unknown";
+    uint64_t source_seq = 0;
+    FrameId matched_frame_id = -1;
+    std::string retry_outcome = "unknown";
+    std::string retry_readiness_reason = "none";
+    bool value_exists_after_update = false;
+    bool estimate_exists_after_update = false;
+    bool variable_index_contains_after_update = false;
+    bool h2_snapshot_valid_before_retry = false;
+    bool h2_snapshot_contains_xk_before_retry = false;
+    bool packet_contains_xk = false;
+  };
+  std::vector<PostUpdateRetryH2AuditEntry> post_update_h2_audit_entries;
+
+#ifdef KIMERA_USE_CBS
+  auto should_sample_pending_visibility_diag =
+      [&](const ExternalPosePrior& prior) -> bool {
+    if (!FLAGS_cbs_diag_external_prior_lifecycle) {
+      return false;
+    }
+    if (!(cbs_exchange_active && cbs_heart_active)) {
+      return false;
+    }
+    if (!(prior.source_ == "liorf" || prior.source_ == "liosam")) {
+      return false;
+    }
+    constexpr size_t kVisibilityDiagSampleLimit = 10u;
+    if (cbs_external_prior_visibility_sampled_source_seqs_.find(
+            prior.source_seq_) !=
+        cbs_external_prior_visibility_sampled_source_seqs_.end()) {
+      return true;
+    }
+    if (cbs_external_prior_visibility_sampled_source_seqs_.size() >=
+        kVisibilityDiagSampleLimit) {
+      return false;
+    }
+    const auto inserted =
+        cbs_external_prior_visibility_sampled_source_seqs_.insert(
+            prior.source_seq_);
+    return inserted.second;
+  };
+#endif
 
   double ext_queue_scan_filter_ms = 0.0;
   double ext_window_match_ms = 0.0;
@@ -9501,15 +9792,82 @@ bool VioBackend::optimize(
           prior->retry_backoff_ns_ = std::min(kDeferredMaxBackoffNs, backoff_ns * 2);
           return backoff_ns;
         };
+    const auto emit_external_prior_lifecycle =
+        [&](const ExternalPosePrior& prior,
+            const char* decision,
+            const char* reason,
+            const char* queue_bucket,
+            bool matched,
+            FrameId matched_frame_id,
+            Timestamp matched_timestamp_ns,
+            const std::string& readiness_reason,
+            Timestamp backoff_ns,
+            bool injected_now) {
+          if (!FLAGS_cbs_diag_external_prior_lifecycle) {
+            return;
+          }
+          std::cerr << std::setprecision(12)
+                    << "[CBS][ExternalPriorLifecycleDiag]"
+                    << " timestamp_ns=" << timestamp_kf_nsec
+                    << " curr_kf_id=" << cur_id
+                    << " source=" << prior.source_
+                    << " source_seq=" << prior.source_seq_
+                    << " prior_timestamp_ns=" << prior.timestamp_kf_nsec_
+                    << " receive_wall_timestamp_ns="
+                    << prior.receive_wall_timestamp_ns_
+                    << " first_seen_epoch_timestamp_ns="
+                    << prior.first_seen_epoch_timestamp_ns_
+                    << " lifecycle_attempt_count="
+                    << prior.lifecycle_attempt_count_
+                    << " queue_age_ns="
+                    << std::max<Timestamp>(0, timestamp_kf_nsec -
+                                                  prior.timestamp_kf_nsec_)
+                    << " has_locked_target="
+                    << (prior.has_locked_matched_target_ ? 1 : 0)
+                    << " locked_matched_frame_id=" << prior.locked_matched_frame_id_
+                    << " locked_matched_timestamp_ns="
+                    << prior.locked_matched_timestamp_ns_
+                    << " matched=" << (matched ? 1 : 0)
+                    << " matched_frame_id=" << matched_frame_id
+                    << " matched_timestamp_ns=" << matched_timestamp_ns
+                    << " oldest_active_pose_timestamp_ns="
+                    << oldest_active_pose_timestamp
+                    << " newest_active_pose_timestamp_ns="
+                    << newest_active_pose_timestamp
+                    << " decision=" << decision
+                    << " reason=" << reason
+                    << " queue_bucket=" << queue_bucket
+                    << " readiness_reason=" << readiness_reason
+                    << " backoff_ns=" << backoff_ns
+                    << " next_eligible_timestamp_ns="
+                    << prior.next_eligible_timestamp_ns_
+                    << " retry_backoff_ns=" << prior.retry_backoff_ns_
+                    << " injected_now=" << (injected_now ? 1 : 0)
+                    << std::endl;
+        };
 
     for (const auto& queued_prior : working_queue) {
       const auto prior_scan_start = std::chrono::steady_clock::now();
       ExternalPosePrior prior = queued_prior;
+      if (prior.first_seen_epoch_timestamp_ns_ < 0) {
+        prior.first_seen_epoch_timestamp_ns_ = timestamp_kf_nsec;
+      }
+      ++prior.lifecycle_attempt_count_;
 #ifdef KIMERA_USE_CBS
       ++num_external_beliefs_received;
 #endif
       if (!cbs_exchange_active) {
         ++num_external_priors_dropped_disabled_mode;
+        emit_external_prior_lifecycle(prior,
+                                      "drop",
+                                      "exchange_disabled",
+                                      "disabled_mode",
+                                      false,
+                                      -1,
+                                      -1,
+                                      "none",
+                                      0,
+                                      false);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         continue;
@@ -9521,6 +9879,19 @@ bool VioBackend::optimize(
         remaining_queue.push_back(prior);
         ++num_external_priors_deferred;
         ++num_external_priors_fast_skipped;
+        emit_external_prior_lifecycle(prior,
+                                      "defer",
+                                      "next_eligible_in_future",
+                                      "generic",
+                                      false,
+                                      -1,
+                                      -1,
+                                      "none",
+                                      std::max<Timestamp>(
+                                          0,
+                                          prior.next_eligible_timestamp_ns_ -
+                                              timestamp_kf_nsec),
+                                      false);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         continue;
@@ -9543,6 +9914,17 @@ bool VioBackend::optimize(
           ++num_external_priors_deferred;
           ++num_external_priors_fast_skipped;
           ++num_external_priors_source_backoff_skipped;
+          emit_external_prior_lifecycle(
+              prior,
+              "defer",
+              "source_backoff_window_active",
+              "generic",
+              false,
+              -1,
+              -1,
+              "none",
+              std::max<Timestamp>(0, retry_after_ns - timestamp_kf_nsec),
+              false);
           ext_queue_scan_filter_ms +=
               elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
           continue;
@@ -9550,73 +9932,116 @@ bool VioBackend::optimize(
       }
 #endif
 
-      // Drop priors that are older than the oldest pose still active in the
-      // optimizer window (fixed-lag behavior).
-      if (oldest_active_pose_timestamp > 0 &&
-          prior.timestamp_kf_nsec_ + external_prior_timestamp_tolerance_ns_ <
-              oldest_active_pose_timestamp) {
-        ++num_external_priors_dropped_marginalized;
-        ext_queue_scan_filter_ms +=
-            elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
-        continue;
-      }
-
-      // Drop priors that are too old w.r.t current backend timestamp.
-      if (prior.timestamp_kf_nsec_ + kMaxPriorAgeNs < timestamp_kf_nsec) {
-        ++num_external_priors_dropped_old;
-        ext_queue_scan_filter_ms +=
-            elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
-        continue;
-      }
-
-      // Keep priors that are too far in the future; they may match later frames.
-      if (prior.timestamp_kf_nsec_ > timestamp_kf_nsec + kMaxFutureLeadNs) {
-        prior.next_eligible_timestamp_ns_ = std::max(
-            prior.next_eligible_timestamp_ns_,
-            prior.timestamp_kf_nsec_ - kMaxFutureLeadNs);
-        remaining_queue.push_back(prior);
-        ++num_external_priors_deferred;
-        ext_queue_scan_filter_ms +=
-            elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
-        continue;
-      }
-
       bool matched = false;
       FrameId matched_frame_id = -1;
+      const bool has_locked_target = prior.has_locked_matched_target_;
 
-      const auto match_start = std::chrono::steady_clock::now();
-      {
-        std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
-        if (!timestamp_to_kf_id_map_.empty()) {
-          auto it = timestamp_to_kf_id_map_.lower_bound(prior.timestamp_kf_nsec_);
+      if (!has_locked_target) {
+        // Drop priors that are older than the oldest pose still active in the
+        // optimizer window (fixed-lag behavior).
+        if (oldest_active_pose_timestamp > 0 &&
+            prior.timestamp_kf_nsec_ + external_prior_timestamp_tolerance_ns_ <
+                oldest_active_pose_timestamp) {
+          ++num_external_priors_dropped_marginalized;
+          emit_external_prior_lifecycle(prior,
+                                        "drop",
+                                        "older_than_oldest_active_window",
+                                        "unmatched_window_pending",
+                                        false,
+                                        -1,
+                                        -1,
+                                        "none",
+                                        0,
+                                        false);
+          ext_queue_scan_filter_ms +=
+              elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
+          continue;
+        }
 
-          std::map<Timestamp, FrameId>::const_iterator best_it =
-              timestamp_to_kf_id_map_.end();
-          Timestamp best_dt = std::numeric_limits<Timestamp>::max();
+        // Drop priors that are too old w.r.t current backend timestamp.
+        if (prior.timestamp_kf_nsec_ + kMaxPriorAgeNs < timestamp_kf_nsec) {
+          ++num_external_priors_dropped_old;
+          emit_external_prior_lifecycle(prior,
+                                        "drop",
+                                        "exceeds_max_age",
+                                        "unmatched_window_pending",
+                                        false,
+                                        -1,
+                                        -1,
+                                        "none",
+                                        0,
+                                        false);
+          ext_queue_scan_filter_ms +=
+              elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
+          continue;
+        }
 
-          if (it != timestamp_to_kf_id_map_.end()) {
-            const Timestamp dt = absDiffNs(it->first, prior.timestamp_kf_nsec_);
-            best_it = it;
-            best_dt = dt;
-          }
-          if (it != timestamp_to_kf_id_map_.begin()) {
-            auto prev_it = std::prev(it);
-            const Timestamp dt = absDiffNs(prev_it->first, prior.timestamp_kf_nsec_);
-            if (dt < best_dt) {
-              best_it = prev_it;
-              best_dt = dt;
-            }
-          }
-
-          if (best_it != timestamp_to_kf_id_map_.end() &&
-              best_dt <= external_prior_timestamp_tolerance_ns_) {
-            matched = true;
-            matched_frame_id = best_it->second;
-          }
+        // Keep priors that are too far in the future; they may match later frames.
+        if (prior.timestamp_kf_nsec_ > timestamp_kf_nsec + kMaxFutureLeadNs) {
+          prior.next_eligible_timestamp_ns_ = std::max(
+              prior.next_eligible_timestamp_ns_,
+              prior.timestamp_kf_nsec_ - kMaxFutureLeadNs);
+          remaining_queue.push_back(prior);
+          ++num_external_priors_deferred;
+          emit_external_prior_lifecycle(
+              prior,
+              "defer",
+              "future_lead_exceeds_gate",
+              "unmatched_window_pending",
+              false,
+              -1,
+              -1,
+              "none",
+              std::max<Timestamp>(
+                  0, prior.next_eligible_timestamp_ns_ - timestamp_kf_nsec),
+              false);
+          ext_queue_scan_filter_ms +=
+              elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
+          continue;
         }
       }
-      ext_window_match_ms +=
-          elapsedMs(match_start, std::chrono::steady_clock::now());
+
+      if (has_locked_target) {
+        matched = true;
+        matched_frame_id = prior.locked_matched_frame_id_;
+      } else {
+        const auto match_start = std::chrono::steady_clock::now();
+        {
+          std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
+          if (!timestamp_to_kf_id_map_.empty()) {
+            auto it = timestamp_to_kf_id_map_.lower_bound(prior.timestamp_kf_nsec_);
+
+            std::map<Timestamp, FrameId>::const_iterator best_it =
+                timestamp_to_kf_id_map_.end();
+            Timestamp best_dt = std::numeric_limits<Timestamp>::max();
+
+            if (it != timestamp_to_kf_id_map_.end()) {
+              const Timestamp dt = absDiffNs(it->first, prior.timestamp_kf_nsec_);
+              best_it = it;
+              best_dt = dt;
+            }
+            if (it != timestamp_to_kf_id_map_.begin()) {
+              auto prev_it = std::prev(it);
+              const Timestamp dt = absDiffNs(prev_it->first, prior.timestamp_kf_nsec_);
+              if (dt < best_dt) {
+                best_it = prev_it;
+                best_dt = dt;
+              }
+            }
+
+            if (best_it != timestamp_to_kf_id_map_.end() &&
+                best_dt <= external_prior_timestamp_tolerance_ns_) {
+              matched = true;
+              matched_frame_id = best_it->second;
+              prior.has_locked_matched_target_ = true;
+              prior.locked_matched_frame_id_ = matched_frame_id;
+              prior.locked_matched_timestamp_ns_ = best_it->first;
+            }
+          }
+        }
+        ext_window_match_ms +=
+            elapsedMs(match_start, std::chrono::steady_clock::now());
+      }
 
       if (!matched) {
         // zy
@@ -9625,6 +10050,16 @@ bool VioBackend::optimize(
         // already handled by the future-gate above.
         if (!cbs_heart_active) {
           ++num_external_priors_dropped_marginalized;
+          emit_external_prior_lifecycle(prior,
+                                        "drop",
+                                        "unmatched_nonheart_mode",
+                                        "unmatched_window_pending",
+                                        false,
+                                        -1,
+                                        -1,
+                                        "none",
+                                        0,
+                                        false);
           ext_queue_scan_filter_ms +=
               elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
           continue;
@@ -9638,13 +10073,34 @@ bool VioBackend::optimize(
             prior.timestamp_kf_nsec_ + external_prior_timestamp_tolerance_ns_ <
                 newest_active_pose_timestamp) {
           ++num_external_priors_dropped_marginalized;
+          emit_external_prior_lifecycle(prior,
+                                        "drop",
+                                        "unmatched_behind_newest_active_window",
+                                        "unmatched_window_pending",
+                                        false,
+                                        -1,
+                                        -1,
+                                        "none",
+                                        0,
+                                        false);
           ext_queue_scan_filter_ms +=
               elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
           continue;
         }
-        schedule_deferred_with_backoff(&prior);
+        const Timestamp deferred_backoff_ns = schedule_deferred_with_backoff(&prior);
         remaining_queue.push_back(prior);
         ++num_external_priors_deferred;
+        ++num_external_priors_deferred_generic_backoff;
+        emit_external_prior_lifecycle(prior,
+                                      "defer",
+                                      "unmatched_retry_with_backoff",
+                                      "generic",
+                                      false,
+                                      -1,
+                                      -1,
+                                      "none",
+                                      deferred_backoff_ns,
+                                      false);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         continue;
@@ -9652,30 +10108,195 @@ bool VioBackend::optimize(
 
       // Avoid overloading a single optimize() step.
       if (num_external_priors_injected >= kMaxExternalPriorsPerOptimize) {
-        schedule_deferred_with_backoff(&prior);
+        const Timestamp deferred_backoff_ns = schedule_deferred_with_backoff(&prior);
         remaining_queue.push_back(prior);
         ++num_external_priors_deferred_budget;
+        ++num_external_priors_deferred_generic_backoff;
+        emit_external_prior_lifecycle(prior,
+                                      "defer",
+                                      "per_optimize_budget_exhausted",
+                                      "generic",
+                                      true,
+                                      matched_frame_id,
+                                      prior.locked_matched_timestamp_ns_,
+                                      "none",
+                                      deferred_backoff_ns,
+                                      false);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         continue;
       }
 
       const gtsam::Symbol pose_symbol(kPoseSymbolChar, matched_frame_id);
+      if (prior.has_locked_matched_target_ && !isPoseKeyActiveInOptimizer(pose_symbol)) {
+        bool value_exists_in_optimizer_now = false;
 #ifdef KIMERA_USE_CBS
+        if (cbs_heart_active && cbs_optimizer_) {
+          value_exists_in_optimizer_now = cbs_optimizer_->valueExists(pose_symbol);
+        }
+#endif
+        const bool was_in_new_values_now = new_values_.exists(pose_symbol);
+        if (cbs_exchange_active && cbs_heart_active &&
+            prior.pending_in_new_values_not_committed_) {
+          const bool sample_visibility_diag =
+#ifdef KIMERA_USE_CBS
+              should_sample_pending_visibility_diag(prior);
+#else
+              false;
+#endif
+          pending_post_update_retry_priors.push_back(
+              {prior,
+               matched_frame_id,
+               prior.locked_matched_timestamp_ns_,
+               sample_visibility_diag,
+               false,
+               was_in_new_values_now,
+               state_.exists(pose_symbol),
+               curr_kf_id_,
+               matched_frame_id == curr_kf_id_,
+               value_exists_in_optimizer_now,
+               false,
+               false,
+               false,
+               false});
+          ++num_external_priors_deferred;
+          ++num_external_priors_deferred_no_local_receiver_state;
+          ++num_external_priors_deferred_matched_wait;
+          if (first_no_local_receiver_state_reason == "none") {
+            first_no_local_receiver_state_reason = "value_pending_new_values";
+          }
+          emit_external_prior_lifecycle(
+              prior,
+              "defer",
+              "locked_target_inactive_preupdate_post_update_retry",
+              "matched_wait",
+              true,
+              matched_frame_id,
+              prior.locked_matched_timestamp_ns_,
+              "value_pending_new_values",
+              0,
+              false);
+          ext_queue_scan_filter_ms +=
+              elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
+          continue;
+        }
+        ++num_external_priors_dropped_marginalized;
+        emit_external_prior_lifecycle(prior,
+                                      "drop",
+                                      "locked_target_no_longer_active",
+                                      "matched_wait",
+                                      true,
+                                      matched_frame_id,
+                                      prior.locked_matched_timestamp_ns_,
+                                      "none",
+                                      0,
+                                      false);
+        ext_queue_scan_filter_ms +=
+            elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
+        continue;
+      }
+#ifdef KIMERA_USE_CBS
+      ReceiverLocalBeliefReadinessState local_receiver_readiness_state =
+          ReceiverLocalBeliefReadinessState::
+              kMissingInOptimizerAndNewValues;
+      std::string local_receiver_ready_reason = "ready";
       if (cbs_exchange_active && cbs_heart_active &&
-          !isReceiverLocalBeliefReadyForCbs(pose_symbol)) {
-        schedule_deferred_with_backoff(&prior);
-        remaining_queue.push_back(prior);
+          !isReceiverLocalBeliefReadyForCbs(
+              pose_symbol,
+              &local_receiver_readiness_state,
+              &local_receiver_ready_reason)) {
+        switch (local_receiver_readiness_state) {
+          case ReceiverLocalBeliefReadinessState::kReadyInOptimizer:
+            ++num_external_priors_ready_in_optimizer_state;
+            break;
+          case ReceiverLocalBeliefReadinessState::
+              kPendingInNewValuesNotCommitted:
+            ++num_external_priors_pending_in_new_values_state;
+            break;
+          case ReceiverLocalBeliefReadinessState::
+              kMissingInOptimizerAndNewValues:
+            ++num_external_priors_missing_in_optimizer_and_new_values_state;
+            break;
+        }
+        prior.has_locked_matched_target_ = true;
+        prior.locked_matched_frame_id_ = matched_frame_id;
+        if (prior.locked_matched_timestamp_ns_ < 0) {
+          prior.locked_matched_timestamp_ns_ = prior.timestamp_kf_nsec_;
+        }
+        // Matched priors should retry quickly in fixed-lag mode; exponential
+        // backoff here makes them age out before receiver-local readiness.
+        prior.next_eligible_timestamp_ns_ = timestamp_kf_nsec;
+        prior.retry_backoff_ns_ = 0;
+        const bool pending_post_update_retry =
+            local_receiver_readiness_state ==
+            ReceiverLocalBeliefReadinessState::
+                kPendingInNewValuesNotCommitted;
+        prior.pending_in_new_values_not_committed_ = pending_post_update_retry;
+        bool value_exists_in_optimizer_now = false;
+#ifdef KIMERA_USE_CBS
+        if (cbs_optimizer_) {
+          value_exists_in_optimizer_now = cbs_optimizer_->valueExists(pose_symbol);
+        }
+#endif
+        if (pending_post_update_retry) {
+          const bool sample_visibility_diag =
+#ifdef KIMERA_USE_CBS
+              should_sample_pending_visibility_diag(prior);
+#else
+              false;
+#endif
+          pending_post_update_retry_priors.push_back(
+              {prior,
+               matched_frame_id,
+               prior.locked_matched_timestamp_ns_,
+               sample_visibility_diag,
+               false,
+               new_values_.exists(pose_symbol),
+               state_.exists(pose_symbol),
+               curr_kf_id_,
+               matched_frame_id == curr_kf_id_,
+               value_exists_in_optimizer_now,
+               false,
+               false,
+               false,
+               false});
+        } else {
+          remaining_queue.push_back(prior);
+        }
         ++num_external_priors_deferred;
         ++num_external_priors_deferred_no_local_receiver_state;
+        ++num_external_priors_deferred_matched_wait;
+        if (first_no_local_receiver_state_reason == "none") {
+          first_no_local_receiver_state_reason = local_receiver_ready_reason;
+        }
         VLOG(2) << "Deferring external prior: receiver LOCAL CBS state not "
                    "ready yet. source="
                 << prior.source_ << ", seq=" << prior.source_seq_
                 << ", ts[nsec]=" << prior.timestamp_kf_nsec_
-                << ", matched_frame_id=" << matched_frame_id;
+                << ", matched_frame_id=" << matched_frame_id
+                << ", local_ready_reason=" << local_receiver_ready_reason
+                << ", defer_mode="
+                << (pending_post_update_retry
+                        ? "matched_target_wait_retry_post_update_same_epoch"
+                        : "matched_target_wait_retry_next_epoch");
+        emit_external_prior_lifecycle(prior,
+                                      "defer",
+                                      pending_post_update_retry
+                                          ? "receiver_local_pending_post_update_retry"
+                                          : "receiver_local_state_not_ready",
+                                      "matched_wait",
+                                      true,
+                                      matched_frame_id,
+                                      prior.locked_matched_timestamp_ns_,
+                                      local_receiver_ready_reason,
+                                      0,
+                                      false);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         continue;
+      }
+      if (cbs_exchange_active && cbs_heart_active) {
+        ++num_external_priors_ready_in_optimizer_state;
       }
 #endif
       const bool pose_key_is_active = isPoseKeyActiveInOptimizer(pose_symbol);
@@ -10463,6 +11084,16 @@ bool VioBackend::optimize(
                   std::min(kRejectedSourceMaxBackoffNs, backoff_ns * 2);
             }
 #endif
+            emit_external_prior_lifecycle(prior,
+                                          "drop",
+                                          "belief_rejected_by_cbs_addBeliefs",
+                                          "matched_wait",
+                                          true,
+                                          matched_frame_id,
+                                          prior.locked_matched_timestamp_ns_,
+                                          "cbs_rejected",
+                                          0,
+                                          false);
             ext_queue_scan_filter_ms +=
                 elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
             continue;
@@ -10491,6 +11122,17 @@ bool VioBackend::optimize(
                     << ", ts[nsec]=" << prior.timestamp_kf_nsec_
                     << ", matched_frame_id=" << matched_frame_id;
           }
+          emit_external_prior_lifecycle(prior,
+                                        "inject",
+                                        cbs_heart_active ? "accepted_cbs_heart_mode"
+                                                         : "accepted_legacy_prior_injection",
+                                        "matched_wait",
+                                        true,
+                                        matched_frame_id,
+                                        prior.locked_matched_timestamp_ns_,
+                                        "ready",
+                                        0,
+                                        true);
           ext_queue_scan_filter_ms +=
               elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         } else {
@@ -10498,12 +11140,32 @@ bool VioBackend::optimize(
           VLOG(2) << "Dropping external prior because CBS belief exchange is OFF. source="
                   << prior.source_ << ", seq=" << prior.source_seq_
                   << ", ts[nsec]=" << prior.timestamp_kf_nsec_;
+          emit_external_prior_lifecycle(prior,
+                                        "drop",
+                                        "cbs_exchange_runtime_disabled",
+                                        "disabled_mode",
+                                        true,
+                                        matched_frame_id,
+                                        prior.locked_matched_timestamp_ns_,
+                                        "none",
+                                        0,
+                                        false);
           ext_queue_scan_filter_ms +=
               elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         }
 #else
         ++num_external_priors_dropped_disabled_mode;
         VLOG(2) << "Dropping external prior because CBS support is not compiled.";
+        emit_external_prior_lifecycle(prior,
+                                      "drop",
+                                      "cbs_not_compiled",
+                                      "disabled_mode",
+                                      true,
+                                      matched_frame_id,
+                                      prior.locked_matched_timestamp_ns_,
+                                      "none",
+                                      0,
+                                      false);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
 #endif
@@ -10514,6 +11176,16 @@ bool VioBackend::optimize(
                 << prior.source_ << ", seq=" << prior.source_seq_
                 << ", ts[nsec]=" << prior.timestamp_kf_nsec_
                 << ", frame_id=" << matched_frame_id;
+        emit_external_prior_lifecycle(prior,
+                                      "drop",
+                                      "matched_pose_key_inactive",
+                                      "matched_wait",
+                                      true,
+                                      matched_frame_id,
+                                      prior.locked_matched_timestamp_ns_,
+                                      "none",
+                                      0,
+                                      false);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
       } // zy when something behaves oddly, you can trace exact upstream message through Kimera.
@@ -10583,6 +11255,19 @@ bool VioBackend::optimize(
         << ", deferred_budget=" << num_external_priors_deferred_budget
         << ", deferred_no_local_receiver_state="
         << num_external_priors_deferred_no_local_receiver_state
+        << ", deferred_matched_wait=" << num_external_priors_deferred_matched_wait
+        << ", deferred_generic_backoff="
+        << num_external_priors_deferred_generic_backoff
+        << ", ready_in_optimizer="
+        << num_external_priors_ready_in_optimizer_state
+        << ", pending_in_new_values_not_committed="
+        << num_external_priors_pending_in_new_values_state
+        << ", missing_in_optimizer_and_new_values="
+        << num_external_priors_missing_in_optimizer_and_new_values_state
+        << ", rescued_by_post_update_retry="
+        << num_external_priors_rescued_by_post_update_retry
+        << ", first_no_local_ready_reason="
+        << first_no_local_receiver_state_reason
         << ", queue_size_now=" << external_queue_size_now;
   }
 
@@ -10607,6 +11292,20 @@ bool VioBackend::optimize(
               << num_external_priors_dropped_disabled_mode
               << " deferred_no_local_receiver_state="
               << num_external_priors_deferred_no_local_receiver_state
+              << " deferred_matched_wait="
+              << num_external_priors_deferred_matched_wait
+              << " deferred_generic_backoff="
+              << num_external_priors_deferred_generic_backoff
+              << " ready_in_optimizer="
+              << num_external_priors_ready_in_optimizer_state
+              << " pending_in_new_values_not_committed="
+              << num_external_priors_pending_in_new_values_state
+              << " missing_in_optimizer_and_new_values="
+              << num_external_priors_missing_in_optimizer_and_new_values_state
+              << " rescued_by_post_update_retry="
+              << num_external_priors_rescued_by_post_update_retry
+              << " first_no_local_ready_reason="
+              << first_no_local_receiver_state_reason
               << " beliefs_staged=" << num_external_beliefs_staged
               << " beliefs_accepted=" << num_external_beliefs_accepted
               << " beliefs_rejected=" << num_external_beliefs_rejected
@@ -10655,6 +11354,18 @@ bool VioBackend::optimize(
         << " priors_injected=" << num_external_priors_injected
         << " priors_deferred=" << num_external_priors_deferred
         << " priors_deferred_budget=" << num_external_priors_deferred_budget
+        << " priors_deferred_matched_wait="
+        << num_external_priors_deferred_matched_wait
+        << " priors_deferred_generic_backoff="
+        << num_external_priors_deferred_generic_backoff
+        << " priors_ready_in_optimizer="
+        << num_external_priors_ready_in_optimizer_state
+        << " priors_pending_in_new_values_not_committed="
+        << num_external_priors_pending_in_new_values_state
+        << " priors_missing_in_optimizer_and_new_values="
+        << num_external_priors_missing_in_optimizer_and_new_values_state
+        << " priors_rescued_by_post_update_retry="
+        << num_external_priors_rescued_by_post_update_retry
         << " priors_fast_skipped=" << num_external_priors_fast_skipped
         << " priors_source_backoff_skipped="
         << num_external_priors_source_backoff_skipped
@@ -11187,6 +11898,54 @@ bool VioBackend::optimize(
         (new_factors_tmp.size() > local_heart_factor_count)
             ? (new_factors_tmp.size() - local_heart_factor_count)
             : 0u;
+    auto set_packet_failure = [&](const std::string& reason_prefix,
+                                  const gtsam::Key key) {
+      const gtsam::Symbol symbol(key);
+      std::ostringstream oss;
+      oss << symbol.chr() << symbol.index();
+      h2_sidecar_packet_failure_key = oss.str();
+      h2_sidecar_packet_failure_reason = reason_prefix + ":" + oss.str();
+    };
+
+    gtsam::Values cbs_packet_values_cache;
+    bool cbs_packet_values_loaded = false;
+    bool cbs_packet_values_load_attempted = false;
+    auto try_load_cbs_packet_values = [&]() -> bool {
+      if (cbs_packet_values_load_attempted) {
+        return cbs_packet_values_loaded;
+      }
+      cbs_packet_values_load_attempted = true;
+#ifdef KIMERA_USE_CBS
+      if (useCbsOptimizerHeart() && cbs_optimizer_) {
+        try {
+          cbs_packet_values_cache = cbs_optimizer_->calculateEstimate();
+          cbs_packet_values_loaded = true;
+        } catch (const std::exception& e) {
+          VLOG(2) << "H2 sidecar packet fallback values query failed: "
+                  << e.what();
+        } catch (...) {
+          VLOG(2) << "H2 sidecar packet fallback values query failed: "
+                     "unknown exception";
+        }
+      }
+#endif
+      return cbs_packet_values_loaded;
+    };
+
+    auto key_supported_and_available = [&](const gtsam::Key key) -> bool {
+      const gtsam::Symbol symbol(key);
+      const char key_type = symbol.chr();
+      if (key_type != kPoseSymbolChar && key_type != kVelocitySymbolChar &&
+          key_type != kImuBiasSymbolChar) {
+        set_packet_failure("unsupported_key_type", key);
+        return false;
+      }
+      if (new_values_.exists(symbol) || state_.exists(symbol)) {
+        return true;
+      }
+      return try_load_cbs_packet_values() && cbs_packet_values_cache.exists(symbol);
+    };
+
     h2_sidecar_packet.local_factors.reserve(local_heart_factor_count);
     h2_sidecar_packet.heart_new_factor_positions.reserve(
         local_heart_factor_count);
@@ -11197,8 +11956,25 @@ bool VioBackend::optimize(
       if (!factor) {
         continue;
       }
-      // Mirror only epoch-local factors. Sharing immutable factor pointers
-      // avoids clone() gaps for factor types that do not implement cloning.
+      bool factor_keys_resolvable = true;
+      for (const gtsam::Key key : factor->keys()) {
+        if (!key_supported_and_available(key)) {
+          // Unsupported key types remain hard-fail, but missing boundary keys
+          // are dropped from the sidecar packet to keep the sidecar healthy.
+          if (h2_sidecar_packet_failure_reason.rfind("unsupported_key_type:", 0u) !=
+              0u) {
+            factor_keys_resolvable = false;
+          }
+          break;
+        }
+      }
+      if (!h2_sidecar_packet_failure_reason.empty()) {
+        break;
+      }
+      if (!factor_keys_resolvable) {
+        continue;
+      }
+      // Mirror only epoch-local factors that are packet-resolvable.
       h2_sidecar_packet.local_factors.push_back(factor);
       h2_sidecar_packet.heart_new_factor_positions.push_back(factor_pos);
       for (const gtsam::Key key : factor->keys()) {
@@ -11206,14 +11982,10 @@ bool VioBackend::optimize(
       }
     }
 
-    auto set_packet_failure = [&](const std::string& reason_prefix,
-                                  const gtsam::Key key) {
-      const gtsam::Symbol symbol(key);
-      std::ostringstream oss;
-      oss << symbol.chr() << symbol.index();
-      h2_sidecar_packet_failure_key = oss.str();
-      h2_sidecar_packet_failure_reason = reason_prefix + ":" + oss.str();
-    };
+    if (h2_sidecar_packet_failure_reason.empty() &&
+        h2_sidecar_packet.local_factors.empty()) {
+      h2_sidecar_packet_failure_reason = "h2_sidecar_packet_no_resolvable_local_factors";
+    }
 
     if (h2_sidecar_packet_failure_reason.empty()) {
       for (const gtsam::Key key : required_local_keys) {
@@ -11226,6 +11998,10 @@ bool VioBackend::optimize(
             } else if (state_.exists(symbol)) {
               h2_sidecar_packet.local_values.insert(
                   symbol, state_.at<gtsam::Pose3>(symbol));
+            } else if (try_load_cbs_packet_values() &&
+                       cbs_packet_values_cache.exists(symbol)) {
+              h2_sidecar_packet.local_values.insert(
+                  symbol, cbs_packet_values_cache.at<gtsam::Pose3>(symbol));
             } else {
               set_packet_failure("missing_local_value_for_key", key);
               break;
@@ -11238,6 +12014,10 @@ bool VioBackend::optimize(
             } else if (state_.exists(symbol)) {
               h2_sidecar_packet.local_values.insert(
                   symbol, state_.at<gtsam::Vector3>(symbol));
+            } else if (try_load_cbs_packet_values() &&
+                       cbs_packet_values_cache.exists(symbol)) {
+              h2_sidecar_packet.local_values.insert(
+                  symbol, cbs_packet_values_cache.at<gtsam::Vector3>(symbol));
             } else {
               set_packet_failure("missing_local_value_for_key", key);
               break;
@@ -11250,6 +12030,12 @@ bool VioBackend::optimize(
             } else if (state_.exists(symbol)) {
               h2_sidecar_packet.local_values.insert(
                   symbol, state_.at<gtsam::imuBias::ConstantBias>(symbol));
+            } else if (try_load_cbs_packet_values() &&
+                       cbs_packet_values_cache.exists(symbol)) {
+              h2_sidecar_packet.local_values.insert(
+                  symbol,
+                  cbs_packet_values_cache.at<gtsam::imuBias::ConstantBias>(
+                      symbol));
             } else {
               set_packet_failure("missing_local_value_for_key", key);
               break;
@@ -11276,6 +12062,110 @@ bool VioBackend::optimize(
   VLOG(10) << "iSAM2 update with " << new_factors_tmp.size() << " new factors "
            << ", " << new_values_.size() << " new values "
            << ", and " << delete_slots.size() << " deleted factors.";
+#ifdef KIMERA_USE_CBS
+  if (!pending_post_update_retry_priors.empty() && cbs_exchange_active &&
+      cbs_heart_active && cbs_optimizer_) {
+    const auto& variable_index_before_update = cbs_optimizer_->getVariableIndex();
+    gtsam::Values estimate_before_update_cache;
+    bool have_estimate_before_update_cache = false;
+    try {
+      estimate_before_update_cache = cbs_optimizer_->calculateEstimate();
+      have_estimate_before_update_cache = true;
+    } catch (...) {
+      have_estimate_before_update_cache = false;
+    }
+
+    const auto slots_touch_pose_symbol =
+        [&](const gtsam::FactorIndices& slots,
+            const gtsam::Symbol& pose_symbol) -> bool {
+      const gtsam::Key pose_key = pose_symbol.key();
+      for (const auto& slot : slots) {
+        if (!active_factor_graph->exists(slot)) {
+          continue;
+        }
+        const auto factor = active_factor_graph->at(slot);
+        if (!factor) {
+          continue;
+        }
+        for (const auto& key : factor->keys()) {
+          if (key == pose_key) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    std::unordered_set<uint64_t> sampled_seq_seen_preupdate;
+    sampled_seq_seen_preupdate.reserve(pending_post_update_retry_priors.size());
+    for (auto& pending_entry : pending_post_update_retry_priors) {
+      const gtsam::Symbol pose_symbol(kPoseSymbolChar,
+                                      pending_entry.matched_frame_id);
+      pending_entry.in_update_packet_new_values =
+          new_values_.exists(pose_symbol);
+      pending_entry.was_in_new_values_before_update =
+          pending_entry.in_update_packet_new_values;
+      pending_entry.in_global_state_before_update = state_.exists(pose_symbol);
+      pending_entry.curr_kf_id_before_update = curr_kf_id_;
+      pending_entry.target_is_current_frame_pose =
+          (pending_entry.matched_frame_id == curr_kf_id_);
+      pending_entry.value_exists_in_optimizer_before_update =
+          cbs_optimizer_->valueExists(pose_symbol);
+      pending_entry.estimate_exists_before_update =
+          have_estimate_before_update_cache &&
+          estimate_before_update_cache.exists(pose_symbol);
+      pending_entry.variable_index_contains_before_update =
+          variable_index_before_update.find(pose_symbol.key()) !=
+          variable_index_before_update.end();
+      pending_entry.touched_by_delete_slots_before_update =
+          slots_touch_pose_symbol(delete_slots, pose_symbol);
+      pending_entry.touched_by_extra_remove_slots_before_update =
+          slots_touch_pose_symbol(extra_factor_slots_to_delete, pose_symbol);
+      if (pending_entry.sample_visibility_diag &&
+          sampled_seq_seen_preupdate
+              .insert(pending_entry.prior.source_seq_)
+              .second) {
+        cbs_pending_prior_packet_probe_targets_.push_back(
+            {pending_entry.prior.source_,
+             pending_entry.prior.source_seq_,
+             pending_entry.prior.timestamp_kf_nsec_,
+             pending_entry.matched_timestamp_ns,
+             pending_entry.matched_frame_id,
+             pending_entry.in_update_packet_new_values,
+             pending_entry.in_global_state_before_update,
+             curr_kf_id_,
+             pending_entry.target_is_current_frame_pose});
+        if (FLAGS_cbs_diag_external_prior_lifecycle) {
+          std::cerr << std::setprecision(12)
+                    << "[CBS][PendingPriorGlobalPreUpdateDiag]"
+                    << " timestamp_ns=" << timestamp_kf_nsec
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " source=" << pending_entry.prior.source_
+                    << " source_seq=" << pending_entry.prior.source_seq_
+                    << " prior_timestamp_ns="
+                    << pending_entry.prior.timestamp_kf_nsec_
+                    << " locked_target_frame_id="
+                    << pending_entry.matched_frame_id
+                    << " locked_target_pose_symbol=x"
+                    << pending_entry.matched_frame_id
+                    << " locked_target_timestamp_ns="
+                    << pending_entry.matched_timestamp_ns
+                    << " global_new_values_exists_before_update="
+                    << (pending_entry.in_update_packet_new_values ? 1 : 0)
+                    << " global_state_exists_before_update="
+                    << (pending_entry.in_global_state_before_update ? 1 : 0)
+                    << " target_is_current_frame_pose="
+                    << (pending_entry.target_is_current_frame_pose ? 1 : 0)
+                    << " target_relation="
+                    << (pending_entry.target_is_current_frame_pose
+                            ? "current_frame_pose"
+                            : "older_locked_target")
+                    << std::endl;
+        }
+      }
+    }
+  }
+#endif
   Smoother::Result result;
   VLOG(10) << "Starting first update.";
   bool is_smoother_ok = updateSmoother(
@@ -11314,6 +12204,707 @@ bool VioBackend::optimize(
         utils::Timer::toc<std::chrono::seconds>(start_time).count();
     start_time = utils::Timer::tic();
   }
+
+#ifdef KIMERA_USE_CBS
+  size_t post_update_retry_attempted = 0u;
+  size_t post_update_retry_requeued = 0u;
+  size_t post_update_retry_dropped = 0u;
+  if (!pending_post_update_retry_priors.empty()) {
+    std::deque<ExternalPosePrior> post_update_requeue;
+    struct PostUpdateVisibilitySample {
+      std::string source;
+      uint64_t source_seq = 0;
+      FrameId matched_frame_id = -1;
+      bool in_update_packet_new_values = false;
+      bool value_exists_before_update = false;
+      bool estimate_exists_before_update = false;
+      bool variable_index_contains_before_update = false;
+      bool touched_by_delete_slots_before_update = false;
+      bool touched_by_extra_remove_slots_before_update = false;
+      bool value_exists_after_update = false;
+      bool estimate_exists_after_update = false;
+      bool variable_index_contains_after_update = false;
+      std::string retry_outcome = "unknown";
+    };
+    std::vector<PostUpdateVisibilitySample> post_update_visibility_samples;
+    const gtsam::VariableIndex* variable_index_after_update_ptr = nullptr;
+    gtsam::Values estimate_after_update_cache;
+    bool have_estimate_after_update_cache = false;
+    if (is_smoother_ok && cbs_exchange_active && cbs_heart_active &&
+        cbs_optimizer_) {
+      variable_index_after_update_ptr = &cbs_optimizer_->getVariableIndex();
+      try {
+        estimate_after_update_cache = cbs_optimizer_->calculateEstimate();
+        have_estimate_after_update_cache = true;
+      } catch (...) {
+        have_estimate_after_update_cache = false;
+      }
+    }
+    const auto find_packet_probe_for_seq =
+        [&](const uint64_t source_seq)
+            -> const CbsPendingPriorPacketProbeTarget* {
+      for (const auto& probe : cbs_pending_prior_packet_probe_targets_) {
+        if (probe.source_seq == source_seq) {
+          return &probe;
+        }
+      }
+      return nullptr;
+    };
+    const auto count_live_factors_touching_pose_symbol =
+        [&](const gtsam::Symbol& pose_symbol,
+            size_t* count_all,
+            size_t* count_smart,
+            size_t* count_imu,
+            size_t* count_between,
+            size_t* count_prior,
+            size_t* count_other) {
+          CHECK_NOTNULL(count_all);
+          CHECK_NOTNULL(count_smart);
+          CHECK_NOTNULL(count_imu);
+          CHECK_NOTNULL(count_between);
+          CHECK_NOTNULL(count_prior);
+          CHECK_NOTNULL(count_other);
+          *count_all = 0u;
+          *count_smart = 0u;
+          *count_imu = 0u;
+          *count_between = 0u;
+          *count_prior = 0u;
+          *count_other = 0u;
+          if (!cbs_optimizer_) {
+            return;
+          }
+          const gtsam::Key pose_key = pose_symbol.key();
+          const gtsam::NonlinearFactorGraph& factors =
+              cbs_optimizer_->getFactorsUnsafe();
+          for (const auto& factor_ptr : factors) {
+            if (!factor_ptr) {
+              continue;
+            }
+            bool touches_pose_key = false;
+            for (const gtsam::Key key : factor_ptr->keys()) {
+              if (key == pose_key) {
+                touches_pose_key = true;
+                break;
+              }
+            }
+            if (!touches_pose_key) {
+              continue;
+            }
+            ++(*count_all);
+            if (dynamic_cast<const SmartStereoFactor*>(factor_ptr.get()) != nullptr) {
+              ++(*count_smart);
+            } else if (dynamic_cast<const gtsam::CombinedImuFactor*>(
+                           factor_ptr.get()) != nullptr ||
+                       dynamic_cast<const gtsam::ImuFactor*>(factor_ptr.get()) !=
+                           nullptr) {
+              ++(*count_imu);
+            } else if (dynamic_cast<const gtsam::BetweenFactor<gtsam::Pose3>*>(
+                           factor_ptr.get()) != nullptr ||
+                       dynamic_cast<const gtsam::BetweenFactor<gtsam::Vector3>*>(
+                           factor_ptr.get()) != nullptr ||
+                       dynamic_cast<const gtsam::BetweenFactor<
+                           gtsam::imuBias::ConstantBias>*>(factor_ptr.get()) !=
+                           nullptr) {
+              ++(*count_between);
+            } else if (dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(
+                           factor_ptr.get()) != nullptr ||
+                       dynamic_cast<const gtsam::PriorFactor<gtsam::Vector3>*>(
+                           factor_ptr.get()) != nullptr ||
+                       dynamic_cast<const gtsam::PriorFactor<
+                           gtsam::imuBias::ConstantBias>*>(factor_ptr.get()) !=
+                           nullptr ||
+                       dynamic_cast<const ExternalPosePriorFactor*>(
+                           factor_ptr.get()) != nullptr) {
+              ++(*count_prior);
+            } else {
+              ++(*count_other);
+            }
+          }
+        };
+    if (is_smoother_ok && cbs_exchange_active && cbs_heart_active) {
+      for (auto& pending_entry : pending_post_update_retry_priors) {
+        ++post_update_retry_attempted;
+        ExternalPosePrior prior = std::move(pending_entry.prior);
+        const FrameId matched_frame_id = pending_entry.matched_frame_id;
+        const gtsam::Symbol pose_symbol(kPoseSymbolChar, matched_frame_id);
+        const bool sample_visibility_diag = pending_entry.sample_visibility_diag;
+        const CbsPendingPriorPacketProbeTarget* packet_probe =
+            find_packet_probe_for_seq(prior.source_seq_);
+        const std::string fallback_path_used =
+            packet_probe ? packet_probe->fallback_path_used : "none";
+        const std::string packet_update_stage =
+            packet_probe ? packet_probe->packet_update_stage : "none";
+        const std::string packet_call_phase_label =
+            packet_probe ? packet_probe->packet_call_phase_label : "none";
+        const std::string packet_timing_label =
+            packet_probe ? packet_probe->packet_timing_label : "none";
+        const std::string packet_factors_name =
+            packet_probe ? packet_probe->packet_factors_name : "none";
+        const std::string packet_values_name =
+            packet_probe ? packet_probe->packet_values_name : "none";
+        const bool packet_contains_xk =
+            packet_probe ? packet_probe->packet_contains_xk : false;
+        const bool packet_contains_xk_observed =
+            packet_probe ? packet_probe->packet_contains_xk_observed : false;
+        const size_t packet_factors_touching_xk_count =
+            packet_probe ? packet_probe->packet_factors_touching_xk_count : 0u;
+        const size_t packet_factors_touching_xk_smart_count =
+            packet_probe ? packet_probe->packet_factors_touching_xk_smart_count
+                         : 0u;
+        const size_t packet_factors_touching_xk_imu_count =
+            packet_probe ? packet_probe->packet_factors_touching_xk_imu_count
+                         : 0u;
+        const size_t packet_factors_touching_xk_between_count =
+            packet_probe ? packet_probe->packet_factors_touching_xk_between_count
+                         : 0u;
+        const size_t packet_factors_touching_xk_prior_count =
+            packet_probe ? packet_probe->packet_factors_touching_xk_prior_count
+                         : 0u;
+        const size_t packet_factors_touching_xk_other_count =
+            packet_probe ? packet_probe->packet_factors_touching_xk_other_count
+                         : 0u;
+        const bool packet_contains_xkm1 =
+            packet_probe ? packet_probe->packet_contains_xkm1 : false;
+        const bool packet_contains_vkm1 =
+            packet_probe ? packet_probe->packet_contains_vkm1 : false;
+        const bool packet_contains_bkm1 =
+            packet_probe ? packet_probe->packet_contains_bkm1 : false;
+        const size_t packet_missing_companion_keys_for_xk_count =
+            packet_probe
+                ? packet_probe->packet_missing_companion_keys_for_xk_count
+                : 0u;
+        const std::string first_missing_companion_key_for_xk =
+            packet_probe ? packet_probe->first_missing_companion_key_for_xk
+                         : "none";
+        bool value_exists_in_optimizer_after_update =
+            cbs_optimizer_ ? cbs_optimizer_->valueExists(pose_symbol) : false;
+        const bool estimate_exists_in_optimizer_after_update =
+            have_estimate_after_update_cache &&
+            estimate_after_update_cache.exists(pose_symbol);
+        const bool variable_index_contains_after_update =
+            variable_index_after_update_ptr &&
+            (variable_index_after_update_ptr->find(pose_symbol.key()) !=
+             variable_index_after_update_ptr->end());
+        bool h2_snapshot_valid_before_retry = false;
+        bool h2_snapshot_contains_xk_before_retry = false;
+        {
+          std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+          h2_snapshot_valid_before_retry = h2_local_snapshot_valid_;
+          h2_snapshot_contains_xk_before_retry =
+              h2_local_values_snapshot_.exists(pose_symbol);
+        }
+        size_t live_factors_touching_xk_count = 0u;
+        size_t live_factors_touching_xk_smart_count = 0u;
+        size_t live_factors_touching_xk_imu_count = 0u;
+        size_t live_factors_touching_xk_between_count = 0u;
+        size_t live_factors_touching_xk_prior_count = 0u;
+        size_t live_factors_touching_xk_other_count = 0u;
+        count_live_factors_touching_pose_symbol(
+            pose_symbol,
+            &live_factors_touching_xk_count,
+            &live_factors_touching_xk_smart_count,
+            &live_factors_touching_xk_imu_count,
+            &live_factors_touching_xk_between_count,
+            &live_factors_touching_xk_prior_count,
+            &live_factors_touching_xk_other_count);
+        const bool structural_no_live_support_after_update =
+            value_exists_in_optimizer_after_update &&
+            estimate_exists_in_optimizer_after_update &&
+            !variable_index_contains_after_update &&
+            (live_factors_touching_xk_count == 0u);
+        ReceiverLocalBeliefReadinessState retry_readiness_state =
+            ReceiverLocalBeliefReadinessState::
+                kMissingInOptimizerAndNewValues;
+        std::string retry_readiness_reason = "not_evaluated";
+        std::string retry_exception_text = "none";
+        bool retry_ready = false;
+        bool unlock_rematch_applied = false;
+        bool anchored_cov_query_attempted = false;
+        bool anchored_cov_query_ok = false;
+        std::string anchored_cov_query_reason = "not_attempted";
+        std::string anchored_cov_query_source = "none";
+        const auto sanitize_retry_diag_token = [](std::string token) {
+          if (token.empty()) {
+            return std::string("none");
+          }
+          for (char& c : token) {
+            if (std::isspace(static_cast<unsigned char>(c))) {
+              c = '_';
+            }
+          }
+          return token;
+        };
+        const auto emit_post_update_retry_diag =
+            [&](const char* retry_outcome) {
+              if (!FLAGS_cbs_diag_external_prior_lifecycle) {
+                return;
+              }
+              std::cerr << std::setprecision(12)
+                        << "[CBS][ExternalPriorPostUpdateRetryDiag]"
+                        << " timestamp_ns=" << timestamp_kf_nsec
+                        << " curr_kf_id=" << cur_id
+                        << " source=" << prior.source_
+                        << " source_seq=" << prior.source_seq_
+                        << " locked_target_frame_id=" << matched_frame_id
+                        << " locked_target_pose_symbol=x" << matched_frame_id
+                        << " sample_visibility_diag="
+                        << (sample_visibility_diag ? 1 : 0)
+                        << " in_update_packet_new_values="
+                        << (pending_entry.in_update_packet_new_values ? 1 : 0)
+                        << " was_in_new_values_before_update="
+                        << (pending_entry.was_in_new_values_before_update ? 1 : 0)
+                        << " valueExists_in_optimizer_before_retry="
+                        << (pending_entry.value_exists_in_optimizer_before_update ? 1
+                                                                                  : 0)
+                        << " estimate_exists_before_update="
+                        << (pending_entry.estimate_exists_before_update ? 1 : 0)
+                        << " variable_index_contains_before_update="
+                        << (pending_entry.variable_index_contains_before_update ? 1
+                                                                                : 0)
+                        << " touched_by_delete_slots_before_update="
+                        << (pending_entry.touched_by_delete_slots_before_update
+                                ? 1
+                                : 0)
+                        << " touched_by_extra_remove_slots_before_update="
+                        << (pending_entry.touched_by_extra_remove_slots_before_update
+                                ? 1
+                                : 0)
+                        << " fallback_path_used="
+                        << fallback_path_used
+                        << " packet_update_stage="
+                        << packet_update_stage
+                        << " packet_call_phase_label="
+                        << packet_call_phase_label
+                        << " packet_timing_label=" << packet_timing_label
+                        << " packet_factors_name=" << packet_factors_name
+                        << " packet_values_name=" << packet_values_name
+                        << " packet_contains_xk="
+                        << (packet_contains_xk ? 1 : 0)
+                        << " packet_contains_xk_observed="
+                        << (packet_contains_xk_observed ? 1 : 0)
+                        << " packet_contains_xkm1="
+                        << (packet_contains_xkm1 ? 1 : 0)
+                        << " packet_contains_vkm1="
+                        << (packet_contains_vkm1 ? 1 : 0)
+                        << " packet_contains_bkm1="
+                        << (packet_contains_bkm1 ? 1 : 0)
+                        << " packet_factors_touching_xk_count="
+                        << packet_factors_touching_xk_count
+                        << " packet_factors_touching_xk_smart_count="
+                        << packet_factors_touching_xk_smart_count
+                        << " packet_factors_touching_xk_imu_count="
+                        << packet_factors_touching_xk_imu_count
+                        << " packet_factors_touching_xk_between_count="
+                        << packet_factors_touching_xk_between_count
+                        << " packet_factors_touching_xk_prior_count="
+                        << packet_factors_touching_xk_prior_count
+                        << " packet_factors_touching_xk_other_count="
+                        << packet_factors_touching_xk_other_count
+                        << " packet_missing_companion_keys_for_xk_count="
+                        << packet_missing_companion_keys_for_xk_count
+                        << " first_missing_companion_key_for_xk="
+                        << sanitize_retry_diag_token(
+                               first_missing_companion_key_for_xk)
+                        << " valueExists_in_optimizer_after_update="
+                        << (value_exists_in_optimizer_after_update ? 1 : 0)
+                        << " estimate_exists_after_update="
+                        << (estimate_exists_in_optimizer_after_update ? 1 : 0)
+                        << " variable_index_contains_after_update="
+                        << (variable_index_contains_after_update ? 1 : 0)
+                        << " retry_readiness_reason="
+                        << retry_readiness_reason
+                        << " retry_exception_text="
+                        << sanitize_retry_diag_token(retry_exception_text)
+                        << " unlock_rematch_applied="
+                        << (unlock_rematch_applied ? 1 : 0)
+                        << " anchored_local_cov_query_attempted="
+                        << (anchored_cov_query_attempted ? 1 : 0)
+                        << " anchored_local_cov_query_ok="
+                        << (anchored_cov_query_ok ? 1 : 0)
+                        << " anchored_local_cov_query_reason="
+                        << sanitize_retry_diag_token(anchored_cov_query_reason)
+                        << " anchored_local_cov_query_source="
+                        << sanitize_retry_diag_token(anchored_cov_query_source)
+                        << " h2_snapshot_valid_before_retry="
+                        << (h2_snapshot_valid_before_retry ? 1 : 0)
+                        << " h2_snapshot_contains_xk_before_retry="
+                        << (h2_snapshot_contains_xk_before_retry ? 1 : 0)
+                        << " live_factors_touching_xk_count="
+                        << live_factors_touching_xk_count
+                        << " live_factors_touching_xk_smart_count="
+                        << live_factors_touching_xk_smart_count
+                        << " live_factors_touching_xk_imu_count="
+                        << live_factors_touching_xk_imu_count
+                        << " live_factors_touching_xk_between_count="
+                        << live_factors_touching_xk_between_count
+                        << " live_factors_touching_xk_prior_count="
+                        << live_factors_touching_xk_prior_count
+                        << " live_factors_touching_xk_other_count="
+                        << live_factors_touching_xk_other_count
+                        << " retry_outcome=" << retry_outcome << std::endl;
+            };
+        const auto record_visibility_sample =
+            [&](const char* retry_outcome) {
+          if (!sample_visibility_diag) {
+            return;
+          }
+              post_update_visibility_samples.push_back(
+                  {prior.source_,
+                   prior.source_seq_,
+                   matched_frame_id,
+                   pending_entry.in_update_packet_new_values,
+                   pending_entry.value_exists_in_optimizer_before_update,
+                   pending_entry.estimate_exists_before_update,
+                   pending_entry.variable_index_contains_before_update,
+                   pending_entry.touched_by_delete_slots_before_update,
+                   pending_entry.touched_by_extra_remove_slots_before_update,
+                   value_exists_in_optimizer_after_update,
+                   estimate_exists_in_optimizer_after_update,
+                   variable_index_contains_after_update,
+                   std::string(retry_outcome)});
+            };
+        const auto record_h2_audit_entry = [&](const char* retry_outcome) {
+          if (!(prior.source_ == "liorf" || prior.source_ == "liosam")) {
+            return;
+          }
+          post_update_h2_audit_entries.push_back(
+              {prior.source_,
+               prior.source_seq_,
+               matched_frame_id,
+               std::string(retry_outcome),
+               retry_readiness_reason,
+               value_exists_in_optimizer_after_update,
+               estimate_exists_in_optimizer_after_update,
+               variable_index_contains_after_update,
+               h2_snapshot_valid_before_retry,
+               h2_snapshot_contains_xk_before_retry,
+               packet_contains_xk});
+        };
+
+        if (!isPoseKeyActiveInOptimizer(pose_symbol)) {
+          ++num_external_priors_dropped_marginalized;
+          ++post_update_retry_dropped;
+          emit_post_update_retry_diag("now_inactive");
+          record_visibility_sample("now_inactive");
+          record_h2_audit_entry("now_inactive");
+          continue;
+        }
+
+        if (structural_no_live_support_after_update) {
+          retry_readiness_state =
+              ReceiverLocalBeliefReadinessState::kReadyInOptimizer;
+          retry_readiness_reason = "local_cov_unqueryable_no_live_support";
+          retry_exception_text = "none";
+          retry_ready = false;
+        } else {
+          retry_ready = isReceiverLocalBeliefReadyForCbs(pose_symbol,
+                                                         &retry_readiness_state,
+                                                         &retry_readiness_reason,
+                                                         &retry_exception_text);
+        }
+        switch (retry_readiness_state) {
+          case ReceiverLocalBeliefReadinessState::kReadyInOptimizer:
+            ++num_external_priors_ready_in_optimizer_state;
+            break;
+          case ReceiverLocalBeliefReadinessState::
+              kPendingInNewValuesNotCommitted:
+            ++num_external_priors_pending_in_new_values_state;
+            break;
+          case ReceiverLocalBeliefReadinessState::
+              kMissingInOptimizerAndNewValues:
+            ++num_external_priors_missing_in_optimizer_and_new_values_state;
+            break;
+        }
+
+        if (!retry_ready) {
+          anchored_cov_query_attempted = true;
+          gtsam::Pose3 anchored_pose_dummy;
+          gtsam::Matrix66 anchored_cov_dummy = gtsam::Matrix66::Zero();
+          anchored_cov_query_ok = queryH2LocalPoseCovFromActiveSmoother(
+              pose_symbol,
+              &anchored_pose_dummy,
+              &anchored_cov_dummy,
+              &anchored_cov_query_reason,
+              &anchored_cov_query_source);
+          if (retry_readiness_reason ==
+                  "local_cov_unqueryable_no_live_support" &&
+              !prior.unlock_rematch_applied_once_) {
+            unlock_rematch_applied = true;
+            prior.unlock_rematch_applied_once_ = true;
+            prior.has_locked_matched_target_ = false;
+            prior.locked_matched_frame_id_ = -1;
+            prior.locked_matched_timestamp_ns_ = -1;
+            prior.pending_in_new_values_not_committed_ = false;
+          } else {
+            prior.pending_in_new_values_not_committed_ =
+                (retry_readiness_state ==
+                 ReceiverLocalBeliefReadinessState::
+                     kPendingInNewValuesNotCommitted);
+          }
+          prior.next_eligible_timestamp_ns_ = timestamp_kf_nsec;
+          prior.retry_backoff_ns_ = 0;
+          post_update_requeue.push_back(std::move(prior));
+          ++num_external_priors_deferred;
+          ++num_external_priors_deferred_no_local_receiver_state;
+          ++num_external_priors_deferred_matched_wait;
+          ++post_update_retry_requeued;
+          if (first_no_local_receiver_state_reason == "none") {
+            first_no_local_receiver_state_reason = retry_readiness_reason;
+          }
+          emit_post_update_retry_diag("still_pending");
+          record_visibility_sample("still_pending");
+          record_h2_audit_entry("still_pending");
+          continue;
+        }
+
+        if (num_external_priors_injected >= kMaxExternalPriorsPerOptimize) {
+          prior.pending_in_new_values_not_committed_ = false;
+          prior.next_eligible_timestamp_ns_ =
+              std::max(prior.next_eligible_timestamp_ns_,
+                       timestamp_kf_nsec + kDeferredInitialBackoffNs);
+          prior.retry_backoff_ns_ =
+              std::max(kDeferredInitialBackoffNs, prior.retry_backoff_ns_);
+          post_update_requeue.push_back(std::move(prior));
+          ++num_external_priors_deferred_budget;
+          ++num_external_priors_deferred_generic_backoff;
+          ++post_update_retry_requeued;
+          emit_post_update_retry_diag("still_pending");
+          record_visibility_sample("still_pending");
+          record_h2_audit_entry("still_pending");
+          continue;
+        }
+
+        bool accepted_by_cbs = true;
+        gtsam::Matrix66 cov = gtsam::Matrix66::Zero();
+        bool have_cov = false;
+        if (auto gaussian_model =
+                boost::dynamic_pointer_cast<gtsam::noiseModel::Gaussian>(
+                    prior.noise_model_)) {
+          cov = gaussian_model->covariance();
+          have_cov = true;
+        } else if (auto robust_model =
+                       boost::dynamic_pointer_cast<gtsam::noiseModel::Robust>(
+                           prior.noise_model_)) {
+          auto wrapped = boost::dynamic_pointer_cast<gtsam::noiseModel::Gaussian>(
+              robust_model->noise());
+          if (wrapped) {
+            cov = wrapped->covariance();
+            have_cov = true;
+          }
+        }
+
+        if (!have_cov || !cov.allFinite()) {
+          ++num_external_beliefs_dropped_bad_noise;
+          ++num_external_beliefs_cov_rejected;
+          accepted_by_cbs = false;
+        }
+
+        if (accepted_by_cbs) {
+          std::string cov_reason = "unknown";
+          const PoseCovarianceStatus cov_status =
+              sanitizePoseCovariance(&cov, &cov_reason);
+          if (cov_status == PoseCovarianceStatus::kRejected) {
+            ++num_external_beliefs_dropped_bad_noise;
+            ++num_external_beliefs_cov_rejected;
+            accepted_by_cbs = false;
+          } else if (cov_status == PoseCovarianceStatus::kRegularized) {
+            ++num_external_beliefs_cov_regularized;
+          }
+        }
+
+        cbs::AgentId sender_id = kKimeraAgentId;
+        bool known_source = true;
+        if (prior.source_ == "kimera" || prior.source_ == "self") {
+          sender_id = kKimeraAgentId;
+        } else if (prior.source_ == "liorf" || prior.source_ == "liosam") {
+          sender_id = kLiorfAgentId;
+        } else {
+          known_source = false;
+        }
+        if (accepted_by_cbs && !known_source) {
+          ++num_external_beliefs_dropped_unknown_source;
+          accepted_by_cbs = false;
+        }
+        if (accepted_by_cbs && sender_id == kKimeraAgentId) {
+          ++num_external_beliefs_dropped_self_source;
+          accepted_by_cbs = false;
+        }
+
+        gtsam::Pose3 incoming_pose = prior.W_Pose_B_;
+        if (accepted_by_cbs && FLAGS_cbs_diag_align_incoming_mean) {
+          std::lock_guard<std::mutex> lock(external_mean_alignment_mutex_);
+          const auto it = external_mean_alignment_by_source_.find(prior.source_);
+          if (it != external_mean_alignment_by_source_.end()) {
+            incoming_pose = it->second.compose(prior.W_Pose_B_);
+          }
+        }
+
+        if (accepted_by_cbs && prior.source_ == "liorf") {
+          const double configured_scale =
+              FLAGS_liorf_to_kimera_belief_factor_cov_scale;
+          if (!std::isfinite(configured_scale) || configured_scale <= 0.0) {
+            ++num_external_beliefs_dropped_bad_noise;
+            ++num_external_beliefs_cov_rejected;
+            accepted_by_cbs = false;
+          } else if (std::abs(configured_scale - 1.0) > 1e-12) {
+            cov *= configured_scale;
+            std::string scale_cov_reason = "none";
+            const PoseCovarianceStatus scaled_cov_status =
+                sanitizePoseCovariance(&cov, &scale_cov_reason);
+            if (scaled_cov_status == PoseCovarianceStatus::kRejected) {
+              ++num_external_beliefs_dropped_bad_noise;
+              ++num_external_beliefs_cov_rejected;
+              accepted_by_cbs = false;
+            } else if (scaled_cov_status ==
+                       PoseCovarianceStatus::kRegularized) {
+              ++num_external_beliefs_cov_regularized;
+            }
+          }
+        }
+
+        size_t rejected_count = 1u;
+        if (accepted_by_cbs) {
+          const gtsam::Vector6 mu =
+              gtsam::traits<gtsam::Pose3>::Logmap(incoming_pose);
+          gbp::Gaussian belief(pose_symbol, mu, cov, 1);
+          std::map<gtsam::Key, std::vector<std::pair<cbs::AgentId, gbp::Gaussian>>>
+              single_belief;
+          single_belief[pose_symbol].emplace_back(sender_id, belief);
+          ++num_external_beliefs_staged;
+          rejected_count =
+              static_cast<size_t>(cbs_optimizer_->addBeliefs(single_belief));
+          num_external_beliefs_rejected += rejected_count;
+          if (rejected_count > 0u) {
+            num_external_beliefs_rejected_keys_touched += single_belief.size();
+            size_t touched_factors = 0u;
+            for (const auto& key_beliefs : single_belief) {
+              touched_factors += key_beliefs.second.size();
+            }
+            num_external_beliefs_rejected_factors_touched += touched_factors;
+            accepted_by_cbs = false;
+          }
+        }
+
+        if (!accepted_by_cbs) {
+          ++post_update_retry_dropped;
+          emit_post_update_retry_diag("now_inactive");
+          record_visibility_sample("now_inactive");
+          continue;
+        }
+
+        prior.pending_in_new_values_not_committed_ = false;
+        ++num_external_beliefs_accepted_direct;
+        ++num_external_priors_injected;
+        ++num_external_priors_rescued_by_post_update_retry;
+        if (!prior.source_.empty()) {
+          std::lock_guard<std::mutex> backoff_lock(external_source_backoff_mutex_);
+          external_source_retry_after_ns_.erase(prior.source_);
+          external_source_retry_backoff_ns_.erase(prior.source_);
+        }
+        emit_post_update_retry_diag("rescued");
+        record_visibility_sample("rescued");
+        record_h2_audit_entry("rescued");
+      }
+    } else {
+      for (auto& pending_entry : pending_post_update_retry_priors) {
+        post_update_requeue.push_back(std::move(pending_entry.prior));
+      }
+      post_update_retry_requeued = post_update_requeue.size();
+    }
+
+    if (!post_update_requeue.empty()) {
+      std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
+      external_pose_priors_queue_.insert(
+          external_pose_priors_queue_.end(),
+          std::make_move_iterator(post_update_requeue.begin()),
+          std::make_move_iterator(post_update_requeue.end()));
+    }
+    if (FLAGS_cbs_diag_external_prior_lifecycle &&
+        !post_update_visibility_samples.empty() && cbs_optimizer_) {
+      const auto& variable_index_one_block_later =
+          cbs_optimizer_->getVariableIndex();
+      gtsam::Values estimate_one_block_later_cache;
+      bool have_estimate_one_block_later_cache = false;
+      try {
+        estimate_one_block_later_cache = cbs_optimizer_->calculateEstimate();
+        have_estimate_one_block_later_cache = true;
+      } catch (...) {
+        have_estimate_one_block_later_cache = false;
+      }
+      for (const auto& sample : post_update_visibility_samples) {
+        const gtsam::Symbol pose_symbol(kPoseSymbolChar, sample.matched_frame_id);
+        const bool value_exists_one_block_later =
+            cbs_optimizer_->valueExists(pose_symbol);
+        const bool estimate_exists_one_block_later =
+            have_estimate_one_block_later_cache &&
+            estimate_one_block_later_cache.exists(pose_symbol);
+        const bool variable_index_contains_one_block_later =
+            variable_index_one_block_later.find(pose_symbol.key()) !=
+            variable_index_one_block_later.end();
+        const bool became_visible_one_block_later =
+            !sample.value_exists_after_update && value_exists_one_block_later;
+        std::cerr
+            << std::setprecision(12)
+            << "[CBS][ExternalPriorPostUpdateVisibilityLaterDiag]"
+            << " timestamp_ns=" << timestamp_kf_nsec
+            << " curr_kf_id=" << cur_id
+            << " source=" << sample.source
+            << " source_seq=" << sample.source_seq
+            << " locked_target_frame_id=" << sample.matched_frame_id
+            << " locked_target_pose_symbol=x" << sample.matched_frame_id
+            << " in_update_packet_new_values="
+            << (sample.in_update_packet_new_values ? 1 : 0)
+            << " valueExists_in_optimizer_before_update="
+            << (sample.value_exists_before_update ? 1 : 0)
+            << " estimate_exists_before_update="
+            << (sample.estimate_exists_before_update ? 1 : 0)
+            << " variable_index_contains_before_update="
+            << (sample.variable_index_contains_before_update ? 1 : 0)
+            << " touched_by_delete_slots_before_update="
+            << (sample.touched_by_delete_slots_before_update ? 1 : 0)
+            << " touched_by_extra_remove_slots_before_update="
+            << (sample.touched_by_extra_remove_slots_before_update ? 1 : 0)
+            << " valueExists_in_optimizer_after_update="
+            << (sample.value_exists_after_update ? 1 : 0)
+            << " estimate_exists_after_update="
+            << (sample.estimate_exists_after_update ? 1 : 0)
+            << " variable_index_contains_after_update="
+            << (sample.variable_index_contains_after_update ? 1 : 0)
+            << " valueExists_one_block_later="
+            << (value_exists_one_block_later ? 1 : 0)
+            << " estimate_exists_one_block_later="
+            << (estimate_exists_one_block_later ? 1 : 0)
+            << " variable_index_contains_one_block_later="
+            << (variable_index_contains_one_block_later ? 1 : 0)
+            << " became_visible_one_block_later="
+            << (became_visible_one_block_later ? 1 : 0)
+            << " retry_outcome=" << sample.retry_outcome << std::endl;
+      }
+    }
+  }
+  if (cbs_exchange_active && cbs_heart_active &&
+      (post_update_retry_attempted > 0u ||
+       num_external_priors_rescued_by_post_update_retry > 0u)) {
+    std::cerr << std::setprecision(12)
+              << "[CBS][ExternalPriorReadinessDiag]"
+              << " timestamp_ns=" << timestamp_kf_nsec
+              << " curr_kf_id=" << cur_id
+              << " ready_in_optimizer="
+              << num_external_priors_ready_in_optimizer_state
+              << " pending_in_new_values_not_committed="
+              << num_external_priors_pending_in_new_values_state
+              << " missing_in_optimizer_and_new_values="
+              << num_external_priors_missing_in_optimizer_and_new_values_state
+              << " post_update_retry_attempted="
+              << post_update_retry_attempted
+              << " post_update_retry_requeued="
+              << post_update_retry_requeued
+              << " post_update_retry_dropped=" << post_update_retry_dropped
+              << " rescued_by_post_update_retry="
+              << num_external_priors_rescued_by_post_update_retry
+              << std::endl;
+  }
+#endif
 
   /////////////////////////// BOOKKEEPING //////////////////////////////////////
   if (is_smoother_ok) {
@@ -11384,6 +12975,38 @@ bool VioBackend::optimize(
           h2_sync_ok = refreshH2LocalCovariancePassiveSnapshot(
               h2_sidecar_packet, cur_id, &h2_stats);
         } else if (!h2_sidecar_packet_failure_reason.empty()) {
+          if (h2_sidecar_packet_failure_reason ==
+              "h2_sidecar_packet_no_resolvable_local_factors") {
+            // Non-fatal: keep last valid snapshot instead of hard-resetting
+            // sidecar state on a transient epoch where no packet-local factors
+            // are currently resolvable.
+            bool snapshot_still_valid = false;
+            {
+              std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+              snapshot_still_valid = h2_local_snapshot_valid_;
+            }
+            h2_sync_ok = snapshot_still_valid;
+            h2_stats.failure_reason = snapshot_still_valid
+                                          ? "h2_sidecar_packet_unresolvable_keep_last_snapshot"
+                                          : "h2_sidecar_packet_no_resolvable_local_factors";
+            h2_stats.first_failure_reason = h2_stats.failure_reason;
+            h2_stats.first_failure_key = "none";
+            h2_stats.filtered_external_factor_count =
+                h2_sidecar_packet.filtered_external_factor_count;
+            h2_stats.unmapped_remove_slot_count =
+                h2_sidecar_packet.unmapped_remove_slot_count;
+            h2_stats.packet_remove_count =
+                h2_sidecar_packet.sidecar_remove_factor_indices.size();
+            h2_stats.packet_mapped_heart_remove_slots_count =
+                h2_sidecar_packet.mapped_heart_remove_factor_slots.size();
+            h2_stats.packet_heart_new_factor_positions_count =
+                h2_sidecar_packet.heart_new_factor_positions.size();
+            h2_stats.packet_pose_values_count = h2_sidecar_packet.pose_values_count;
+            h2_stats.packet_vel_values_count = h2_sidecar_packet.vel_values_count;
+            h2_stats.packet_bias_values_count = h2_sidecar_packet.bias_values_count;
+            h2_stats.snapshot_refresh_ms = 0.0;
+            h2_stats.hard_reset_count = cbs_h2_sidecar_hard_reset_count_;
+          } else {
           h2_stats.failure_reason = h2_sidecar_packet_failure_reason;
           h2_stats.first_failure_reason = h2_sidecar_packet_failure_reason;
           h2_stats.first_failure_key = h2_sidecar_packet_failure_key;
@@ -11414,6 +13037,7 @@ bool VioBackend::optimize(
           }
           ++cbs_h2_sidecar_hard_reset_count_;
           h2_stats.hard_reset_count = cbs_h2_sidecar_hard_reset_count_;
+          }
         } else {
           h2_stats.failure_reason = "h2_sidecar_packet_unavailable";
           h2_stats.filtered_external_factor_count =
@@ -11467,6 +13091,122 @@ bool VioBackend::optimize(
           cbs_h2_sidecar_desync_streak_ = 0u;
         } else {
           ++cbs_h2_sidecar_desync_streak_;
+        }
+        if (FLAGS_cbs_diag_external_prior_lifecycle &&
+            !post_update_h2_audit_entries.empty()) {
+          const auto count_h2_packet_local_factors_touching_pose =
+              [&](const gtsam::Key pose_key) -> size_t {
+            size_t count = 0u;
+            for (const auto& factor_ptr : h2_sidecar_packet.local_factors) {
+              if (!factor_ptr) {
+                continue;
+              }
+              bool touches_pose_key = false;
+              for (const gtsam::Key key : factor_ptr->keys()) {
+                if (key == pose_key) {
+                  touches_pose_key = true;
+                  break;
+                }
+              }
+              if (touches_pose_key) {
+                ++count;
+              }
+            }
+            return count;
+          };
+          const auto sanitize_h2_diag_token = [](std::string token) {
+            if (token.empty()) {
+              return std::string("none");
+            }
+            for (char& c : token) {
+              if (std::isspace(static_cast<unsigned char>(c))) {
+                c = '_';
+              }
+            }
+            return token;
+          };
+          for (const auto& entry : post_update_h2_audit_entries) {
+            const gtsam::Symbol pose_symbol(kPoseSymbolChar, entry.matched_frame_id);
+            const gtsam::Key pose_key = pose_symbol.key();
+            bool h2_snapshot_valid_after_refresh = false;
+            bool h2_snapshot_contains_xk_after_refresh = false;
+            {
+              std::lock_guard<std::mutex> snapshot_lock(h2_local_snapshot_mutex_);
+              h2_snapshot_valid_after_refresh = h2_local_snapshot_valid_;
+              h2_snapshot_contains_xk_after_refresh =
+                  h2_local_values_snapshot_.exists(pose_symbol);
+            }
+            const bool retry_happened_before_refresh = true;
+            const bool h2_refresh_attempted = h2_sidecar_packet_ready;
+            const size_t packet_local_factors_touching_xk_count =
+                count_h2_packet_local_factors_touching_pose(pose_key);
+            const bool packet_local_values_contains_xk =
+                h2_sidecar_packet.local_values.exists(pose_symbol);
+            const bool retention_filter_erased_xk =
+                h2_refresh_attempted && h2_sync_ok &&
+                packet_local_values_contains_xk &&
+                packet_local_factors_touching_xk_count == 0u &&
+                !h2_snapshot_contains_xk_after_refresh;
+            std::string h2_missing_classification = "none";
+            if (!h2_refresh_attempted) {
+              h2_missing_classification = "refresh_not_run_yet_or_packet_not_ready";
+            } else if (!h2_sync_ok) {
+              h2_missing_classification = "refresh_ran_snapshot_invalid_or_failed";
+            } else if (!h2_snapshot_contains_xk_after_refresh) {
+              if (packet_local_factors_touching_xk_count == 0u) {
+                h2_missing_classification =
+                    packet_local_values_contains_xk
+                        ? "snapshot_erased_xk_during_retention_filter"
+                        : "refresh_ran_but_packet_local_factors_did_not_touch_xk";
+              } else {
+                h2_missing_classification =
+                    "refresh_ran_other_h2_absence_for_xk";
+              }
+            }
+            std::cerr << std::setprecision(12)
+                      << "[CBS][ExternalPriorH2TimingScopeDiag]"
+                      << " timestamp_ns=" << timestamp_kf_nsec
+                      << " curr_kf_id=" << cur_id
+                      << " source=" << entry.source
+                      << " source_seq=" << entry.source_seq
+                      << " locked_target_frame_id=" << entry.matched_frame_id
+                      << " locked_target_pose_symbol=x" << entry.matched_frame_id
+                      << " retry_outcome=" << entry.retry_outcome
+                      << " retry_readiness_reason="
+                      << sanitize_h2_diag_token(entry.retry_readiness_reason)
+                      << " valueExists_in_optimizer_after_update="
+                      << (entry.value_exists_after_update ? 1 : 0)
+                      << " estimate_exists_after_update="
+                      << (entry.estimate_exists_after_update ? 1 : 0)
+                      << " variable_index_contains_after_update="
+                      << (entry.variable_index_contains_after_update ? 1 : 0)
+                      << " packet_contains_xk="
+                      << (entry.packet_contains_xk ? 1 : 0)
+                      << " h2_snapshot_valid_before_retry="
+                      << (entry.h2_snapshot_valid_before_retry ? 1 : 0)
+                      << " h2_snapshot_contains_xk_before_retry="
+                      << (entry.h2_snapshot_contains_xk_before_retry ? 1 : 0)
+                      << " retry_happened_before_refresh="
+                      << (retry_happened_before_refresh ? 1 : 0)
+                      << " h2_snapshot_valid_after_refresh="
+                      << (h2_snapshot_valid_after_refresh ? 1 : 0)
+                      << " h2_snapshot_contains_xk_after_refresh="
+                      << (h2_snapshot_contains_xk_after_refresh ? 1 : 0)
+                      << " h2_refresh_attempted="
+                      << (h2_refresh_attempted ? 1 : 0)
+                      << " h2_refresh_succeeded=" << (h2_sync_ok ? 1 : 0)
+                      << " h2_refresh_failure_reason="
+                      << sanitize_h2_diag_token(h2_stats.failure_reason)
+                      << " packet_local_values_contains_xk="
+                      << (packet_local_values_contains_xk ? 1 : 0)
+                      << " packet_local_factors_touching_xk_count="
+                      << packet_local_factors_touching_xk_count
+                      << " retention_filter_erased_xk="
+                      << (retention_filter_erased_xk ? 1 : 0)
+                      << " h2_missing_classification="
+                      << sanitize_h2_diag_token(h2_missing_classification)
+                      << std::endl;
+          }
         }
         if (!h2_sync_ok && !cbs_h2_first_bad_epoch_logged_) {
           cbs_h2_first_bad_epoch_logged_ = true;
@@ -18697,10 +20437,15 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             bool invalid_slot_retry_attempted = false;
             bool invalid_slot_retry_succeeded = false;
             gtsam::ISAM2Result cbs_result;
+            // Debug-only: tracks which fallback values-carrying path (if any)
+            // was used for sampled pending priors in this epoch.
+            std::string pending_prior_fallback_path_used_this_epoch = "none";
               const auto run_update_stage_with_retry =
                 [&](const std::string& stage_label,
                     const gtsam::NonlinearFactorGraph& stage_factors,
                     const gtsam::Values& stage_values,
+                    const char* stage_factors_packet_name,
+                    const char* stage_values_packet_name,
                     const cbs::BPSAM::UpdateParams& stage_params,
                     gtsam::ISAM2Result* stage_result,
                     gtsam::FactorIndices* effective_remove_slots,
@@ -18713,6 +20458,378 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   *stage_retry_attempted = false;
                   *stage_retry_succeeded = false;
                   *effective_remove_slots = stage_params.removeFactorIndices;
+
+                  const auto classify_stage_kind =
+                      [&](const std::string& local_stage_label) {
+                        if (local_stage_label == "two_stage_update_a" ||
+                            local_stage_label ==
+                                "two_stage_update_a_skip_replay_crossing_remove") {
+                          return std::string("stage_a");
+                        }
+                        if (local_stage_label == "two_stage_update_b") {
+                          return std::string("stage_b");
+                        }
+                        if (local_stage_label == "single_packet_update") {
+                          return std::string("single_packet");
+                        }
+                        if (local_stage_label.find("stage_a_direct_local_replay") !=
+                            std::string::npos) {
+                          return std::string("wrapper");
+                        }
+                        return std::string("other");
+                      };
+                  const auto slot_list_touches_pose_key =
+                      [&](const gtsam::FactorIndices& slots,
+                          const gtsam::Key pose_key) -> bool {
+                        const auto& factors = cbs_optimizer_->getFactorsUnsafe();
+                        for (const auto slot : slots) {
+                          if (!factors.exists(slot)) {
+                            continue;
+                          }
+                          const auto factor = factors.at(slot);
+                          if (!factor) {
+                            continue;
+                          }
+                          for (const auto key : factor->keys()) {
+                            if (key == pose_key) {
+                              return true;
+                            }
+                          }
+                        }
+                        return false;
+                      };
+                  const auto count_packet_factors_touching_pose_key =
+                      [&](const gtsam::NonlinearFactorGraph& packet_factors,
+                          const gtsam::Key pose_key,
+                          size_t* touch_count,
+                          size_t* touch_smart_count,
+                          size_t* touch_imu_count,
+                          size_t* touch_between_count,
+                          size_t* touch_prior_count,
+                          size_t* touch_other_count) {
+                        CHECK_NOTNULL(touch_count);
+                        CHECK_NOTNULL(touch_smart_count);
+                        CHECK_NOTNULL(touch_imu_count);
+                        CHECK_NOTNULL(touch_between_count);
+                        CHECK_NOTNULL(touch_prior_count);
+                        CHECK_NOTNULL(touch_other_count);
+                        *touch_count = 0u;
+                        *touch_smart_count = 0u;
+                        *touch_imu_count = 0u;
+                        *touch_between_count = 0u;
+                        *touch_prior_count = 0u;
+                        *touch_other_count = 0u;
+                        for (const auto& factor_ptr : packet_factors) {
+                          if (!factor_ptr) {
+                            continue;
+                          }
+                          bool touches_pose_key = false;
+                          for (const auto key : factor_ptr->keys()) {
+                            if (key == pose_key) {
+                              touches_pose_key = true;
+                              break;
+                            }
+                          }
+                          if (!touches_pose_key) {
+                            continue;
+                          }
+                          ++(*touch_count);
+                          const std::string factor_type =
+                              classify_forensic_factor_type(factor_ptr.get());
+                          if (factor_type == "smart") {
+                            ++(*touch_smart_count);
+                          } else if (factor_type == "imu") {
+                            ++(*touch_imu_count);
+                          } else if (factor_type == "between") {
+                            ++(*touch_between_count);
+                          } else if (factor_type == "prior" ||
+                                     factor_type == "external_prior") {
+                            ++(*touch_prior_count);
+                          } else {
+                            ++(*touch_other_count);
+                          }
+                        }
+                      };
+                  const auto emit_pending_prior_update_packet_diag =
+                      [&](const std::string& call_phase_label,
+                          const char* call_timing_label,
+                          const gtsam::NonlinearFactorGraph& call_factors,
+                          const gtsam::Values& call_values,
+                          const cbs::BPSAM::UpdateParams& call_params) {
+                        if (!FLAGS_cbs_diag_external_prior_lifecycle) {
+                          return;
+                        }
+                        if (cbs_pending_prior_packet_probe_targets_.empty()) {
+                          return;
+                        }
+                        const auto& variable_index_snapshot =
+                            cbs_optimizer_->getVariableIndex();
+                        gtsam::Values estimate_snapshot;
+                        bool have_estimate_snapshot = false;
+                        try {
+                          estimate_snapshot = cbs_optimizer_->calculateEstimate();
+                          have_estimate_snapshot = true;
+                        } catch (...) {
+                          have_estimate_snapshot = false;
+                        }
+                        const std::string stage_kind =
+                            classify_stage_kind(stage_label);
+                        const bool packet_is_stage_a = stage_kind == "stage_a";
+                        const bool packet_is_stage_b = stage_kind == "stage_b";
+                        const bool packet_is_wrapper = stage_kind == "wrapper";
+                        for (auto& target :
+                             cbs_pending_prior_packet_probe_targets_) {
+                          const gtsam::Symbol pose_symbol(kPoseSymbolChar,
+                                                          target.matched_frame_id);
+                          const gtsam::Key pose_key = pose_symbol.key();
+                          const bool have_prev_state_symbol =
+                              target.matched_frame_id > 0;
+                          const gtsam::Symbol pose_prev_symbol(
+                              kPoseSymbolChar,
+                              have_prev_state_symbol
+                                  ? static_cast<FrameId>(target.matched_frame_id - 1)
+                                  : 0);
+                          const gtsam::Symbol vel_prev_symbol(
+                              kVelocitySymbolChar,
+                              have_prev_state_symbol
+                                  ? static_cast<FrameId>(target.matched_frame_id - 1)
+                                  : 0);
+                          const gtsam::Symbol bias_prev_symbol(
+                              kImuBiasSymbolChar,
+                              have_prev_state_symbol
+                                  ? static_cast<FrameId>(target.matched_frame_id - 1)
+                                  : 0);
+                          const bool packet_values_contains_xk =
+                              call_values.exists(pose_symbol);
+                          const bool packet_values_contains_xkm1 =
+                              have_prev_state_symbol &&
+                              call_values.exists(pose_prev_symbol);
+                          const bool packet_values_contains_vkm1 =
+                              have_prev_state_symbol &&
+                              call_values.exists(vel_prev_symbol);
+                          const bool packet_values_contains_bkm1 =
+                              have_prev_state_symbol &&
+                              call_values.exists(bias_prev_symbol);
+                          const bool value_exists_in_optimizer =
+                              cbs_optimizer_->valueExists(pose_symbol);
+                          const bool estimate_exists =
+                              have_estimate_snapshot &&
+                              estimate_snapshot.exists(pose_symbol);
+                          const bool variable_index_contains =
+                              variable_index_snapshot.find(pose_key) !=
+                              variable_index_snapshot.end();
+                          const bool remove_slots_touch_xk =
+                              slot_list_touches_pose_key(
+                                  call_params.removeFactorIndices, pose_key);
+                          const bool delete_slots_touch_xk =
+                              slot_list_touches_pose_key(delete_slots_forensic,
+                                                        pose_key);
+                          const bool lag_remove_slots_touch_xk =
+                              slot_list_touches_pose_key(
+                                  lag_window_state.remove_factor_indices, pose_key);
+                          size_t packet_touching_factor_count = 0u;
+                          size_t packet_touching_smart_count = 0u;
+                          size_t packet_touching_imu_count = 0u;
+                          size_t packet_touching_between_count = 0u;
+                          size_t packet_touching_prior_count = 0u;
+                          size_t packet_touching_other_count = 0u;
+                          std::unordered_set<gtsam::Key>
+                              missing_companion_keys_for_xk;
+                          std::string first_missing_companion_key_for_xk = "none";
+                          count_packet_factors_touching_pose_key(
+                              call_factors,
+                              pose_key,
+                              &packet_touching_factor_count,
+                              &packet_touching_smart_count,
+                              &packet_touching_imu_count,
+                              &packet_touching_between_count,
+                              &packet_touching_prior_count,
+                              &packet_touching_other_count);
+                          for (const auto& factor_ptr : call_factors) {
+                            if (!factor_ptr) {
+                              continue;
+                            }
+                            bool touches_pose_key = false;
+                            for (const gtsam::Key key : factor_ptr->keys()) {
+                              if (key == pose_key) {
+                                touches_pose_key = true;
+                                break;
+                              }
+                            }
+                            if (!touches_pose_key) {
+                              continue;
+                            }
+                            for (const gtsam::Key key : factor_ptr->keys()) {
+                              const bool key_in_optimizer_state =
+                                  variable_index_snapshot.find(key) !=
+                                      variable_index_snapshot.end() ||
+                                  cbs_optimizer_->valueExists(key);
+                              const bool key_in_stage_values =
+                                  call_values.exists(key);
+                              if (!key_in_optimizer_state && !key_in_stage_values) {
+                                missing_companion_keys_for_xk.insert(key);
+                                if (first_missing_companion_key_for_xk == "none") {
+                                  first_missing_companion_key_for_xk =
+                                      gtsam::DefaultKeyFormatter(key);
+                                }
+                              }
+                            }
+                          }
+                          const int xk_present_in_stage_a_packet_this_call =
+                              packet_is_stage_a
+                                  ? (packet_values_contains_xk ? 1 : 0)
+                                  : -1;
+                          const int xk_present_in_stage_b_packet_this_call =
+                              packet_is_stage_b
+                                  ? (packet_values_contains_xk ? 1 : 0)
+                                  : -1;
+                          const int xk_present_in_wrapper_packet_this_call =
+                              packet_is_wrapper
+                                  ? (packet_values_contains_xk ? 1 : 0)
+                                  : -1;
+                          if (packet_values_contains_xk) {
+                            target.packet_contains_xk = true;
+                            target.packet_update_stage = stage_label;
+                            target.packet_call_phase_label = call_phase_label;
+                            target.packet_timing_label = call_timing_label;
+                            target.packet_factors_name =
+                                stage_factors_packet_name
+                                    ? std::string(stage_factors_packet_name)
+                                    : std::string("unknown");
+                            target.packet_values_name =
+                                stage_values_packet_name
+                                    ? std::string(stage_values_packet_name)
+                                    : std::string("unknown");
+                            target.packet_factors_touching_xk_count =
+                                packet_touching_factor_count;
+                            target.packet_factors_touching_xk_smart_count =
+                                packet_touching_smart_count;
+                            target.packet_factors_touching_xk_imu_count =
+                                packet_touching_imu_count;
+                            target.packet_factors_touching_xk_between_count =
+                                packet_touching_between_count;
+                            target.packet_factors_touching_xk_prior_count =
+                                packet_touching_prior_count;
+                            target.packet_factors_touching_xk_other_count =
+                                packet_touching_other_count;
+                            target.packet_contains_xkm1 =
+                                packet_values_contains_xkm1;
+                            target.packet_contains_vkm1 =
+                                packet_values_contains_vkm1;
+                            target.packet_contains_bkm1 =
+                                packet_values_contains_bkm1;
+                            target.packet_missing_companion_keys_for_xk_count =
+                                missing_companion_keys_for_xk.size();
+                            target.first_missing_companion_key_for_xk =
+                                first_missing_companion_key_for_xk;
+                          }
+                          target.packet_contains_xk_observed = true;
+                          if (pending_prior_fallback_path_used_this_epoch !=
+                              "none") {
+                            target.fallback_path_used =
+                                pending_prior_fallback_path_used_this_epoch;
+                          }
+                          std::cerr
+                              << std::setprecision(12)
+                              << "[CBS][PendingPriorUpdatePacketDiag]"
+                              << " timestamp_ns=" << timestamp_lkf_
+                              << " curr_kf_id=" << curr_kf_id_
+                              << " source=" << target.source
+                              << " source_seq=" << target.source_seq
+                              << " prior_timestamp_ns="
+                              << target.prior_timestamp_ns
+                              << " locked_target_frame_id="
+                              << target.matched_frame_id
+                              << " locked_target_pose_symbol=x"
+                              << target.matched_frame_id
+                              << " locked_target_timestamp_ns="
+                              << target.matched_timestamp_ns
+                              << " global_new_values_exists_before_update="
+                              << (target.global_new_values_exists_before_update
+                                      ? 1
+                                      : 0)
+                              << " global_state_exists_before_update="
+                              << (target.global_state_exists_before_update ? 1
+                                                                           : 0)
+                              << " target_is_current_frame_pose="
+                              << (target.target_is_current_frame_pose ? 1 : 0)
+                              << " target_relation="
+                              << (target.target_is_current_frame_pose
+                                      ? "current_frame_pose"
+                                      : "older_locked_target")
+                              << " update_stage="
+                              << sanitize_forensic_token(stage_label)
+                              << " stage_kind="
+                              << sanitize_forensic_token(stage_kind)
+                              << " call_phase_label="
+                              << sanitize_forensic_token(call_phase_label)
+                              << " call_timing_label="
+                              << sanitize_forensic_token(call_timing_label)
+                              << " packet_factors_name="
+                              << sanitize_forensic_token(
+                                     stage_factors_packet_name
+                                         ? stage_factors_packet_name
+                                         : "unknown")
+                              << " packet_values_name="
+                              << sanitize_forensic_token(
+                                     stage_values_packet_name
+                                         ? stage_values_packet_name
+                                         : "unknown")
+                              << " packet_factor_count="
+                              << count_nonnull_factors(call_factors)
+                              << " packet_values_size=" << call_values.size()
+                              << " packet_values_contains_xk="
+                              << (packet_values_contains_xk ? 1 : 0)
+                              << " packet_values_contains_xkm1="
+                              << (packet_values_contains_xkm1 ? 1 : 0)
+                              << " packet_values_contains_vkm1="
+                              << (packet_values_contains_vkm1 ? 1 : 0)
+                              << " packet_values_contains_bkm1="
+                              << (packet_values_contains_bkm1 ? 1 : 0)
+                              << " fallback_path_used="
+                              << sanitize_forensic_token(
+                                     pending_prior_fallback_path_used_this_epoch)
+                              << " packet_is_stage_a=" << (packet_is_stage_a ? 1 : 0)
+                              << " packet_is_stage_b=" << (packet_is_stage_b ? 1 : 0)
+                              << " packet_is_wrapper=" << (packet_is_wrapper ? 1 : 0)
+                              << " xk_present_in_stage_a_packet_this_call="
+                              << xk_present_in_stage_a_packet_this_call
+                              << " xk_present_in_stage_b_packet_this_call="
+                              << xk_present_in_stage_b_packet_this_call
+                              << " xk_present_in_wrapper_packet_this_call="
+                              << xk_present_in_wrapper_packet_this_call
+                              << " packet_factors_touching_xk_count="
+                              << packet_touching_factor_count
+                              << " packet_factors_touching_xk_smart_count="
+                              << packet_touching_smart_count
+                              << " packet_factors_touching_xk_imu_count="
+                              << packet_touching_imu_count
+                              << " packet_factors_touching_xk_between_count="
+                              << packet_touching_between_count
+                              << " packet_factors_touching_xk_prior_count="
+                              << packet_touching_prior_count
+                              << " packet_factors_touching_xk_other_count="
+                              << packet_touching_other_count
+                              << " packet_missing_companion_keys_for_xk_count="
+                              << missing_companion_keys_for_xk.size()
+                              << " first_missing_companion_key_for_xk="
+                              << sanitize_forensic_token(
+                                     first_missing_companion_key_for_xk)
+                              << " removeFactorIndices_touch_xk="
+                              << (remove_slots_touch_xk ? 1 : 0)
+                              << " delete_slots_touch_xk="
+                              << (delete_slots_touch_xk ? 1 : 0)
+                              << " lag_remove_slots_touch_xk="
+                              << (lag_remove_slots_touch_xk ? 1 : 0)
+                              << " valueExists_in_optimizer_snapshot="
+                              << (value_exists_in_optimizer ? 1 : 0)
+                              << " estimate_exists_snapshot="
+                              << (estimate_exists ? 1 : 0)
+                              << " variable_index_contains_snapshot="
+                              << (variable_index_contains ? 1 : 0)
+                              << std::endl;
+                        }
+                      };
 
                   const auto format_missing_key_factor_keys =
                       [](const gtsam::NonlinearFactor::shared_ptr& factor_ptr) {
@@ -18861,17 +20978,35 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                         cbs_two_stage_current_update_stage = stage_label;
                         exception_phase_label = phase_label;
                         cbs::BPSAM::UpdateParams call_params = params;
-                        call_params.cbs_update_stage_label = stage_label;
-                        call_params.disable_live_ils_retry_for_this_update =
+                        const bool stage_label_default_disable_live_ils_retry =
                             (stage_label == "two_stage_update_a" ||
                              stage_label ==
                                  "stage_a_direct_local_replay_post_stage_b_apply" ||
                              stage_label == "stage_a_direct_local_replay_apply");
+                        call_params.cbs_update_stage_label = stage_label;
+                        call_params.cbs_update_phase_label = phase_label;
+                        call_params.cbs_curr_kf_id_for_diag =
+                            static_cast<long long>(curr_kf_id_);
+                        call_params.disable_live_ils_retry_for_this_update =
+                            call_params.disable_live_ils_retry_for_this_update ||
+                            stage_label_default_disable_live_ils_retry;
+                        emit_pending_prior_update_packet_diag(
+                            phase_label,
+                            "before_update_call",
+                            *stage_factors_for_update,
+                            stage_values,
+                            call_params);
                         const auto call_start = std::chrono::steady_clock::now();
                         gtsam::ISAM2Result update_result = cbs_optimizer_->update(
                             *stage_factors_for_update, stage_values, call_params);
                         cbs_first_update_ms +=
                             elapsedMs(call_start, std::chrono::steady_clock::now());
+                        emit_pending_prior_update_packet_diag(
+                            phase_label,
+                            "after_update_call",
+                            *stage_factors_for_update,
+                            stage_values,
+                            call_params);
                         return update_result;
                       };
 
@@ -18904,6 +21039,47 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                           retry_params,
                           "bpsam_update_call_" + stage_label +
                               "_retry_skip_invalid_remove_slots");
+                      *stage_retry_succeeded = true;
+                    } else if (has_map_at &&
+                               stage_params
+                                   .cbs_stage_b_fallback_no_ils_remove_context &&
+                               !stage_params.removeFactorIndices.empty()) {
+                      *stage_retry_attempted = true;
+                      cbs::BPSAM::UpdateParams retry_params = stage_params;
+                      const size_t wrapper_remove_count_before_retry =
+                          retry_params.removeFactorIndices.size();
+                      retry_params.removeFactorIndices.clear();
+                      // Retry this exact Stage-B fallback call without wrapper
+                      // remove indices and bypass live ILS remove generation.
+                      retry_params.disable_live_ils_retry_for_this_update = true;
+                      *effective_remove_slots = retry_params.removeFactorIndices;
+                      forensic_remove_slots_this_attempt =
+                          retry_params.removeFactorIndices;
+                      cbs_update_packet_forensics = build_update_packet_forensics(
+                          forensic_remove_slots_this_attempt);
+                      std::cerr << std::setprecision(12)
+                                << "[CBS][StageBFallbackMapAtRetryNoWrapperRemoveDiag]"
+                                << " curr_kf_id=" << curr_kf_id_
+                                << " update_stage="
+                                << sanitize_forensic_token(stage_label)
+                                << " stage_a_skip_reason="
+                                << sanitize_forensic_token(
+                                       stage_params
+                                           .cbs_stage_a_skip_reason_for_diag)
+                                << " wrapper_remove_count_before="
+                                << wrapper_remove_count_before_retry
+                                << " wrapper_remove_count_after="
+                                << retry_params.removeFactorIndices.size()
+                                << " disable_live_ils_retry_for_this_update="
+                                << (retry_params
+                                            .disable_live_ils_retry_for_this_update
+                                        ? 1
+                                        : 0)
+                                << std::endl;
+                      *stage_result = run_stage_update_call(
+                          retry_params,
+                          "bpsam_update_call_" + stage_label +
+                              "_retry_without_wrapper_remove");
                       *stage_retry_succeeded = true;
                     } else {
                       throw;
@@ -24181,6 +26357,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       "two_stage_update_a",
                       *stage_a_summary_factors_for_update_ptr,
                       stage_a_values,
+                      "stage_a_summary_factors_for_update_ptr",
+                      "stage_a_values",
                       update_a_params,
                       &update_a_result,
                       &update_a_effective_remove_slots,
@@ -24714,6 +26892,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       "two_stage_update_a_skip_replay_crossing_remove",
                       *stage_a_summary_factors_for_update_ptr,
                       stage_a_values,
+                      "stage_a_summary_factors_for_update_ptr",
+                      "stage_a_values",
                       stage_a_skip_replay_params,
                       &update_a_result,
                       &update_a_effective_remove_slots,
@@ -25086,6 +27266,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                         "stage_a_direct_local_replay_apply",
                         direct_local_apply_factors,
                         direct_local_apply_values,
+                        "direct_local_apply_factors",
+                        "direct_local_apply_values",
                         direct_local_apply_batch_params,
                         &direct_local_apply_batch_result,
                         &direct_local_apply_batch_effective_remove_slots,
@@ -25922,6 +28104,112 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               cbs_phase2_two_stage_update_b_new_factor_count =
                   count_nonnull_factors(*stage_b_factors_for_update_ptr);
 
+              bool stage_b_completed_successfully = false;
+              bool stage_b_skipped_missing_key_packet = false;
+              const bool stage_a_preflight_skip_reason_is_contract =
+                  stage_a_missing_support_preflight_skip &&
+                  (stage_a_missing_support_preflight_skip_reason ==
+                       "summary_only_without_direct_local_support_preflight" ||
+                   stage_a_missing_support_preflight_skip_reason ==
+                       "zero_support_remove_only_preflight");
+              const bool stage_a_support_only_summary_no_remove_fallback_case =
+                  stage_a_missing_support_preflight_skip &&
+                  stage_a_missing_support_preflight_skip_reason ==
+                      "stage_a_support_only_summary_no_remove_packet_preflight";
+              const bool stage_b_continued_after_stage_a_skip =
+                  !stage_a_completed_successfully &&
+                  (stage_a_preflight_skip_reason_is_contract ||
+                   stage_a_support_only_summary_no_remove_fallback_case);
+              const bool stage_b_only_fallback_for_support_only_summary_no_remove =
+                  !stage_a_completed_successfully &&
+                  stage_a_support_only_summary_no_remove_fallback_case;
+              stage_b_continued_after_stage_a_skip_for_origin_diag =
+                  stage_b_continued_after_stage_a_skip;
+              if (stage_b_continued_after_stage_a_skip) {
+                stage_b_continuation_seen_once = true;
+              }
+              const bool stage_b_allowed_to_execute =
+                  stage_a_completed_successfully ||
+                  stage_b_continued_after_stage_a_skip;
+              const size_t
+                  stage_b_wrapper_remove_count_before_fallback_suppression =
+                      update_b_params.removeFactorIndices.size();
+              const bool stage_b_wrapper_remove_suppression_context =
+                  stage_b_only_fallback_for_support_only_summary_no_remove &&
+                  enable_remove_factor_indices;
+              size_t stage_b_wrapper_remove_smart_count_before = 0u;
+              size_t stage_b_wrapper_remove_non_smart_count_before = 0u;
+              long long stage_b_wrapper_first_dropped_non_smart_slot = -1;
+              std::string stage_b_wrapper_first_dropped_non_smart_class = "none";
+              std::string stage_b_wrapper_first_dropped_non_smart_keys = "none";
+              if (stage_b_wrapper_remove_suppression_context &&
+                  !update_b_params.removeFactorIndices.empty()) {
+                gtsam::FactorIndices fallback_smart_only_remove_slots;
+                fallback_smart_only_remove_slots.reserve(
+                    update_b_params.removeFactorIndices.size());
+                for (const size_t slot : update_b_params.removeFactorIndices) {
+                  const bool slot_live = stage_b_optimizer_factors.exists(slot) &&
+                                         stage_b_optimizer_factors.at(slot);
+                  const std::string slot_class =
+                      slot_live
+                          ? classify_forensic_remove_factor_class(
+                                stage_b_optimizer_factors.at(slot))
+                          : std::string("missing_slot");
+                  if (slot_class == "smart") {
+                    ++stage_b_wrapper_remove_smart_count_before;
+                    fallback_smart_only_remove_slots.push_back(slot);
+                  } else {
+                    ++stage_b_wrapper_remove_non_smart_count_before;
+                    if (stage_b_wrapper_first_dropped_non_smart_slot < 0) {
+                      stage_b_wrapper_first_dropped_non_smart_slot =
+                          static_cast<long long>(slot);
+                      stage_b_wrapper_first_dropped_non_smart_class =
+                          sanitize_forensic_token(slot_class);
+                      stage_b_wrapper_first_dropped_non_smart_keys =
+                          sanitize_forensic_token(
+                              format_factor_keys_for_slot(stage_b_optimizer_factors,
+                                                          slot));
+                    }
+                  }
+                }
+                update_b_params.removeFactorIndices.swap(
+                    fallback_smart_only_remove_slots);
+              }
+              if (stage_b_wrapper_remove_suppression_context) {
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageBFallbackWrapperRemoveSuppressionDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " stage_a_skip_reason="
+                    << sanitize_forensic_token(
+                           stage_a_missing_support_preflight_skip_reason)
+                    << " wrapper_remove_count_before="
+                    << stage_b_wrapper_remove_count_before_fallback_suppression
+                    << " wrapper_remove_count_after="
+                    << update_b_params.removeFactorIndices.size()
+                    << " wrapper_remove_smart_count_before="
+                    << stage_b_wrapper_remove_smart_count_before
+                    << " wrapper_remove_non_smart_count_before="
+                    << stage_b_wrapper_remove_non_smart_count_before
+                    << " first_dropped_non_smart_slot="
+                    << stage_b_wrapper_first_dropped_non_smart_slot
+                    << " first_dropped_non_smart_slot_class="
+                    << sanitize_forensic_token(
+                           stage_b_wrapper_first_dropped_non_smart_class)
+                    << " first_dropped_non_smart_slot_keys="
+                    << sanitize_forensic_token(
+                           stage_b_wrapper_first_dropped_non_smart_keys)
+                    << " suppression_applied="
+                    << (stage_b_wrapper_remove_count_before_fallback_suppression !=
+                                update_b_params.removeFactorIndices.size()
+                            ? 1
+                            : 0)
+                    << " enable_remove_factor_indices="
+                    << (enable_remove_factor_indices ? 1 : 0)
+                    << " suppression_mode="
+                    << "fallback_stage_b_wrapper_remove_smart_only"
+                    << std::endl;
+              }
               const StageBPacketSnapshot stage_b_packet_snapshot =
                   build_stage_b_packet_snapshot(*stage_b_factors_for_update_ptr,
                                                 new_values,
@@ -25937,31 +28225,36 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                           stage_a_completed_successfully,
                           *stage_b_factors_for_update_ptr,
                           new_values);
-              bool stage_b_completed_successfully = false;
-              bool stage_b_skipped_missing_key_packet = false;
-              const bool stage_a_preflight_skip_reason_is_contract =
-                  stage_a_missing_support_preflight_skip &&
-                  (stage_a_missing_support_preflight_skip_reason ==
-                       "summary_only_without_direct_local_support_preflight" ||
-                   stage_a_missing_support_preflight_skip_reason ==
-                       "zero_support_remove_only_preflight");
-              const bool stage_b_continued_after_stage_a_skip =
-                  !stage_a_completed_successfully &&
-                  stage_a_preflight_skip_reason_is_contract;
-              stage_b_continued_after_stage_a_skip_for_origin_diag =
-                  stage_b_continued_after_stage_a_skip;
-              if (stage_b_continued_after_stage_a_skip) {
-                stage_b_continuation_seen_once = true;
-              }
-              const bool stage_b_allowed_to_execute =
-                  stage_a_completed_successfully ||
-                  stage_b_continued_after_stage_a_skip;
               const std::string stage_a_skip_stage_b_continuation_mode =
-                  stage_b_continued_after_stage_a_skip
+                  stage_b_only_fallback_for_support_only_summary_no_remove
+                      ? "fallback_stage_b_only_after_stage_a_support_only_summary_no_remove_preflight"
+                      : (stage_b_continued_after_stage_a_skip
                       ? "continue_stage_b_after_stage_a_preflight_skip"
                       : (stage_a_completed_successfully
                              ? "stage_a_completed_normal_two_stage"
-                             : "skip_stage_b_due_to_stage_a_not_completed_nonpreflight");
+                             : "skip_stage_b_due_to_stage_a_not_completed_nonpreflight"));
+              if (stage_b_only_fallback_for_support_only_summary_no_remove) {
+                pending_prior_fallback_path_used_this_epoch = "stage_b_only";
+                for (auto& target : cbs_pending_prior_packet_probe_targets_) {
+                  target.fallback_path_used =
+                      pending_prior_fallback_path_used_this_epoch;
+                }
+                std::cerr
+                    << std::setprecision(12)
+                    << "[CBS][StageAFallbackValuesUpdateDiag]"
+                    << " curr_kf_id=" << curr_kf_id_
+                    << " stage_a_preflight_skip_reason="
+                    << sanitize_forensic_token(
+                           stage_a_missing_support_preflight_skip_reason)
+                    << " fallback_path_used=stage_b_only"
+                    << " stage_b_new_factor_count="
+                    << stage_b_packet_snapshot.factor_count
+                    << " stage_b_new_value_count=" << new_values.size()
+                    << " stage_b_remove_count="
+                    << update_b_params.removeFactorIndices.size()
+                    << " fallback_mode=support_only_summary_no_remove_preflight_values_commit"
+                    << std::endl;
+              }
               if (stage_a_missing_support_preflight_skip) {
                 std::cerr
                     << std::setprecision(12)
@@ -26021,10 +28314,27 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 update_b_retry_attempted = false;
                 update_b_retry_succeeded = false;
               } else try {
+                cbs::BPSAM::UpdateParams stage_b_call_params = update_b_params;
+                const bool stage_b_fallback_context_for_ils_remove_guard =
+                    stage_b_only_fallback_for_support_only_summary_no_remove;
+                if (stage_b_fallback_context_for_ils_remove_guard) {
+                  stage_b_call_params
+                      .cbs_stage_b_fallback_no_ils_remove_context = true;
+                  stage_b_call_params.cbs_stage_a_skip_reason_for_diag =
+                      stage_a_missing_support_preflight_skip_reason;
+                  stage_b_call_params.cbs_curr_kf_id_for_diag =
+                      static_cast<long long>(curr_kf_id_);
+                  if (stage_b_call_params.removeFactorIndices.empty()) {
+                    stage_b_call_params.disable_live_ils_retry_for_this_update =
+                        true;
+                  }
+                }
                 run_update_stage_with_retry("two_stage_update_b",
                                             *stage_b_factors_for_update_ptr,
                                             new_values,
-                                            update_b_params,
+                                            "stage_b_factors_for_update_ptr",
+                                            "new_values",
+                                            stage_b_call_params,
                                             &update_b_result,
                                             &update_b_effective_remove_slots,
                                             &update_b_retry_attempted,
@@ -26032,12 +28342,90 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 stage_b_skipped_missing_key_packet =
                     cbs_two_stage_current_update_stage ==
                     "two_stage_update_b_skipped_missing_key_packet";
-                stage_b_completed_successfully = true;
-                stage_b_last_clean_snapshot = stage_b_packet_snapshot;
-                stage_b_last_clean_snapshot_valid = true;
-                post_stage_a_pre_stage_b_last_clean_snapshot =
-                    post_stage_a_pre_stage_b_state_snapshot;
-                post_stage_a_pre_stage_b_last_clean_snapshot_valid = true;
+                const gtsam::Symbol stage_b_target_pose_symbol(kPoseSymbolChar,
+                                                               curr_kf_id_);
+                const bool stage_b_packet_contains_target_xk =
+                    new_values.exists(stage_b_target_pose_symbol);
+                bool stage_b_target_value_exists_after_update = false;
+                bool stage_b_target_estimate_exists_after_update = false;
+                bool stage_b_target_variable_index_contains_after_update = false;
+                if (stage_b_packet_contains_target_xk) {
+                  stage_b_target_value_exists_after_update =
+                      cbs_optimizer_->valueExists(stage_b_target_pose_symbol);
+                  if (stage_b_target_value_exists_after_update) {
+                    try {
+                      (void)cbs_optimizer_->calculateEstimate<gtsam::Pose3>(
+                          stage_b_target_pose_symbol);
+                      stage_b_target_estimate_exists_after_update = true;
+                    } catch (...) {
+                      stage_b_target_estimate_exists_after_update = false;
+                    }
+                  }
+                  const auto& stage_b_variable_index_snapshot =
+                      cbs_optimizer_->getVariableIndex();
+                  stage_b_target_variable_index_contains_after_update =
+                      stage_b_variable_index_snapshot.find(
+                          stage_b_target_pose_symbol.key()) !=
+                      stage_b_variable_index_snapshot.end();
+                }
+                const bool stage_b_target_commit_visible_after_update =
+                    !stage_b_packet_contains_target_xk ||
+                    (stage_b_target_value_exists_after_update &&
+                     stage_b_target_estimate_exists_after_update);
+                const bool stage_b_contract_passed =
+                    !stage_b_skipped_missing_key_packet &&
+                    stage_b_target_commit_visible_after_update;
+                std::cerr << std::setprecision(12)
+                          << "[CBS][StageBCommitContractDiag]"
+                          << " curr_kf_id=" << curr_kf_id_
+                          << " stage_a_skip_reason="
+                          << sanitize_forensic_token(
+                                 stage_a_missing_support_preflight_skip_reason)
+                          << " stage_b_skipped_missing_key_packet="
+                          << (stage_b_skipped_missing_key_packet ? 1 : 0)
+                          << " stage_b_packet_contains_target_xk="
+                          << (stage_b_packet_contains_target_xk ? 1 : 0)
+                          << " target_xk="
+                          << sanitize_forensic_token(
+                                 gtsam::DefaultKeyFormatter(
+                                     stage_b_target_pose_symbol.key()))
+                          << " target_value_exists_after_update="
+                          << (stage_b_target_value_exists_after_update ? 1 : 0)
+                          << " target_estimate_exists_after_update="
+                          << (stage_b_target_estimate_exists_after_update ? 1 : 0)
+                          << " target_variable_index_contains_after_update="
+                          << (stage_b_target_variable_index_contains_after_update
+                                  ? 1
+                                  : 0)
+                          << " target_commit_visible_after_update="
+                          << (stage_b_target_commit_visible_after_update ? 1 : 0)
+                          << " stage_b_contract_passed="
+                          << (stage_b_contract_passed ? 1 : 0)
+                          << std::endl;
+                if (stage_b_contract_passed) {
+                  stage_b_completed_successfully = true;
+                  stage_b_last_clean_snapshot = stage_b_packet_snapshot;
+                  stage_b_last_clean_snapshot_valid = true;
+                  post_stage_a_pre_stage_b_last_clean_snapshot =
+                      post_stage_a_pre_stage_b_state_snapshot;
+                  post_stage_a_pre_stage_b_last_clean_snapshot_valid = true;
+                } else {
+                  stage_b_completed_successfully = false;
+                  cbs_phase2_stage_b_epoch_skipped_due_to_initial_failure = true;
+                  cbs_phase2_stage_b_skipped_kf =
+                      static_cast<long long>(curr_kf_id_);
+                  if (stage_b_skipped_missing_key_packet) {
+                    cbs_phase2_stage_b_skip_reason =
+                        "stage_b_packet_skipped_missing_key_preflight";
+                  } else if (stage_b_packet_contains_target_xk) {
+                    cbs_phase2_stage_b_skip_reason =
+                        "stage_b_noncommit_target_xk_not_visible_after_update";
+                  } else {
+                    cbs_phase2_stage_b_skip_reason =
+                        "stage_b_contract_not_satisfied";
+                  }
+                  update_b_effective_remove_slots.clear();
+                }
               } catch (const std::exception& stage_b_error) {
                 const std::string stage_b_error_message =
                     stage_b_error.what() ? std::string(stage_b_error.what())
@@ -26855,6 +29243,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                         "stage_a_direct_local_replay_post_stage_b_apply",
                         direct_local_apply_empty_factors,
                         direct_local_apply_empty_values,
+                        "direct_local_apply_empty_factors",
+                        "direct_local_apply_empty_values",
                         direct_local_apply_params,
                         &direct_local_apply_result,
                         &direct_local_effective_remove_slots,
@@ -27352,6 +29742,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 run_update_stage_with_retry("single_packet_update",
                                             cbs_update_factors,
                                             new_values,
+                                            "cbs_update_factors",
+                                            "new_values",
                                             cbs_first_update_params,
                                             &cbs_result,
                                             &single_effective_remove_slots,

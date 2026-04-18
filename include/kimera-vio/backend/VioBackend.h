@@ -434,10 +434,19 @@ class VioBackend {
   // heart (CBS-heart or legacy fixed-lag).
   bool isPoseKeyActiveInOptimizer(const gtsam::Symbol& pose_symbol) const;
 
+  enum class ReceiverLocalBeliefReadinessState {
+    kReadyInOptimizer = 0,
+    kPendingInNewValuesNotCommitted = 1,
+    kMissingInOptimizerAndNewValues = 2,
+  };
+
   // Returns true only when CBS receiver-local state is queryable for normal
   // belief merge (key exists and LOCAL marginal covariance is available).
   bool isReceiverLocalBeliefReadyForCbs(
-      const gtsam::Symbol& pose_symbol) const;
+      const gtsam::Symbol& pose_symbol,
+      ReceiverLocalBeliefReadinessState* readiness_state = nullptr,
+      std::string* failure_reason = nullptr,
+      std::string* failure_exception_text = nullptr) const;
 
   // Prune timestamp->frame map so only active-key targets remain.
   void pruneTimestampToKeyframeMap(const bool cbs_heart_active,
@@ -969,6 +978,12 @@ class VioBackend {
   // stores timestamped priors until optimize() consumes them; queue cap prevents unbounded growth.
   struct ExternalPosePrior {
   Timestamp timestamp_kf_nsec_ = -1;
+  // Wall-clock receive timestamp at enqueue time (system_clock ns since epoch).
+  int64_t receive_wall_timestamp_ns_ = -1;
+  // First backend epoch timestamp that touched this prior in queue processing.
+  Timestamp first_seen_epoch_timestamp_ns_ = -1;
+  // Number of queue-processing attempts seen by this prior.
+  uint32_t lifecycle_attempt_count_ = 0;
   gtsam::Pose3 W_Pose_B_ = gtsam::Pose3();
   gtsam::SharedNoiseModel noise_model_;
   std::string source_ = "unknown";
@@ -976,13 +991,65 @@ class VioBackend {
   // Earliest backend timestamp when this prior should be reprocessed.
   // Used to avoid expensive rework of deferred candidates every epoch.
   Timestamp next_eligible_timestamp_ns_ = std::numeric_limits<Timestamp>::lowest();
-  // Exponential backoff state for deferred priors.
+  // Exponential backoff state for generic deferred priors (unmatched/future).
+  // NOTE: priors that already have a locked matched target should not use this
+  // in fixed-lag mode; they are retried every epoch until that target frame
+  // becomes inactive.
   Timestamp retry_backoff_ns_ = 0;
+  // When a prior has already been matched once, keep that target frame so
+  // later retries only re-check receiver-local readiness instead of rematching.
+  bool has_locked_matched_target_ = false;
+  FrameId locked_matched_frame_id_ = -1;
+  Timestamp locked_matched_timestamp_ns_ = -1;
+  // Marks priors that were blocked only because receiver x_k was still pending
+  // in new_values_ during the previous epoch.
+  bool pending_in_new_values_not_committed_ = false;
+  // One-shot guard for post-update structural no-support unlock/rematch.
+  bool unlock_rematch_applied_once_ = false;
   };
 
   mutable std::mutex external_pose_priors_queue_mutex_;
   std::deque<ExternalPosePrior> external_pose_priors_queue_;
   size_t max_external_pose_priors_queue_size_ = 1000;
+  // Debug-only: tracks LIORF source_seq values already sampled for deep
+  // state-visibility instrumentation in the matched-wait receive path.
+  std::unordered_set<size_t>
+      cbs_external_prior_visibility_sampled_source_seqs_;
+  struct CbsPendingPriorPacketProbeTarget {
+    std::string source = "unknown";
+    uint64_t source_seq = 0;
+    Timestamp prior_timestamp_ns = -1;
+    Timestamp matched_timestamp_ns = -1;
+    FrameId matched_frame_id = -1;
+    bool global_new_values_exists_before_update = false;
+    bool global_state_exists_before_update = false;
+    FrameId curr_kf_id_before_update = -1;
+    bool target_is_current_frame_pose = false;
+    // Debug-only packetization outcome for sampled stuck priors.
+    std::string fallback_path_used = "none";
+    std::string packet_update_stage = "none";
+    std::string packet_call_phase_label = "none";
+    std::string packet_timing_label = "none";
+    std::string packet_factors_name = "none";
+    std::string packet_values_name = "none";
+    bool packet_contains_xk = false;
+    bool packet_contains_xk_observed = false;
+    size_t packet_factors_touching_xk_count = 0u;
+    size_t packet_factors_touching_xk_smart_count = 0u;
+    size_t packet_factors_touching_xk_imu_count = 0u;
+    size_t packet_factors_touching_xk_between_count = 0u;
+    size_t packet_factors_touching_xk_prior_count = 0u;
+    size_t packet_factors_touching_xk_other_count = 0u;
+    bool packet_contains_xkm1 = false;
+    bool packet_contains_vkm1 = false;
+    bool packet_contains_bkm1 = false;
+    size_t packet_missing_companion_keys_for_xk_count = 0u;
+    std::string first_missing_companion_key_for_xk = "none";
+  };
+  // Debug-only per-epoch sampled targets used to trace exact update packet
+  // visibility for stuck LIORF->Kimera matched priors.
+  std::vector<CbsPendingPriorPacketProbeTarget>
+      cbs_pending_prior_packet_probe_targets_;
 
   // Diagnostic-only per-source receiver_world<-sender_world mean alignment
   // used before CBS addBeliefs().
