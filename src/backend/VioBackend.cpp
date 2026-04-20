@@ -141,6 +141,10 @@ DEFINE_bool(cbs_diag_external_prior_lifecycle,
             false,
             "If true, emit per-prior lifecycle diagnostics while processing "
             "the external prior queue.");
+DEFINE_bool(cbs_diag_emit_heart_epoch_diag,
+            true,
+            "If true, emit the full [CBS][HeartEpochDiag] forensic line each "
+            "epoch. Disable to reduce CBS-heart logging overhead.");
 DEFINE_bool(external_pose_belief_safe_covariance_fallback,
             false,
             "If true, publish external pose beliefs with a safe covariance "
@@ -509,7 +513,7 @@ DEFINE_int32(cbs_smart_replace_material_pose_key_delta,
              "pose-key supports required to treat pose-key-set change as "
              "material.");
 DEFINE_int32(cbs_smart_replace_noncritical_budget_per_epoch,
-             32,
+             8,
              "Maximum number of non-critical smart-factor replacements per "
              "epoch in CBS-heart mode. Set to <=0 to disable budgeting.");
 DEFINE_bool(
@@ -519,7 +523,7 @@ DEFINE_bool(
     "old and new factors are degenerate and there is no correctness upgrade.");
 DEFINE_bool(
     cbs_smart_replace_prevent_valid_to_invalid_downgrade,
-    false,
+    true,
     "If true in CBS-heart mode, keep an existing valid smart factor instead "
     "of replacing it with an invalid candidate factor.");
 DEFINE_int64(cbs_deferred_prior_initial_backoff_ns,
@@ -2531,7 +2535,10 @@ bool VioBackend::getLatestExternalPoseBelief(
     cbs_last_epoch_priors_injected = cbs_last_epoch_priors_injected_;
   }
 
-  if (useCbsH2LocalCovSidecar() && !covariance_set) {
+  const auto try_h2_local_cov_sidecar_outgoing = [&]() {
+    if (!useCbsH2LocalCovSidecar() || covariance_set) {
+      return;
+    }
     gtsam::Pose3 local_pose = belief->W_Pose_B_;
     gtsam::Matrix66 local_cov = gtsam::Matrix66::Identity();
     std::string local_reason;
@@ -2622,10 +2629,15 @@ bool VioBackend::getLatestExternalPoseBelief(
         }
       }
     }
+  };
+
+  // Non-CBS-heart paths keep the existing H2 local-sidecar-only behavior.
+  if (!useCbsOptimizerHeart() && useCbsH2LocalCovSidecar() && !covariance_set) {
+    try_h2_local_cov_sidecar_outgoing();
   }
 
   // In CBS mode, export covariance from BPSAM marginals so shared beliefs reflect the CBS state.
-  if (useCbsOptimizerHeart() && !useCbsH2LocalCovSidecar()) {
+  if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     gtsam::Symbol cov_query_pose_symbol = pose_symbol;
     bool cov_query_pose_symbol_fell_back = false;
@@ -2651,12 +2663,135 @@ bool VioBackend::getLatestExternalPoseBelief(
         cov_query_pose_symbol_fell_back =
             (cov_query_pose_symbol.index() != pose_symbol.index());
         if (cov_query_pose_symbol_fell_back) {
-          h2_cov_fallback_used = useCbsH2LocalCovSidecar();
           std::ostringstream reason_stream;
-          reason_stream << "h2_sidecar_missing_curr_key_use_latest_pose_key:x"
+          reason_stream << "cbs_local_missing_curr_key_use_latest_pose_key:x"
                         << cov_query_pose_symbol.index();
           h2_cov_fallback_reason = reason_stream.str();
         }
+      }
+    }
+
+    // Keep outgoing covariance semantics aligned with receive-side local-before
+    // path by using the same BPSAM anchored-local operator first.
+    if (!covariance_set && cbs_optimizer_->valueExists(cov_query_pose_symbol)) {
+      const auto sanitize_anchor_var = [](double requested, double fallback) {
+        return (std::isfinite(requested) && requested > 0.0) ? requested
+                                                             : fallback;
+      };
+      const double anchor_rot_var =
+          sanitize_anchor_var(FLAGS_cbs_h2_local_cov_anchor_rot_var, 1e-2);
+      const double anchor_trans_var =
+          sanitize_anchor_var(FLAGS_cbs_h2_local_cov_anchor_trans_var, 1e-1);
+      const auto try_cbs_anchored_local_cov =
+          [&](const gtsam::Symbol& query_symbol,
+              gtsam::Matrix66* pose_cov_out) -> bool {
+        CHECK_NOTNULL(pose_cov_out);
+        if (!cbs_optimizer_->valueExists(query_symbol)) {
+          return false;
+        }
+        const gtsam::Values all_values = cbs_optimizer_->calculateEstimate();
+        const gtsam::Key query_key = query_symbol.key();
+        if (!all_values.exists(query_key)) {
+          return false;
+        }
+
+        const auto factors_full = cbs_optimizer_->getFactorsUnsafe();
+        gtsam::NonlinearFactorGraph local_factors;
+        local_factors.reserve(factors_full.size());
+        std::unordered_set<gtsam::Key> local_graph_keys;
+        for (const auto& factor : factors_full) {
+          if (!factor) {
+            continue;
+          }
+          const auto& fkeys = factor->keys();
+          const bool remove_from_local =
+              (fkeys.size() == 2u) &&
+              (cbs::isPoseBeliefFactor(cbs_optimizer_->id(), factor) ||
+               cbs::isAnchorBeliefFactor(factor));
+          if (remove_from_local) {
+            continue;
+          }
+          local_factors.push_back(factor);
+          for (const auto fk : fkeys) {
+            local_graph_keys.insert(fk);
+          }
+        }
+
+        gtsam::Values local_values;
+        for (const auto fk : local_graph_keys) {
+          if (all_values.exists(fk)) {
+            local_values.insert_or_assign(fk, all_values.at(fk));
+          }
+        }
+        if (all_values.exists(query_key) && !local_values.exists(query_key)) {
+          local_values.insert_or_assign(query_key, all_values.at(query_key));
+        }
+        if (!local_values.exists(query_key)) {
+          return false;
+        }
+
+        gtsam::NonlinearFactorGraph anchored_local_factors = local_factors;
+        gtsam::Vector6 anchor_var;
+        anchor_var << anchor_rot_var, anchor_rot_var, anchor_rot_var,
+            anchor_trans_var, anchor_trans_var, anchor_trans_var;
+        const auto anchor_noise =
+            gtsam::noiseModel::Diagonal::Variances(anchor_var);
+        const gtsam::Pose3 anchor_pose = local_values.at<gtsam::Pose3>(query_key);
+        anchored_local_factors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+            query_key, anchor_pose, anchor_noise);
+
+        const gtsam::Marginals anchored_marginals(anchored_local_factors,
+                                                  local_values);
+        const gtsam::Matrix anchored_cov =
+            anchored_marginals.marginalCovariance(query_key);
+        if (anchored_cov.rows() < 6 || anchored_cov.cols() < 6 ||
+            !anchored_cov.allFinite()) {
+          return false;
+        }
+        *pose_cov_out = anchored_cov.topLeftCorner<6, 6>();
+        return pose_cov_out->allFinite();
+      };
+      try {
+        gtsam::Matrix66 anchored_pose_cov = gtsam::Matrix66::Identity();
+        const auto cov_query_start = std::chrono::steady_clock::now();
+        if (try_cbs_anchored_local_cov(cov_query_pose_symbol,
+                                       &anchored_pose_cov)) {
+          belief->covariance_ = anchored_pose_cov;
+          covariance_set = true;
+          if (cov_query_pose_symbol_fell_back) {
+            outgoing_cov_source =
+                "cbs_local_anchored_pose_prior_latest_pose_fallback";
+          } else {
+            outgoing_cov_source = "cbs_local_anchored_pose_prior";
+          }
+          outgoing_cov_query_ms +=
+              elapsedMs(cov_query_start, std::chrono::steady_clock::now());
+          const auto emit_diag_start = std::chrono::steady_clock::now();
+          emit_outgoing_cov_diag(belief->covariance_,
+                                 std::nullopt,
+                                 "cbs_local_anchored_pose_prior");
+          outgoing_diag_emit_ms +=
+              elapsedMs(emit_diag_start, std::chrono::steady_clock::now());
+        } else {
+          outgoing_cov_query_ms +=
+              elapsedMs(cov_query_start, std::chrono::steady_clock::now());
+        }
+      } catch (const std::exception& e) {
+        VLOG(2) << "CBS anchored local covariance query failed: " << e.what();
+      }
+    }
+
+    // Secondary path: H2 local sidecar (anchored-local snapshot) if BPSAM
+    // anchored-local query is unavailable.
+    if (useCbsH2LocalCovSidecar() && !covariance_set) {
+      try_h2_local_cov_sidecar_outgoing();
+      if (covariance_set && outgoing_cov_source == "h2_sidecar_local_only") {
+        outgoing_cov_source = "h2_sidecar_local_only_after_bpsam_anchored_local_failure";
+      } else if (covariance_set &&
+                 outgoing_cov_source ==
+                     "h2_sidecar_local_only_latest_pose_fallback") {
+        outgoing_cov_source =
+            "h2_sidecar_local_only_latest_pose_fallback_after_bpsam_anchored_local_failure";
       }
     }
 
@@ -2742,6 +2877,25 @@ bool VioBackend::getLatestExternalPoseBelief(
         }
       } catch (const std::exception& e) {
         VLOG(2) << "CBS marginal covariance query failed: " << e.what();
+      }
+    }
+
+    // If anchored-local primary path and CBS LOCAL are both unavailable, retry
+    // local-sidecar query once as a final fallback before generic covariance
+    // fallback below.
+    if (useCbsH2LocalCovSidecar() && !covariance_set) {
+      h2_cov_fallback_used = true;
+      if (h2_cov_fallback_reason == "none") {
+        h2_cov_fallback_reason = "cbs_local_covariance_unavailable_before_h2_fallback";
+      }
+      try_h2_local_cov_sidecar_outgoing();
+      if (covariance_set && outgoing_cov_source == "h2_sidecar_local_only") {
+        outgoing_cov_source = "h2_sidecar_local_only_after_cbs_local_failure";
+      } else if (covariance_set &&
+                 outgoing_cov_source ==
+                     "h2_sidecar_local_only_latest_pose_fallback") {
+        outgoing_cov_source =
+            "h2_sidecar_local_only_latest_pose_fallback_after_cbs_local_failure";
       }
     }
   }
@@ -30549,9 +30703,10 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << sanitize_forensic_token(two_stage_non_activation_reason_diag)
                       << " activation_mode=two_stage_regime_selection_audit"
                       << std::endl;
-	            std::cerr
-	                << std::setprecision(12)
-	                << "[CBS][HeartEpochDiag] curr_kf_id=" << curr_kf_id_
+	            if (FLAGS_cbs_diag_emit_heart_epoch_diag) {
+	              std::cerr
+	                  << std::setprecision(12)
+	                  << "[CBS][HeartEpochDiag] curr_kf_id=" << curr_kf_id_
                 << " remove_factor_indices_applied="
                 << removed_factor_indices_applied
                 << " remove_factor_indices_requested="
@@ -31337,8 +31492,9 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << " cbs_heart_active=" << (useCbsOptimizerHeart() ? 1 : 0)
                 << " use_cbs_optimizer=" << (FLAGS_use_cbs_optimizer ? 1 : 0)
                 << " cbs_replace_fixed_lag_optimizer="
-                << (FLAGS_cbs_replace_fixed_lag_optimizer ? 1 : 0)
-                << std::endl;
+	                  << (FLAGS_cbs_replace_fixed_lag_optimizer ? 1 : 0)
+	                  << std::endl;
+	            }
             if (cbs_phase2_lag_remove_slots_requested_raw > 0u ||
                 cbs_phase2_lag_requested_slot_count > 0u ||
                 cbs_phase2_summary_required_crossing_slots > 0u ||
