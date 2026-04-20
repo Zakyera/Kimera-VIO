@@ -132,6 +132,12 @@ class Pipeline {
         query_timestamp_kf_nsec, belief, tolerance_ns);
   }
 
+  inline bool getExternalPriorReceiverWatermark(
+      VioBackend::ExternalPriorReceiverWatermark* watermark) const {
+    CHECK(vio_backend_module_);
+    return vio_backend_module_->getExternalPriorReceiverWatermark(watermark);
+  }
+
   inline LcdModule* getLcdModule() const { return lcd_module_.get(); }
 
  public:

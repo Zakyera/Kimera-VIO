@@ -121,6 +121,14 @@ DEFINE_int64(external_prior_max_future_lead_ns,
 DEFINE_int32(external_prior_max_queue_size,
              1000,
              "Maximum number of staged external pose priors kept in memory.");
+DEFINE_bool(external_prior_future_reservoir_enabled,
+            true,
+            "If true, deferred priors with future eligibility are stored in a "
+            "time-ordered reservoir and only promoted when due.");
+DEFINE_int32(external_prior_max_future_reservoir_size,
+             5000,
+             "Maximum number of deferred future priors kept in the receiver "
+             "reservoir.");
 DEFINE_int64(external_prior_queue_time_horizon_ns,
              60000000000LL,  // 60s
              "Keep at most this trailing time window (ns) of staged external "
@@ -500,6 +508,20 @@ DEFINE_int32(cbs_smart_replace_material_pose_key_delta,
              "Minimum symmetric-difference cardinality between old/new smart "
              "pose-key supports required to treat pose-key-set change as "
              "material.");
+DEFINE_int32(cbs_smart_replace_noncritical_budget_per_epoch,
+             32,
+             "Maximum number of non-critical smart-factor replacements per "
+             "epoch in CBS-heart mode. Set to <=0 to disable budgeting.");
+DEFINE_bool(
+    cbs_smart_replace_skip_nonimproving_degenerate_replacements,
+    true,
+    "If true in CBS-heart mode, skip smart-factor replacement churn when both "
+    "old and new factors are degenerate and there is no correctness upgrade.");
+DEFINE_bool(
+    cbs_smart_replace_prevent_valid_to_invalid_downgrade,
+    false,
+    "If true in CBS-heart mode, keep an existing valid smart factor instead "
+    "of replacing it with an invalid candidate factor.");
 DEFINE_int64(cbs_deferred_prior_initial_backoff_ns,
              200000000,  // 200ms
              "Initial defer backoff (ns) for unmatched/no-local/budgeted "
@@ -980,6 +1002,19 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   }
   LOG(INFO) << "External prior max queue size [count]: "
             << max_external_pose_priors_queue_size_;
+  if (FLAGS_external_prior_max_future_reservoir_size > 0) {
+    max_external_pose_priors_future_reservoir_size_ =
+        static_cast<size_t>(FLAGS_external_prior_max_future_reservoir_size);
+  } else {
+    LOG(WARNING) << "Invalid --external_prior_max_future_reservoir_size="
+                 << FLAGS_external_prior_max_future_reservoir_size
+                 << ", falling back to 5000.";
+    max_external_pose_priors_future_reservoir_size_ = 5000;
+  }
+  LOG(INFO) << "External prior future reservoir: enabled="
+            << (FLAGS_external_prior_future_reservoir_enabled ? "true" : "false")
+            << ", max_size="
+            << max_external_pose_priors_future_reservoir_size_;
   LOG(INFO) << "External prior queue time horizon [ns]: "
             << FLAGS_external_prior_queue_time_horizon_ns;
   LOG(INFO) << "External prior max per optimize [count]: "
@@ -1357,6 +1392,14 @@ bool VioBackend::initStateAndSetPriors(
   {
     std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
     external_pose_priors_queue_.clear();
+    external_pose_priors_future_reservoir_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> watermark_lock(
+        external_prior_receiver_watermark_mutex_);
+    external_prior_receiver_last_optimize_timestamp_ns_ = -1;
+    external_prior_receiver_oldest_active_pose_timestamp_ns_ = -1;
+    external_prior_receiver_newest_active_pose_timestamp_ns_ = -1;
   }
   {
     std::lock_guard<std::mutex> map_lock(timestamp_to_kf_id_map_mutex_);
@@ -1709,10 +1752,24 @@ bool VioBackend::addLandmarkToGraph(const LandmarkId& lmk_id,
 
   // Add observations to smart factor
   size_t num_active_observations = 0u;
+#ifdef KIMERA_USE_CBS
+  const bool cbs_limit_smart_support_to_lag_window = useCbsOptimizerHeart();
+  const FrameId cbs_oldest_active_frame_for_smart_support =
+      cbs_limit_smart_support_to_lag_window
+          ? computeCbsOldestActiveFrame(static_cast<FrameId>(curr_kf_id_))
+          : 0u;
+#else
+  const bool cbs_limit_smart_support_to_lag_window = false;
+  const FrameId cbs_oldest_active_frame_for_smart_support = 0u;
+#endif
   if (VLOG_IS_ON(10)) new_factor->print();
   std::stringstream ss;
   for (const std::pair<FrameId, StereoPoint2>& obs : ft.obs_) {
     const FrameId& frame_id = obs.first;
+    if (cbs_limit_smart_support_to_lag_window &&
+        frame_id < cbs_oldest_active_frame_for_smart_support) {
+      continue;
+    }
     const gtsam::Symbol& pose_symbol = gtsam::Symbol(kPoseSymbolChar, frame_id);
     bool pose_key_is_active = false;
 #ifdef KIMERA_USE_CBS
@@ -1796,7 +1853,21 @@ void VioBackend::updateLandmarkInGraph(
       smart_noise_, smart_factors_params_, B_Pose_leftCamRect_));
 
   size_t num_active_observations = 0u;
+#ifdef KIMERA_USE_CBS
+  const bool cbs_limit_smart_support_to_lag_window = useCbsOptimizerHeart();
+  const FrameId cbs_oldest_active_frame_for_smart_support =
+      cbs_limit_smart_support_to_lag_window
+          ? computeCbsOldestActiveFrame(static_cast<FrameId>(curr_kf_id_))
+          : 0u;
+#else
+  const bool cbs_limit_smart_support_to_lag_window = false;
+  const FrameId cbs_oldest_active_frame_for_smart_support = 0u;
+#endif
   for (const std::pair<FrameId, StereoPoint2>& obs : ft_it->second.obs_) {
+    if (cbs_limit_smart_support_to_lag_window &&
+        obs.first < cbs_oldest_active_frame_for_smart_support) {
+      continue;
+    }
     const gtsam::Symbol pose_symbol(kPoseSymbolChar, obs.first);
     if (!isPoseKeyActiveInOptimizer(pose_symbol)) {
       continue;
@@ -2966,6 +3037,62 @@ bool VioBackend::getExternalPoseBeliefAtTimestamp(
   return false;
 }
 
+bool VioBackend::getExternalPriorReceiverWatermark(
+    ExternalPriorReceiverWatermark* watermark) const {
+  CHECK_NOTNULL(watermark);
+
+  Timestamp emitted_at_backend_timestamp_ns = -1;
+  Timestamp oldest_active_pose_timestamp_ns = -1;
+  Timestamp newest_active_pose_timestamp_ns = -1;
+  {
+    std::lock_guard<std::mutex> lock(external_prior_receiver_watermark_mutex_);
+    emitted_at_backend_timestamp_ns =
+        external_prior_receiver_last_optimize_timestamp_ns_;
+    oldest_active_pose_timestamp_ns =
+        external_prior_receiver_oldest_active_pose_timestamp_ns_;
+    newest_active_pose_timestamp_ns =
+        external_prior_receiver_newest_active_pose_timestamp_ns_;
+  }
+
+  size_t ready_queue_size = 0u;
+  size_t future_reservoir_size = 0u;
+  {
+    std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
+    ready_queue_size = external_pose_priors_queue_.size();
+    future_reservoir_size = external_pose_priors_future_reservoir_.size();
+  }
+
+  const Timestamp recommended_sender_max_future_lead_ns =
+      FLAGS_external_prior_max_future_lead_ns >= 0
+          ? static_cast<Timestamp>(FLAGS_external_prior_max_future_lead_ns)
+          : static_cast<Timestamp>(0);
+  const Timestamp recommended_sender_max_timestamp_ns =
+      newest_active_pose_timestamp_ns > 0
+          ? newest_active_pose_timestamp_ns +
+                recommended_sender_max_future_lead_ns
+          : -1;
+  const Timestamp recommended_sender_min_timestamp_ns =
+      oldest_active_pose_timestamp_ns > 0
+          ? std::max<Timestamp>(
+                0, oldest_active_pose_timestamp_ns -
+                       external_prior_timestamp_tolerance_ns_)
+          : -1;
+
+  watermark->emitted_at_backend_timestamp_ns_ = emitted_at_backend_timestamp_ns;
+  watermark->oldest_active_pose_timestamp_ns_ = oldest_active_pose_timestamp_ns;
+  watermark->newest_active_pose_timestamp_ns_ = newest_active_pose_timestamp_ns;
+  watermark->recommended_sender_min_timestamp_ns_ =
+      recommended_sender_min_timestamp_ns;
+  watermark->recommended_sender_max_timestamp_ns_ =
+      recommended_sender_max_timestamp_ns;
+  watermark->recommended_sender_max_future_lead_ns_ =
+      recommended_sender_max_future_lead_ns;
+  watermark->ready_queue_size_ = ready_queue_size;
+  watermark->future_reservoir_size_ = future_reservoir_size;
+  watermark->total_buffered_priors_ = ready_queue_size + future_reservoir_size;
+  return emitted_at_backend_timestamp_ns > 0;
+}
+
 
 
 /* -------------------------------------------------------------------------- */
@@ -3423,8 +3550,14 @@ bool VioBackend::isPoseKeyActiveInOptimizer(
 #ifdef KIMERA_USE_CBS
   if (useCbsOptimizerHeart()) {
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
-    return cbs_optimizer_->valueExists(pose_symbol) ||
-           new_values_.exists(pose_symbol);
+    // In CBS mode, `valueExists` alone is too permissive for fixed-lag logic:
+    // stale keys can remain in Values after structural removal. Use active
+    // variable-index membership as the primary activity signal.
+    if (new_values_.exists(pose_symbol)) {
+      return true;
+    }
+    const auto& variable_index = cbs_optimizer_->getVariableIndex();
+    return variable_index.find(pose_symbol) != variable_index.end();
   }
 #endif
   return state_.exists(pose_symbol) || new_values_.exists(pose_symbol);
@@ -9553,6 +9686,8 @@ bool VioBackend::optimize(
   size_t num_external_priors_fast_skipped = 0;
   size_t num_external_priors_source_backoff_skipped = 0;
   size_t num_external_priors_considered = 0;
+  size_t num_external_priors_promoted_from_future_reservoir = 0;
+  size_t num_external_priors_deferred_to_future_reservoir = 0;
   std::string first_no_local_receiver_state_reason = "none";
 
   struct PendingPostUpdateRetryPrior {
@@ -9766,6 +9901,15 @@ bool VioBackend::optimize(
   cbs_timestamp_map_pruned_count_last_epoch_ = num_timestamp_map_pruned;
   cbs_oldest_active_pose_timestamp_last_epoch_ = oldest_active_pose_timestamp;
   cbs_newest_active_pose_timestamp_last_epoch_ = newest_active_pose_timestamp;
+  {
+    std::lock_guard<std::mutex> watermark_lock(
+        external_prior_receiver_watermark_mutex_);
+    external_prior_receiver_last_optimize_timestamp_ns_ = timestamp_kf_nsec;
+    external_prior_receiver_oldest_active_pose_timestamp_ns_ =
+        oldest_active_pose_timestamp;
+    external_prior_receiver_newest_active_pose_timestamp_ns_ =
+        newest_active_pose_timestamp;
+  }
   if (num_timestamp_map_pruned > 0) {
     VLOG(2) << "Pruned " << num_timestamp_map_pruned
             << " marginalized timestamp->key entries. oldest_active_ts[nsec]="
@@ -9774,11 +9918,43 @@ bool VioBackend::optimize(
 
   {
     std::deque<ExternalPosePrior> working_queue;
+    std::multimap<Timestamp, ExternalPosePrior> deferred_future_reservoir_inserts;
     {
       std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
-      working_queue.swap(external_pose_priors_queue_);
+      if (FLAGS_external_prior_future_reservoir_enabled) {
+        auto it = external_pose_priors_future_reservoir_.begin();
+        while (it != external_pose_priors_future_reservoir_.end() &&
+               it->first <= timestamp_kf_nsec) {
+          working_queue.push_back(std::move(it->second));
+          ++num_external_priors_promoted_from_future_reservoir;
+          it = external_pose_priors_future_reservoir_.erase(it);
+        }
+      }
+      if (!external_pose_priors_queue_.empty()) {
+        working_queue.insert(
+            working_queue.end(),
+            std::make_move_iterator(external_pose_priors_queue_.begin()),
+            std::make_move_iterator(external_pose_priors_queue_.end()));
+        external_pose_priors_queue_.clear();
+      }
     }
     std::deque<ExternalPosePrior> remaining_queue;
+    const auto should_store_in_future_reservoir =
+        [&](const ExternalPosePrior& prior) -> bool {
+          return FLAGS_external_prior_future_reservoir_enabled &&
+                 prior.next_eligible_timestamp_ns_ > timestamp_kf_nsec;
+        };
+    const auto stash_deferred_prior =
+        [&](ExternalPosePrior* prior) {
+          CHECK_NOTNULL(prior);
+          if (should_store_in_future_reservoir(*prior)) {
+            deferred_future_reservoir_inserts.emplace(
+                prior->next_eligible_timestamp_ns_, std::move(*prior));
+            ++num_external_priors_deferred_to_future_reservoir;
+          } else {
+            remaining_queue.push_back(std::move(*prior));
+          }
+        };
     const auto schedule_deferred_with_backoff =
         [&](ExternalPosePrior* prior) -> Timestamp {
           CHECK_NOTNULL(prior);
@@ -9876,13 +10052,15 @@ bool VioBackend::optimize(
       ++num_external_priors_considered;
 
       if (prior.next_eligible_timestamp_ns_ > timestamp_kf_nsec) {
-        remaining_queue.push_back(prior);
+        const char* queue_bucket =
+            should_store_in_future_reservoir(prior) ? "future_reservoir"
+                                                    : "generic";
         ++num_external_priors_deferred;
         ++num_external_priors_fast_skipped;
         emit_external_prior_lifecycle(prior,
                                       "defer",
                                       "next_eligible_in_future",
-                                      "generic",
+                                      queue_bucket,
                                       false,
                                       -1,
                                       -1,
@@ -9892,6 +10070,7 @@ bool VioBackend::optimize(
                                           prior.next_eligible_timestamp_ns_ -
                                               timestamp_kf_nsec),
                                       false);
+        stash_deferred_prior(&prior);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         continue;
@@ -9910,7 +10089,9 @@ bool VioBackend::optimize(
         if (retry_after_ns > timestamp_kf_nsec) {
           prior.next_eligible_timestamp_ns_ = std::max(
               prior.next_eligible_timestamp_ns_, retry_after_ns);
-          remaining_queue.push_back(prior);
+          const char* queue_bucket =
+              should_store_in_future_reservoir(prior) ? "future_reservoir"
+                                                      : "generic";
           ++num_external_priors_deferred;
           ++num_external_priors_fast_skipped;
           ++num_external_priors_source_backoff_skipped;
@@ -9918,13 +10099,14 @@ bool VioBackend::optimize(
               prior,
               "defer",
               "source_backoff_window_active",
-              "generic",
+              queue_bucket,
               false,
               -1,
               -1,
               "none",
               std::max<Timestamp>(0, retry_after_ns - timestamp_kf_nsec),
               false);
+          stash_deferred_prior(&prior);
           ext_queue_scan_filter_ms +=
               elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
           continue;
@@ -9981,13 +10163,16 @@ bool VioBackend::optimize(
           prior.next_eligible_timestamp_ns_ = std::max(
               prior.next_eligible_timestamp_ns_,
               prior.timestamp_kf_nsec_ - kMaxFutureLeadNs);
-          remaining_queue.push_back(prior);
+          const char* queue_bucket =
+              should_store_in_future_reservoir(prior)
+                  ? "future_reservoir"
+                  : "unmatched_window_pending";
           ++num_external_priors_deferred;
           emit_external_prior_lifecycle(
               prior,
               "defer",
               "future_lead_exceeds_gate",
-              "unmatched_window_pending",
+              queue_bucket,
               false,
               -1,
               -1,
@@ -9995,6 +10180,7 @@ bool VioBackend::optimize(
               std::max<Timestamp>(
                   0, prior.next_eligible_timestamp_ns_ - timestamp_kf_nsec),
               false);
+          stash_deferred_prior(&prior);
           ext_queue_scan_filter_ms +=
               elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
           continue;
@@ -10088,19 +10274,22 @@ bool VioBackend::optimize(
           continue;
         }
         const Timestamp deferred_backoff_ns = schedule_deferred_with_backoff(&prior);
-        remaining_queue.push_back(prior);
+        const char* queue_bucket =
+            should_store_in_future_reservoir(prior) ? "future_reservoir"
+                                                    : "generic";
         ++num_external_priors_deferred;
         ++num_external_priors_deferred_generic_backoff;
         emit_external_prior_lifecycle(prior,
                                       "defer",
                                       "unmatched_retry_with_backoff",
-                                      "generic",
+                                      queue_bucket,
                                       false,
                                       -1,
                                       -1,
                                       "none",
                                       deferred_backoff_ns,
                                       false);
+        stash_deferred_prior(&prior);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         continue;
@@ -10109,19 +10298,22 @@ bool VioBackend::optimize(
       // Avoid overloading a single optimize() step.
       if (num_external_priors_injected >= kMaxExternalPriorsPerOptimize) {
         const Timestamp deferred_backoff_ns = schedule_deferred_with_backoff(&prior);
-        remaining_queue.push_back(prior);
+        const char* queue_bucket =
+            should_store_in_future_reservoir(prior) ? "future_reservoir"
+                                                    : "generic";
         ++num_external_priors_deferred_budget;
         ++num_external_priors_deferred_generic_backoff;
         emit_external_prior_lifecycle(prior,
                                       "defer",
                                       "per_optimize_budget_exhausted",
-                                      "generic",
+                                      queue_bucket,
                                       true,
                                       matched_frame_id,
                                       prior.locked_matched_timestamp_ns_,
                                       "none",
                                       deferred_backoff_ns,
                                       false);
+        stash_deferred_prior(&prior);
         ext_queue_scan_filter_ms +=
             elapsedMs(prior_scan_start, std::chrono::steady_clock::now());
         continue;
@@ -10261,7 +10453,7 @@ bool VioBackend::optimize(
                false,
                false});
         } else {
-          remaining_queue.push_back(prior);
+          stash_deferred_prior(&prior);
         }
         ++num_external_priors_deferred;
         ++num_external_priors_deferred_no_local_receiver_state;
@@ -11193,20 +11385,36 @@ bool VioBackend::optimize(
 
     {
       std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
+      if (!deferred_future_reservoir_inserts.empty()) {
+        external_pose_priors_future_reservoir_.insert(
+            std::make_move_iterator(deferred_future_reservoir_inserts.begin()),
+            std::make_move_iterator(deferred_future_reservoir_inserts.end()));
+      }
+      while (external_pose_priors_future_reservoir_.size() >
+             max_external_pose_priors_future_reservoir_size_) {
+        external_pose_priors_future_reservoir_.erase(
+            external_pose_priors_future_reservoir_.begin());
+      }
       if (!external_pose_priors_queue_.empty()) {
         remaining_queue.insert(
             remaining_queue.end(),
             std::make_move_iterator(external_pose_priors_queue_.begin()),
             std::make_move_iterator(external_pose_priors_queue_.end()));
       }
+      while (remaining_queue.size() > max_external_pose_priors_queue_size_) {
+        remaining_queue.pop_front();
+      }
       external_pose_priors_queue_.swap(remaining_queue);
     }
   }
 
   size_t external_queue_size_now = 0u;
+  size_t external_future_reservoir_size_now = 0u;
   {
     std::lock_guard<std::mutex> queue_lock(external_pose_priors_queue_mutex_);
     external_queue_size_now = external_pose_priors_queue_.size();
+    external_future_reservoir_size_now =
+        external_pose_priors_future_reservoir_.size();
   }
 
   bool cbs_no_external_effect_epoch = false;
@@ -11258,6 +11466,10 @@ bool VioBackend::optimize(
         << ", deferred_matched_wait=" << num_external_priors_deferred_matched_wait
         << ", deferred_generic_backoff="
         << num_external_priors_deferred_generic_backoff
+        << ", promoted_from_future_reservoir="
+        << num_external_priors_promoted_from_future_reservoir
+        << ", deferred_to_future_reservoir="
+        << num_external_priors_deferred_to_future_reservoir
         << ", ready_in_optimizer="
         << num_external_priors_ready_in_optimizer_state
         << ", pending_in_new_values_not_committed="
@@ -11268,7 +11480,8 @@ bool VioBackend::optimize(
         << num_external_priors_rescued_by_post_update_retry
         << ", first_no_local_ready_reason="
         << first_no_local_receiver_state_reason
-        << ", queue_size_now=" << external_queue_size_now;
+        << ", queue_size_now=" << external_queue_size_now
+        << ", future_reservoir_size_now=" << external_future_reservoir_size_now;
   }
 
 #ifdef KIMERA_USE_CBS
@@ -11296,6 +11509,10 @@ bool VioBackend::optimize(
               << num_external_priors_deferred_matched_wait
               << " deferred_generic_backoff="
               << num_external_priors_deferred_generic_backoff
+              << " promoted_from_future_reservoir="
+              << num_external_priors_promoted_from_future_reservoir
+              << " deferred_to_future_reservoir="
+              << num_external_priors_deferred_to_future_reservoir
               << " ready_in_optimizer="
               << num_external_priors_ready_in_optimizer_state
               << " pending_in_new_values_not_committed="
@@ -11328,7 +11545,9 @@ bool VioBackend::optimize(
               << num_external_beliefs_health_gate_pull_capped
               << " receiver_health_score="
               << receiver_health_score_for_epoch
-              << " queue_size_now=" << external_queue_size_now << std::endl;
+              << " queue_size_now=" << external_queue_size_now
+              << " future_reservoir_size_now="
+              << external_future_reservoir_size_now << std::endl;
 
     const double ext_queue_total_ms = ext_queue_scan_filter_ms;
     const double ext_queue_filter_only_ms = std::max(
@@ -11370,6 +11589,10 @@ bool VioBackend::optimize(
         << " priors_source_backoff_skipped="
         << num_external_priors_source_backoff_skipped
         << " priors_considered=" << num_external_priors_considered
+        << " priors_promoted_from_future_reservoir="
+        << num_external_priors_promoted_from_future_reservoir
+        << " priors_deferred_to_future_reservoir="
+        << num_external_priors_deferred_to_future_reservoir
         << " rejected_keys_touched="
         << num_external_beliefs_rejected_keys_touched
         << " rejected_factors_touched="
@@ -11383,7 +11606,9 @@ bool VioBackend::optimize(
         << " beliefs_health_pull_capped="
         << num_external_beliefs_health_gate_pull_capped
         << " receiver_health_score=" << receiver_health_score_for_epoch
-        << " queue_size_now=" << external_queue_size_now << std::endl;
+        << " queue_size_now=" << external_queue_size_now
+        << " future_reservoir_size_now=" << external_future_reservoir_size_now
+        << std::endl;
     std::cerr << std::setprecision(12)
               << "[CBS][BeliefHealthEpochDiag]"
               << " curr_kf_id=" << cur_id
@@ -11472,6 +11697,8 @@ bool VioBackend::optimize(
   size_t cbs_smart_replacement_due_to_correctness_threshold = 0u;
   size_t cbs_smart_replacement_skipped_small_change = 0u;
   size_t cbs_smart_replacement_skipped_keep_existing = 0u;
+  size_t cbs_smart_replacement_skipped_due_to_budget = 0u;
+  size_t cbs_smart_replacement_noncritical_applied = 0u;
   std::unordered_set<LandmarkId> cbs_landmarks_touched_for_replacement;
   std::unordered_set<LandmarkId> cbs_landmarks_touched_for_new_insertion;
 
@@ -11594,6 +11821,12 @@ bool VioBackend::optimize(
       static_cast<size_t>(std::max(1, FLAGS_cbs_smart_replace_material_support_delta));
   const size_t cbs_material_pose_key_delta_threshold = static_cast<size_t>(
       std::max(1, FLAGS_cbs_smart_replace_material_pose_key_delta));
+  const size_t cbs_smart_replacement_noncritical_budget_per_epoch =
+      static_cast<size_t>(
+          std::max(0, FLAGS_cbs_smart_replace_noncritical_budget_per_epoch));
+  const bool cbs_smart_replacement_budget_enabled =
+      useCbsOptimizerHeart() &&
+      cbs_smart_replacement_noncritical_budget_per_epoch > 0u;
   const auto sorted_unique_keys =
       [](const SmartStereoFactor::shared_ptr& factor) -> std::vector<gtsam::Key> {
     std::vector<gtsam::Key> keys;
@@ -11695,17 +11928,39 @@ bool VioBackend::optimize(
             support_changed_materially || pose_key_set_changed_materially;
         const bool has_correctness_upgrade =
             due_to_invalid_to_valid_transition || due_to_correctness_threshold;
+        const bool degenerate_nonimproving_churn_case =
+            due_to_degenerate_factor && !has_correctness_upgrade;
+        const bool skip_degenerate_nonimproving_replacement =
+            useCbsOptimizerHeart() &&
+            FLAGS_cbs_smart_replace_skip_nonimproving_degenerate_replacements &&
+            degenerate_nonimproving_churn_case;
+        const bool prevent_valid_to_invalid_downgrade =
+            useCbsOptimizerHeart() &&
+            FLAGS_cbs_smart_replace_prevent_valid_to_invalid_downgrade &&
+            due_to_valid_to_invalid_transition;
+        const bool replacement_is_noncritical = !has_correctness_upgrade;
         // Conservative gate: keep existing active smart factor unless there is
         // a material support/pose-key change or a clear correctness upgrade.
         const bool should_replace_default =
-            has_material_shape_change || has_correctness_upgrade;
+            (has_material_shape_change || has_correctness_upgrade) &&
+            !skip_degenerate_nonimproving_replacement &&
+            !prevent_valid_to_invalid_downgrade;
+        const bool should_skip_due_to_budget =
+            should_replace_default && replacement_is_noncritical &&
+            cbs_smart_replacement_budget_enabled &&
+            cbs_smart_replacement_noncritical_applied >=
+                cbs_smart_replacement_noncritical_budget_per_epoch;
         const bool should_replace =
             should_replace_default &&
             !(useCbsOptimizerHeart() &&
-              FLAGS_cbs_diag_disable_smart_factor_replacements);
+              FLAGS_cbs_diag_disable_smart_factor_replacements) &&
+            !should_skip_due_to_budget;
 
         if (!should_replace) {
           ++cbs_smart_replacement_skipped_keep_existing;
+          if (should_skip_due_to_budget) {
+            ++cbs_smart_replacement_skipped_due_to_budget;
+          }
           const bool small_change_case =
               !has_material_shape_change &&
               !due_to_invalid_to_valid_transition &&
@@ -11718,10 +11973,16 @@ bool VioBackend::optimize(
           continue;
         }
 
-        // Intuition: replace previous smart factor for this landmark with the refreshed factor.
+        // Intuition: replace previous smart factor for this landmark with the
+        // refreshed factor. Keep bookkeeping pointer in sync with the candidate
+        // that will be inserted so post-update remap can resolve by identity.
         delete_slots.push_back(slot);
         new_factors_tmp.push_back(candidate_factor);
         lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
+        old_smart_factor_it->second.first = candidate_factor;
+        if (replacement_is_noncritical) {
+          ++cbs_smart_replacement_noncritical_applied;
+        }
         ++cbs_smart_factor_replacements;
         ++cbs_delete_slots_from_smart_replacement;
         if (same_support_size) {
@@ -12167,6 +12428,21 @@ bool VioBackend::optimize(
   }
 #endif
   Smoother::Result result;
+  if (useCbsOptimizerHeart() && cbs_smart_replacement_budget_enabled &&
+      cbs_smart_replacement_skipped_due_to_budget > 0u) {
+    std::cerr << std::setprecision(12)
+              << "[CBS][SmartReplacementBudgetDiag]"
+              << " curr_kf_id=" << cur_id
+              << " noncritical_budget_per_epoch="
+              << cbs_smart_replacement_noncritical_budget_per_epoch
+              << " noncritical_applied="
+              << cbs_smart_replacement_noncritical_applied
+              << " skipped_due_to_budget="
+              << cbs_smart_replacement_skipped_due_to_budget
+              << " total_replacements=" << cbs_smart_factor_replacements
+              << " total_new_insertions=" << cbs_smart_factor_new_insertions
+              << std::endl;
+  }
   VLOG(10) << "Starting first update.";
   bool is_smoother_ok = updateSmoother(
       &result,
@@ -15214,7 +15490,61 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
 
           gtsam::NonlinearFactorGraph phase2_summary_factors;
           CbsFixedLagBpsamHeart::SummaryBuildStats phase2_stats;
-          cbs_phase2_summary_attempted = (cbs_phase2_heart_ && phase2_plan_ready);
+          const bool cbs_phase2_summary_attempt_requested =
+              (cbs_phase2_heart_ && phase2_plan_ready);
+          // Performance guard: when there is no external CBS work in this epoch
+          // and prune state is already pending with a very large lag-remove
+          // candidate set, skip rebuilding the expensive lag-edge summary.
+          // This keeps no-external catch-up epochs from spending tens of
+          // seconds in summary construction that cannot be consumed.
+          constexpr size_t kPhase2SummaryPerfGuardMinRemoveCandidates = 4096u;
+          bool cbs_no_external_effect_for_perf_guard = false;
+          size_t cbs_last_epoch_beliefs_accepted_for_perf_guard = 0u;
+          size_t cbs_last_epoch_priors_injected_for_perf_guard = 0u;
+          {
+            std::lock_guard<std::mutex> effect_lock(
+                cbs_external_effect_state_mutex_);
+            cbs_no_external_effect_for_perf_guard =
+                cbs_last_epoch_no_external_effect_;
+            cbs_last_epoch_beliefs_accepted_for_perf_guard =
+                cbs_last_epoch_beliefs_accepted_;
+            cbs_last_epoch_priors_injected_for_perf_guard =
+                cbs_last_epoch_priors_injected_;
+          }
+          const bool cbs_phase2_summary_perf_guard_skip =
+              cbs_phase2_summary_attempt_requested &&
+              cbs_no_external_effect_for_perf_guard &&
+              cbs_phase2_pending_prune_exists &&
+              cbs_phase2_incremental_remove_candidate_count >=
+                  kPhase2SummaryPerfGuardMinRemoveCandidates;
+          if (cbs_phase2_summary_perf_guard_skip) {
+            std::cerr << std::setprecision(12)
+                      << "[CBS][Phase2SummaryPerfGuardDiag]"
+                      << " curr_kf_id=" << curr_kf_id_
+                      << " no_external_effect_epoch="
+                      << (cbs_no_external_effect_for_perf_guard ? 1 : 0)
+                      << " last_epoch_beliefs_accepted="
+                      << cbs_last_epoch_beliefs_accepted_for_perf_guard
+                      << " last_epoch_priors_injected="
+                      << cbs_last_epoch_priors_injected_for_perf_guard
+                      << " pending_prune_exists="
+                      << (cbs_phase2_pending_prune_exists ? 1 : 0)
+                      << " incremental_remove_candidate_count="
+                      << cbs_phase2_incremental_remove_candidate_count
+                      << " min_remove_candidate_threshold="
+                      << kPhase2SummaryPerfGuardMinRemoveCandidates
+                      << " summary_attempt_requested="
+                      << (cbs_phase2_summary_attempt_requested ? 1 : 0)
+                      << " summary_attempt_skipped_by_perf_guard=1"
+                      << std::endl;
+            phase2_stats.summary_mode =
+                "perf_guard_skipped_no_external_pending_prune_large_remove_set";
+            phase2_stats.first_summary_failure_reason =
+                "perf_guard_skipped_no_external_pending_prune_large_remove_set";
+          }
+          cbs_phase2_summary_attempted =
+              cbs_phase2_summary_attempt_requested &&
+              !cbs_phase2_summary_perf_guard_skip;
           const bool emitted =
               cbs_phase2_summary_attempted
                   ? cbs_phase2_heart_->appendLagEdgeSummaryFactors(
@@ -16881,7 +17211,9 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           std::unordered_set<size_t> split_contract_allowed_lag_slots;
           std::unordered_set<size_t> real_applied_lag_slots;
           const bool use_lag_only_remove =
-              cbs_use_phase2_summary_prior_bridge ||
+              // Summary-bridge mode should not implicitly disable delete-slot
+              // removals; keep that behavior only for explicit diagnostics and
+              // marginalization-prior bridge.
               cbs_use_marginalization_prior_bridge ||
               FLAGS_cbs_diag_disable_merge_delete_slots_into_remove_factor_indices;
           const std::string wrapper_label_cfg =
@@ -18476,37 +18808,41 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
           params.approved_total_wrapper_remove_slots =
               sorted_slots_from_set(approved_total_wrapper_remove_slots);
 
-          const auto emit_approved_wrapper_contract_set_log =
-              [&](const std::string& set_name,
-                  const std::unordered_set<size_t>& slot_set) {
-                std::cerr << std::setprecision(12)
-                          << "[CBS][KimeraFinalRemoveContractApprovedSet]"
-                          << " curr_kf_id=" << curr_kf_id_
-                          << " set_name=" << set_name
-                          << " count=" << slot_set.size()
-                          << " slot_ids=" << format_slot_set_csv(slot_set)
-                          << " factor_classes="
-                          << sanitize_forensic_token(
-                                 format_slot_set_factor_classes_csv(cbs_factors,
-                                                                    slot_set))
-                          << " factor_keys="
-                          << sanitize_forensic_token(
-                                 format_slot_set_factor_keys_csv(cbs_factors,
-                                                                 slot_set))
-                          << std::endl;
-              };
-          emit_approved_wrapper_contract_set_log(
-              "approved_direct_local_internal_slots",
-              approved_direct_local_internal_slots);
-          emit_approved_wrapper_contract_set_log(
-              "approved_summary_covered_crossing_slots",
-              approved_summary_covered_crossing_slots);
-          emit_approved_wrapper_contract_set_log(
-              "approved_deferred_unsupported_slots",
-              approved_deferred_unsupported_slots);
-          emit_approved_wrapper_contract_set_log(
-              "approved_total_wrapper_remove_slots",
-              approved_total_wrapper_remove_slots);
+          // Extremely verbose forensic packet dumps are intentionally opt-in.
+          // Keeping them unconditional causes avoidable backend I/O/format cost.
+          if (FLAGS_cbs_log_final_remove_contract_only) {
+            const auto emit_approved_wrapper_contract_set_log =
+                [&](const std::string& set_name,
+                    const std::unordered_set<size_t>& slot_set) {
+                  std::cerr << std::setprecision(12)
+                            << "[CBS][KimeraFinalRemoveContractApprovedSet]"
+                            << " curr_kf_id=" << curr_kf_id_
+                            << " set_name=" << set_name
+                            << " count=" << slot_set.size()
+                            << " slot_ids=" << format_slot_set_csv(slot_set)
+                            << " factor_classes="
+                            << sanitize_forensic_token(
+                                   format_slot_set_factor_classes_csv(cbs_factors,
+                                                                      slot_set))
+                            << " factor_keys="
+                            << sanitize_forensic_token(
+                                   format_slot_set_factor_keys_csv(cbs_factors,
+                                                                   slot_set))
+                            << std::endl;
+                };
+            emit_approved_wrapper_contract_set_log(
+                "approved_direct_local_internal_slots",
+                approved_direct_local_internal_slots);
+            emit_approved_wrapper_contract_set_log(
+                "approved_summary_covered_crossing_slots",
+                approved_summary_covered_crossing_slots);
+            emit_approved_wrapper_contract_set_log(
+                "approved_deferred_unsupported_slots",
+                approved_deferred_unsupported_slots);
+            emit_approved_wrapper_contract_set_log(
+                "approved_total_wrapper_remove_slots",
+                approved_total_wrapper_remove_slots);
+          }
 
           cbs_prev_epoch_remove_factor_indices_.clear();
           cbs_prev_epoch_remove_factor_indices_.insert(
@@ -20224,11 +20560,17 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
       cbs_stage_a_failure_sequence_diag_emitted_once = true;
     };
 
+    bool
+        cbs_stage_b_support_only_no_remove_values_commit_succeeded_for_lag_commit_gate =
+            false;
+
     const auto run_cbs_update_epoch =
         [&](const bool enable_remove_factor_indices,
             bool* should_retry_without_remove) -> bool {
           CHECK_NOTNULL(should_retry_without_remove);
           *should_retry_without_remove = false;
+          cbs_stage_b_support_only_no_remove_values_commit_succeeded_for_lag_commit_gate =
+              false;
           std::string exception_phase_label = "start";
           gtsam::FactorIndices forensic_remove_slots_this_attempt;
           static std::string
@@ -20944,32 +21286,45 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   std::vector<size_t> invalid_remove_slots;
                   gtsam::FactorIndices valid_remove_slots;
                   valid_remove_slots.reserve(stage_params.removeFactorIndices.size());
+                  // Per-slot remove diagnostics are extremely verbose and can
+                  // dominate runtime in long replay runs. Keep detailed slot
+                  // traces gated behind explicit contract-diag flags.
+                  const bool emit_primary_remove_slot_check_diag =
+                      FLAGS_cbs_log_final_remove_contract_only ||
+                      FLAGS_cbs_strict_wrapper_remove_contract;
                   exception_phase_label = stage_label + "_remove_slot_exists_check";
                   {
                     const gtsam::NonlinearFactorGraph& factors =
                         cbs_optimizer_->getFactorsUnsafe();
                     for (const size_t slot : stage_params.removeFactorIndices) {
                       const bool exists = factors.exists(slot) && factors.at(slot);
-                      std::cerr << "[CBS][PrimaryRemoveSlotCheck] curr_kf_id="
-                                << curr_kf_id_ << " stage=" << stage_label
-                                << " slot_id=" << slot
-                                << " exists=" << (exists ? 1 : 0) << std::endl;
+                      if (emit_primary_remove_slot_check_diag) {
+                        std::cerr << "[CBS][PrimaryRemoveSlotCheck] curr_kf_id="
+                                  << curr_kf_id_ << " stage=" << stage_label
+                                  << " slot_id=" << slot
+                                  << " exists=" << (exists ? 1 : 0)
+                                  << std::endl;
+                      }
                       if (exists) {
                         valid_remove_slots.push_back(slot);
                       } else {
                         invalid_remove_slots.push_back(slot);
                       }
                     }
-                    const long long first_invalid_slot =
-                        invalid_remove_slots.empty()
-                            ? -1
-                            : static_cast<long long>(invalid_remove_slots.front());
-                    std::cerr
-                        << "[CBS][PrimaryRemoveSlotCheckSummary] curr_kf_id="
-                        << curr_kf_id_ << " stage=" << stage_label
-                        << " invalid_slot_count=" << invalid_remove_slots.size()
-                        << " first_invalid_slot_id=" << first_invalid_slot
-                        << std::endl;
+                    if (emit_primary_remove_slot_check_diag ||
+                        !invalid_remove_slots.empty()) {
+                      const long long first_invalid_slot =
+                          invalid_remove_slots.empty()
+                              ? -1
+                              : static_cast<long long>(
+                                    invalid_remove_slots.front());
+                      std::cerr
+                          << "[CBS][PrimaryRemoveSlotCheckSummary] curr_kf_id="
+                          << curr_kf_id_ << " stage=" << stage_label
+                          << " invalid_slot_count=" << invalid_remove_slots.size()
+                          << " first_invalid_slot_id=" << first_invalid_slot
+                          << std::endl;
+                    }
                   }
 
                   const auto run_stage_update_call =
@@ -21085,19 +21440,23 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       throw;
                     }
                   }
-                  std::cerr
-                      << "[CBS][PrimaryRemoveSlotCheckRetry] curr_kf_id="
-                      << curr_kf_id_ << " stage=" << stage_label
-                      << " invalid_slot_count=" << invalid_remove_slots.size()
-                      << " retry_attempted="
-                      << (*stage_retry_attempted ? 1 : 0)
-                      << " crash_disappeared="
-                      << ((*stage_retry_attempted && *stage_retry_succeeded) ? 1
-                                                                            : 0)
-                      << " remove_slots_before="
-                      << stage_params.removeFactorIndices.size()
-                      << " remove_slots_after="
-                      << effective_remove_slots->size() << std::endl;
+                  if (emit_primary_remove_slot_check_diag ||
+                      !invalid_remove_slots.empty() || *stage_retry_attempted) {
+                    std::cerr
+                        << "[CBS][PrimaryRemoveSlotCheckRetry] curr_kf_id="
+                        << curr_kf_id_ << " stage=" << stage_label
+                        << " invalid_slot_count=" << invalid_remove_slots.size()
+                        << " retry_attempted="
+                        << (*stage_retry_attempted ? 1 : 0)
+                        << " crash_disappeared="
+                        << ((*stage_retry_attempted && *stage_retry_succeeded)
+                                ? 1
+                                : 0)
+                        << " remove_slots_before="
+                        << stage_params.removeFactorIndices.size()
+                        << " remove_slots_after="
+                        << effective_remove_slots->size() << std::endl;
+                  }
                   forensic_remove_slots_this_attempt = *effective_remove_slots;
                   cbs_update_packet_forensics = build_update_packet_forensics(
                       forensic_remove_slots_this_attempt);
@@ -24899,8 +25258,12 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 const bool stage_a_support_only_salvage_boundary_warmup_epoch =
                     lag_window_state.oldest_active_frame_id <=
                     stage_a_support_only_salvage_relocation_warmup_effective_oldest_active_frame_id_max;
+                const bool stage_a_support_only_salvage_boundary_transition_epoch =
+                    cbs_phase2_boundary_transition_this_epoch;
+                // Contract: bounded warm-up only. Do not defer relocation on every
+                // boundary-transition epoch, otherwise Stage-B remove relocation can
+                // be starved indefinitely once lag starts advancing each frame.
                 const bool stage_a_support_only_salvage_defer_to_next_epoch =
-                    cbs_phase2_boundary_transition_this_epoch ||
                     stage_a_support_only_salvage_boundary_warmup_epoch;
                 size_t stage_a_support_only_salvage_relocation_rejected_nonlive_count =
                     0u;
@@ -25064,9 +25427,12 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                     << " salvage_reason="
                     << "stage_a_support_poor_remove_heavy_packet_after_remove_sanitization"
                     << " relocation_deferred_due_to_boundary_transition="
-                    << (stage_a_support_only_salvage_defer_to_next_epoch ? 1 : 0)
+                    << (stage_a_support_only_salvage_boundary_transition_epoch ? 1
+                                                                              : 0)
                     << " relocation_deferred_due_to_boundary_warmup="
                     << (stage_a_support_only_salvage_boundary_warmup_epoch ? 1 : 0)
+                    << " relocation_deferred_to_next_epoch="
+                    << (stage_a_support_only_salvage_defer_to_next_epoch ? 1 : 0)
                     << " relocation_warmup_oldest_active_frame_id_max="
                     << stage_a_support_only_salvage_relocation_warmup_oldest_active_frame_id_max
                     << " relocation_warmup_exit_extra_epochs="
@@ -25081,7 +25447,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                   !update_a_params.removeFactorIndices.empty() ||
                   !update_b_params.removeFactorIndices.empty();
               if (enable_remove_factor_indices &&
-                  remove_update_attempted_this_attempt) {
+                  remove_update_attempted_this_attempt &&
+                  cbs_phase2_incremental_remove_candidate_count > 0u) {
                 lag_boundary_remove_update_attempted = true;
               }
               cbs_phase2_two_stage_update_a_summary_factor_count =
@@ -28403,6 +28770,11 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                           << (stage_b_contract_passed ? 1 : 0)
                           << std::endl;
                 if (stage_b_contract_passed) {
+                  if (stage_b_only_fallback_for_support_only_summary_no_remove &&
+                      stage_b_packet_snapshot.remove_count == 0u) {
+                    cbs_stage_b_support_only_no_remove_values_commit_succeeded_for_lag_commit_gate =
+                        true;
+                  }
                   stage_b_completed_successfully = true;
                   stage_b_last_clean_snapshot = stage_b_packet_snapshot;
                   stage_b_last_clean_snapshot_valid = true;
@@ -29736,7 +30108,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 remove_update_attempted_this_attempt =
                     !cbs_first_update_params.removeFactorIndices.empty();
                 if (enable_remove_factor_indices &&
-                    remove_update_attempted_this_attempt) {
+                    remove_update_attempted_this_attempt &&
+                    cbs_phase2_incremental_remove_candidate_count > 0u) {
                   lag_boundary_remove_update_attempted = true;
                 }
                 run_update_stage_with_retry("single_packet_update",
@@ -29803,7 +30176,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
             }
 
             if (enable_remove_factor_indices &&
-                !forensic_remove_slots_this_attempt.empty()) {
+                cbs_phase2_incremental_remove_candidate_count > 0u &&
+                cbs_phase2_real_applied_lag_slots_count > 0u) {
               lag_boundary_remove_update_succeeded = true;
             }
 
@@ -29816,7 +30190,8 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
 
             const bool remove_update_succeeded_before_prune_commit =
                 enable_remove_factor_indices &&
-                !forensic_remove_slots_this_attempt.empty();
+                (cbs_phase2_incremental_remove_candidate_count == 0u ||
+                 cbs_phase2_real_applied_lag_slots_count > 0u);
             if (cbs_use_phase2_summary_prior_bridge && cbs_phase2_heart_) {
               cbs_phase2_pending_prune_exists =
                   cbs_phase2_heart_->hasPendingPrunePlan();
@@ -30938,6 +31313,13 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 << " smart_replacement_material_pose_key_delta_threshold="
                 << static_cast<size_t>(std::max(
                        1, FLAGS_cbs_smart_replace_material_pose_key_delta))
+                << " smart_replace_skip_nonimproving_degenerate_replacements="
+                << (FLAGS_cbs_smart_replace_skip_nonimproving_degenerate_replacements
+                        ? 1
+                        : 0)
+                << " smart_replace_prevent_valid_to_invalid_downgrade="
+                << (FLAGS_cbs_smart_replace_prevent_valid_to_invalid_downgrade ? 1
+                                                                                : 0)
                 << " landmarks_touched_for_replacement="
                 << cbs_landmarks_touched_for_replacement
                 << " landmarks_touched_for_new_insertion="
@@ -31975,6 +32357,14 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << " smart_replacement_material_pose_key_delta_threshold="
                       << static_cast<size_t>(std::max(
                              1, FLAGS_cbs_smart_replace_material_pose_key_delta))
+                      << " smart_replace_skip_nonimproving_degenerate_replacements="
+                      << (FLAGS_cbs_smart_replace_skip_nonimproving_degenerate_replacements
+                              ? 1
+                              : 0)
+                      << " smart_replace_prevent_valid_to_invalid_downgrade="
+                      << (FLAGS_cbs_smart_replace_prevent_valid_to_invalid_downgrade
+                              ? 1
+                              : 0)
                       << " landmarks_touched_for_replacement="
                       << cbs_landmarks_touched_for_replacement
                       << " landmarks_touched_for_new_insertion="
@@ -32440,9 +32830,23 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               !lag_boundary_prev_frame_for_diag_exists ||
               (!x_prev_frame_exists_after_epoch && !v_prev_frame_exists_after_epoch &&
                !b_prev_frame_exists_after_epoch);
+          // Stale prev-frame visibility is a useful diagnostic signal, but in
+          // CBS-heart phase2 it is not a hard atomicity gate: structural
+          // retention (e.g. protected priors/support) can intentionally keep
+          // boundary-1 keys visible.
+          // Contract: a lag transaction may only commit when remove semantics are
+          // truly satisfied (effective remove slots applied), or when there were
+          // explicitly zero incremental remove candidates to apply.
+          //
+          // A Stage-B fallback values-only success is informative for diagnostics,
+          // but must not by itself consume lag/prune state.
+          const bool lag_boundary_remove_gate_satisfied =
+              lag_boundary_remove_update_succeeded ||
+              (!lag_boundary_remove_update_attempted &&
+               cbs_phase2_incremental_remove_candidate_count == 0u);
           const bool atomic_remove_success_precondition =
-              epoch_update_succeeded && lag_boundary_remove_update_succeeded &&
-              stale_prev_frame_cleanup_succeeded;
+              lag_boundary_advanced_target_epoch && epoch_update_succeeded &&
+              lag_boundary_remove_gate_satisfied;
           bool prune_plan_consumed_now = false;
           bool lag_transaction_consumed_now = false;
           bool boundary_commit_applied = false;
@@ -32467,7 +32871,7 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                 prune_plan_consumed_now = committed;
                 if (committed) {
                   cbs_phase2_prune_commit_reason =
-                      "primary_remove_update_and_stale_cleanup_succeeded";
+                      "primary_remove_update_gate_succeeded";
                 } else if (cbs_phase2_prune_commit_reason == "none" ||
                            cbs_phase2_prune_commit_reason ==
                                "pending_prune_waiting_for_atomic_commit") {
@@ -32486,12 +32890,15 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
               if (!epoch_update_succeeded) {
                 cbs_phase2_prune_commit_reason =
                     "pending_prune_waiting_for_epoch_success";
-              } else if (!lag_boundary_remove_update_succeeded) {
+              } else if (!lag_boundary_advanced_target_epoch) {
+                cbs_phase2_prune_commit_reason =
+                    "pending_prune_waiting_for_boundary_advance";
+              } else if (!lag_boundary_remove_gate_satisfied) {
                 cbs_phase2_prune_commit_reason =
                     "pending_prune_waiting_for_remove_update";
               } else {
                 cbs_phase2_prune_commit_reason =
-                    "pending_prune_waiting_for_stale_cleanup";
+                    "pending_prune_waiting_for_atomic_commit";
               }
             }
           } else {
@@ -32531,12 +32938,22 @@ bool VioBackend::updateSmoother(Smoother::Result* result,
                       << (lag_boundary_remove_update_attempted ? 1 : 0)
                       << " remove_update_succeeded="
                       << (lag_boundary_remove_update_succeeded ? 1 : 0)
+                      << " remove_gate_satisfied="
+                      << (lag_boundary_remove_gate_satisfied ? 1 : 0)
+                      << " stage_b_support_only_no_remove_values_commit_satisfied="
+                      << (cbs_stage_b_support_only_no_remove_values_commit_succeeded_for_lag_commit_gate
+                              ? 1
+                              : 0)
+                      << " lag_remove_candidate_count="
+                      << cbs_phase2_incremental_remove_candidate_count
                       << " stale_prev_frame_x_after_epoch="
                       << (x_prev_frame_exists_after_epoch ? 1 : 0)
                       << " stale_prev_frame_v_after_epoch="
                       << (v_prev_frame_exists_after_epoch ? 1 : 0)
                       << " stale_prev_frame_b_after_epoch="
                       << (b_prev_frame_exists_after_epoch ? 1 : 0)
+                      << " stale_prev_frame_cleanup_succeeded="
+                      << (stale_prev_frame_cleanup_succeeded ? 1 : 0)
                       << " boundary_commit_applied="
                       << (boundary_commit_applied ? 1 : 0)
                       << " prune_plan_consumed="
@@ -33211,7 +33628,8 @@ void VioBackend::updateNewSmartFactorsSlots(
 
 #ifdef KIMERA_USE_CBS
   if (useCbsOptimizerHeart()) {
-    // Intuition: CBS may inject extra factors internally, so index-based remap is unsafe; remap by pointer identity instead.
+    // Intuition: CBS may inject extra factors internally, so index-based remap
+    // is unsafe; remap by pointer identity instead.
     CHECK(cbs_optimizer_) << "CBS optimizer flag is ON but cbs_optimizer_ is null.";
     if (!cbs_has_last_update_result_) {
       VLOG(2) << "CBS smart-factor slot update skipped: no cached CBS update result yet.";
@@ -33220,33 +33638,77 @@ void VioBackend::updateNewSmartFactorsSlots(
 
     const gtsam::NonlinearFactorGraph& factor_graph =
         cbs_optimizer_->getFactorsUnsafe();
+    std::unordered_map<const SmartStereoFactor*, Slot> slot_by_smart_factor;
+    slot_by_smart_factor.reserve(factor_graph.size());
+    for (size_t slot = 0u; slot < factor_graph.size(); ++slot) {
+      if (!factor_graph.exists(slot)) {
+        continue;
+      }
+      const auto* smart_factor =
+          dynamic_cast<const SmartStereoFactor*>(factor_graph.at(slot).get());
+      if (!smart_factor) {
+        continue;
+      }
+      slot_by_smart_factor.emplace(smart_factor, static_cast<Slot>(slot));
+    }
+
+    size_t remap_ok_count = 0u;
+    size_t remap_missing_entry_count = 0u;
+    size_t remap_null_pointer_count = 0u;
+    size_t remap_not_found_count = 0u;
+    size_t stale_entries_erased_count = 0u;
+    long long first_failed_lmk = -1ll;
+    std::string first_failed_reason = "none";
+    const auto remember_first_failure = [&](const LandmarkId& lmk_id,
+                                            const char* reason) {
+      if (first_failed_lmk < 0) {
+        first_failed_lmk = static_cast<long long>(lmk_id);
+        first_failed_reason = reason;
+      }
+    };
 
     for (const LandmarkId& lmk_id : lmk_ids_of_new_smart_factors) {
-      const auto it = old_smart_factors->find(lmk_id);
-      DCHECK(it != old_smart_factors->end())
-          << "Trying to access unavailable factor.";
-
-      const SmartStereoFactor* target_factor = it->second.first.get();
-      DCHECK(target_factor);
-
-      Slot found_slot = -1;
-      for (size_t slot = 0u; slot < factor_graph.size(); ++slot) {
-        if (!factor_graph.exists(slot)) {
-          continue;
-        }
-        if (factor_graph.at(slot).get() == target_factor) {
-          found_slot = static_cast<Slot>(slot);
-          break;
-        }
-      }
-
-      if (found_slot < 0) {
-        LOG(WARNING) << "CBS smart-factor slot remap failed for lmk id: "
-                     << lmk_id;
+      auto it = old_smart_factors->find(lmk_id);
+      if (it == old_smart_factors->end()) {
+        ++remap_missing_entry_count;
+        remember_first_failure(lmk_id, "missing_bookkeeping_entry");
         continue;
       }
 
-      it->second.second = found_slot;
+      const SmartStereoFactor* target_factor = it->second.first.get();
+      if (!target_factor) {
+        ++remap_null_pointer_count;
+        remember_first_failure(lmk_id, "null_smart_factor_pointer");
+        old_smart_factors->erase(it);
+        ++stale_entries_erased_count;
+        continue;
+      }
+
+      const auto found_slot_it = slot_by_smart_factor.find(target_factor);
+      if (found_slot_it == slot_by_smart_factor.end()) {
+        ++remap_not_found_count;
+        remember_first_failure(lmk_id, "pointer_not_found_in_factor_graph");
+        old_smart_factors->erase(it);
+        ++stale_entries_erased_count;
+        continue;
+      }
+
+      it->second.second = found_slot_it->second;
+      ++remap_ok_count;
+    }
+
+    if (remap_missing_entry_count > 0u || remap_null_pointer_count > 0u ||
+        remap_not_found_count > 0u) {
+      LOG(WARNING) << "[CBS][SmartFactorRemapDiag]"
+                   << " expected=" << lmk_ids_of_new_smart_factors.size()
+                   << " remap_ok_count=" << remap_ok_count
+                   << " missing_entry_count=" << remap_missing_entry_count
+                   << " null_pointer_count=" << remap_null_pointer_count
+                   << " not_found_count=" << remap_not_found_count
+                   << " stale_entries_erased_count=" << stale_entries_erased_count
+                   << " first_failed_lmk=" << first_failed_lmk
+                   << " first_failed_reason=" << first_failed_reason
+                   << " slot_map_size=" << slot_by_smart_factor.size();
     }
     return;
   }

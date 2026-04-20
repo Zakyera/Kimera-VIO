@@ -198,8 +198,6 @@ CbsFixedLagBpsamHeart::advanceLagWindowIncremental(
     incremental_boundary_candidates_ = incremental_plan_cache_.boundary_candidates;
     incremental_summary_insertion_ =
         incremental_plan_cache_.future_summary_insertion;
-    incremental_oldest_active_frame_id_ =
-        incremental_plan_cache_.stale_eviction.oldest_active_frame_id;
     incremental_newest_local_frame_id_ = std::max(
         incremental_newest_local_frame_id_,
         incremental_plan_cache_.stale_eviction.newest_frame_id);
@@ -226,8 +224,6 @@ CbsFixedLagBpsamHeart::advanceLagWindowIncremental(
         buildRemoveFactorIndices(plan.stale_eviction, plan.orphan_prune);
 
     incremental_plan_cache_ = std::move(plan);
-    incremental_oldest_active_frame_id_ =
-        incremental_plan_cache_.stale_eviction.oldest_active_frame_id;
     incremental_boundary_candidates_ =
         incremental_plan_cache_.boundary_candidates;
     incremental_summary_insertion_ =
@@ -271,6 +267,11 @@ bool CbsFixedLagBpsamHeart::commitPendingPrunePlan() {
   if (!pending_prune_plan_valid_) {
     return false;
   }
+  // Advance incremental lag boundary only when pending prune state is
+  // atomically committed by the caller.
+  incremental_oldest_active_frame_id_ =
+      std::max(incremental_oldest_active_frame_id_,
+               pending_prune_plan_.stale_eviction.oldest_active_frame_id);
   pruneIncrementalStateWithPlan(pending_prune_plan_);
   pending_prune_plan_ = LagWindowPlan{};
   pending_prune_plan_valid_ = false;
@@ -696,7 +697,6 @@ CbsFixedLagBpsamHeart::computeStaleFrameEviction(
     const KeyTimestampMap& timestamps,
     const FrameId fallback_newest_frame_id,
     const LocalFrameOwnedKeys& local_ownership) const {
-  (void)local_ownership;
   StaleFrameEvictionResult result;
   result.newest_frame_id = fallback_newest_frame_id;
 
@@ -708,9 +708,14 @@ CbsFixedLagBpsamHeart::computeStaleFrameEviction(
 
   result.oldest_active_frame_id =
       computeOldestActiveFrame(result.newest_frame_id, lag_states_);
-  result.eviction_start_frame_id = 0u;
+  const bool can_use_incremental_start =
+      incremental_state_seeded_from_full_recompute_ &&
+      incremental_oldest_active_frame_id_ > 0u &&
+      incremental_oldest_active_frame_id_ <= result.oldest_active_frame_id;
+  result.eviction_start_frame_id =
+      can_use_incremental_start ? incremental_oldest_active_frame_id_ : 0u;
   result.eviction_end_frame_id = result.oldest_active_frame_id;
-  result.full_rescan = true;
+  result.full_rescan = !can_use_incremental_start;
 
   if (!bpsam_ || result.eviction_end_frame_id <= result.eviction_start_frame_id) {
     return result;
@@ -721,19 +726,43 @@ CbsFixedLagBpsamHeart::computeStaleFrameEviction(
   std::unordered_set<gtsam::FactorIndex> stale_belief_slots_set;
   const gtsam::NonlinearFactorGraph& graph = bpsam_->getFactorsUnsafe();
 
-  for (const auto& kv : variable_index) {
-    const Key key = kv.first;
-    if (!isLocalStateKey(key)) {
-      continue;
+  auto collect_stale_keys_for_frame_range = [&](const auto& frame_map) {
+    for (const auto& frame_keys : frame_map) {
+      const FrameId frame_id = frame_keys.first;
+      if (frame_id < result.eviction_start_frame_id ||
+          frame_id >= result.eviction_end_frame_id) {
+        continue;
+      }
+      result.stale_local_keys.insert(frame_keys.second.begin(),
+                                     frame_keys.second.end());
     }
-    const FrameId key_frame = frameIdFromKey(key);
-    if (key_frame < result.eviction_start_frame_id ||
-        key_frame >= result.eviction_end_frame_id) {
-      continue;
-    }
+  };
 
-    result.stale_local_keys.insert(key);
-    for (const gtsam::FactorIndex slot : kv.second) {
+  if (!result.full_rescan) {
+    collect_stale_keys_for_frame_range(local_ownership.pose_keys_by_frame);
+    collect_stale_keys_for_frame_range(local_ownership.vel_keys_by_frame);
+    collect_stale_keys_for_frame_range(local_ownership.bias_keys_by_frame);
+  } else {
+    for (const auto& kv : variable_index) {
+      const Key key = kv.first;
+      if (!isLocalStateKey(key)) {
+        continue;
+      }
+      const FrameId key_frame = frameIdFromKey(key);
+      if (key_frame < result.eviction_start_frame_id ||
+          key_frame >= result.eviction_end_frame_id) {
+        continue;
+      }
+      result.stale_local_keys.insert(key);
+    }
+  }
+
+  for (const Key key : result.stale_local_keys) {
+    const auto key_it = variable_index.find(key);
+    if (key_it == variable_index.end()) {
+      continue;
+    }
+    for (const gtsam::FactorIndex slot : key_it->second) {
       stale_factor_slots_set.insert(slot);
       if (factorExists(graph, slot) && isBeliefFactor(graph.at(slot))) {
         stale_belief_slots_set.insert(slot);
@@ -2577,6 +2606,48 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
         directly_removable_local_internal_candidate_slots.begin(),
         directly_removable_local_internal_candidate_slots.end());
     std::sort(ordered_candidates.begin(), ordered_candidates.end());
+    // Seed set of direct-local candidates that are blocked specifically by
+    // retained bootstrap support priors. We use this to avoid propagating one
+    // retained-support block through the entire stale component via
+    // candidate-not-component-complete cascades.
+    std::unordered_set<gtsam::FactorIndex>
+        retained_support_seed_blocked_candidates;
+    retained_support_seed_blocked_candidates.reserve(ordered_candidates.size());
+    for (const gtsam::FactorIndex candidate_slot : ordered_candidates) {
+      if (!factorExists(graph, candidate_slot)) {
+        continue;
+      }
+      const auto candidate_factor = graph.at(candidate_slot);
+      if (!candidate_factor) {
+        continue;
+      }
+      bool blocked_by_retained_support = false;
+      for (const Key key : candidate_factor->keys()) {
+        if (!isLocalStateKey(key) || stale_local_key_set.count(key) == 0u) {
+          continue;
+        }
+        const auto key_it = variable_index.find(key);
+        if (key_it == variable_index.end()) {
+          continue;
+        }
+        for (const gtsam::FactorIndex incident_slot : key_it->second) {
+          if (incident_slot == candidate_slot ||
+              !factorExists(graph, incident_slot)) {
+            continue;
+          }
+          if (retained_protected_local_support_slots.count(incident_slot) > 0u) {
+            blocked_by_retained_support = true;
+            break;
+          }
+        }
+        if (blocked_by_retained_support) {
+          break;
+        }
+      }
+      if (blocked_by_retained_support) {
+        retained_support_seed_blocked_candidates.insert(candidate_slot);
+      }
+    }
     std::unordered_set<gtsam::FactorIndex> tentative_direct =
         directly_removable_local_internal_candidate_slots;
     auto evaluateDirectCandidate =
@@ -2668,6 +2739,10 @@ bool CbsFixedLagBpsamHeart::appendLagEdgeSummaryFactors(
                 reason = "blocking_incident_unsupported_lag_factor";
               } else if (directly_removable_local_internal_candidate_slots.count(
                              incident_slot) > 0u) {
+                if (retained_support_seed_blocked_candidates.count(incident_slot) >
+                    0u) {
+                  continue;
+                }
                 reason = "blocking_incident_candidate_not_component_complete";
               } else {
                 Key support_key = invalid_key;

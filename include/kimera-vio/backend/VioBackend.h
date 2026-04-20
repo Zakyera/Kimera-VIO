@@ -140,6 +140,20 @@ class VioBackend {
   gtsam::Matrix6 covariance_ = gtsam::Matrix6::Identity();
   };
 
+  // Receiver-driven pacing watermark used by external senders (e.g., LIORF)
+  // to avoid flooding Kimera with far-future priors.
+  struct ExternalPriorReceiverWatermark {
+    Timestamp emitted_at_backend_timestamp_ns_ = -1;
+    Timestamp oldest_active_pose_timestamp_ns_ = -1;
+    Timestamp newest_active_pose_timestamp_ns_ = -1;
+    Timestamp recommended_sender_min_timestamp_ns_ = -1;
+    Timestamp recommended_sender_max_timestamp_ns_ = -1;
+    Timestamp recommended_sender_max_future_lead_ns_ = -1;
+    size_t ready_queue_size_ = 0u;
+    size_t future_reservoir_size_ = 0u;
+    size_t total_buffered_priors_ = 0u;
+  };
+
   // zy Step 8_a
   // Register callback invoked when a new external-shareable pose belief is ready.
   void registerExternalPoseBeliefCallback(
@@ -203,6 +217,10 @@ class VioBackend {
   bool getExternalPoseBeliefAtTimestamp(const Timestamp& query_timestamp_kf_nsec,
                                         ExternalPoseBelief* belief,
                                         const Timestamp& tolerance_ns = -1) const;
+
+  // Snapshot of receiver pacing state for external sender flow-control.
+  bool getExternalPriorReceiverWatermark(
+      ExternalPriorReceiverWatermark* watermark) const;
 
 
 
@@ -1010,7 +1028,16 @@ class VioBackend {
 
   mutable std::mutex external_pose_priors_queue_mutex_;
   std::deque<ExternalPosePrior> external_pose_priors_queue_;
+  // Time-ordered reservoir for deferred future priors. Entries are keyed by
+  // their next eligible backend timestamp and only promoted when due.
+  std::multimap<Timestamp, ExternalPosePrior>
+      external_pose_priors_future_reservoir_;
   size_t max_external_pose_priors_queue_size_ = 1000;
+  size_t max_external_pose_priors_future_reservoir_size_ = 5000;
+  mutable std::mutex external_prior_receiver_watermark_mutex_;
+  Timestamp external_prior_receiver_last_optimize_timestamp_ns_ = -1;
+  Timestamp external_prior_receiver_oldest_active_pose_timestamp_ns_ = -1;
+  Timestamp external_prior_receiver_newest_active_pose_timestamp_ns_ = -1;
   // Debug-only: tracks LIORF source_seq values already sampled for deep
   // state-visibility instrumentation in the matched-wait receive path.
   std::unordered_set<size_t>

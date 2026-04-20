@@ -90,5 +90,10 @@ bool VioBackendModule::getExternalPoseBeliefAtTimestamp(
       query_timestamp_kf_nsec, belief, tolerance_ns);
 }
 
-}  // namespace VIO
+bool VioBackendModule::getExternalPriorReceiverWatermark(
+    VioBackend::ExternalPriorReceiverWatermark* watermark) const {
+  CHECK(vio_backend_);
+  return vio_backend_->getExternalPriorReceiverWatermark(watermark);
+}
 
+}  // namespace VIO

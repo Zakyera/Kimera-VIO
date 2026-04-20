@@ -105,6 +105,9 @@ class VioBackendModule
       VioBackend::ExternalPoseBelief* belief,
       const Timestamp& tolerance_ns = -1) const;
 
+  bool getExternalPriorReceiverWatermark(
+      VioBackend::ExternalPriorReceiverWatermark* watermark) const;
+
 
  protected:
   const VioBackend::UniquePtr vio_backend_;
