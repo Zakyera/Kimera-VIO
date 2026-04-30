@@ -92,6 +92,13 @@ DEFINE_double(cbs_external_belief_timestamp_tolerance_sec,
               0.2,
               "Max allowed absolute timestamp mismatch (seconds) when matching "
               "incoming external pose beliefs to local keyframes.");
+DEFINE_double(cbs_l2k_receiver_covariance_scale,
+              1.0,
+              "Receiver-side scale factor applied in Kimera to incoming "
+              "L2K covariance before contract merge/factorization.");
+DEFINE_bool(cbs_l2k_enable_soft_reset,
+            false,
+            "Enable GBP soft-reset branch for Kimera L2K contract merge.");
 DEFINE_bool(no_incremental_pose,
             false,
             "Flag to disable incremental pose usage in backend");
@@ -211,6 +218,7 @@ inline BpsamContractMergeResult runBpsamContractMerge(
     gbp::UpdateParams update_params;
     update_params.type = gbp::GaussianMergeType::Contract;
     update_params.metric_type = gbp::MetricType::Hellinger;
+    update_params.enable_soft_reset = FLAGS_cbs_l2k_enable_soft_reset;
 
     gbp::UpdateResult update_result;
     receiver_local_belief.update({incoming_gaussian},
@@ -425,6 +433,19 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   }
   LOG(INFO) << "CBS external belief matcher tolerance: "
             << external_belief_timestamp_tolerance_sec_ << " s";
+  if (std::isfinite(FLAGS_cbs_l2k_receiver_covariance_scale) &&
+      FLAGS_cbs_l2k_receiver_covariance_scale > 0.0) {
+    l2k_receiver_covariance_scale_ = FLAGS_cbs_l2k_receiver_covariance_scale;
+  } else {
+    LOG(WARNING) << "Invalid --cbs_l2k_receiver_covariance_scale="
+                 << FLAGS_cbs_l2k_receiver_covariance_scale
+                 << ", keeping default " << l2k_receiver_covariance_scale_
+                 << ".";
+  }
+  LOG(INFO) << "CBS L2K receiver covariance scale: "
+            << l2k_receiver_covariance_scale_;
+  LOG(INFO) << "CBS L2K soft reset: "
+            << (FLAGS_cbs_l2k_enable_soft_reset ? "ON" : "OFF");
 
   initializePoseBeliefCovarianceSidecarAdapter();
 
@@ -791,7 +812,8 @@ void VioBackend::collectExternalBeliefFactors(
                          const double dmu_local_merged,
                          const double step,
                          const double dxycurr,
-                         const double dxy_target) {
+                         const double dxy_target,
+                         const std::string& curr_origin_class) {
     const size_t sample_idx =
         external_merge_diag_sample_idx_.fetch_add(1u, std::memory_order_relaxed);
     LOG(INFO) << "CBS_MERGE_ROW_L2K,"
@@ -817,7 +839,8 @@ void VioBackend::collectExternalBeliefFactors(
               << dmu_local_merged << ","
               << step << ","
               << dxycurr << ","
-              << dxy_target;
+              << dxy_target << ","
+              << sanitizeCsvToken(curr_origin_class);
   };
 
   auto fetchLocalPoseBelief = [&](const FrameId local_frame_id,
@@ -963,7 +986,8 @@ void VioBackend::collectExternalBeliefFactors(
                   nanValue(),
                   nanValue(),
                   nanValue(),
-                  nanValue());
+                  nanValue(),
+                  "unknown");
       continue;
     }
     ++resolved_count;
@@ -1011,7 +1035,8 @@ void VioBackend::collectExternalBeliefFactors(
                   nanValue(),
                   nanValue(),
                   nanValue(),
-                  nanValue());
+                  nanValue(),
+                  "unknown");
       continue;
     }
 
@@ -1065,11 +1090,15 @@ void VioBackend::collectExternalBeliefFactors(
                   nanValue(),
                   nanValue(),
                   nanValue(),
-                  nanValue());
+                  nanValue(),
+                  "unknown");
       continue;
     }
     if (belief.relax_factor > 0.0) {
       covariance *= (1.0 + belief.relax_factor);
+    }
+    if (l2k_receiver_covariance_scale_ != 1.0) {
+      covariance *= l2k_receiver_covariance_scale_;
     }
     for (size_t i = 0u; i < 6u; ++i) {
       if (!std::isfinite(covariance(i, i)) || covariance(i, i) <= 1e-9) {
@@ -1084,30 +1113,52 @@ void VioBackend::collectExternalBeliefFactors(
     const bool has_local_before =
         fetchLocalPoseBelief(local_frame_id, &local_mu, &local_cov, &local_source);
     const double local_before_trace = has_local_before ? local_cov.trace() : nanValue();
+    const auto stream_key =
+        std::make_pair(belief.source_agent, belief.sender_pose_index);
+    auto stream_it = l2k_sender_stream_belief_state_.find(stream_key);
+    const bool has_previous_sender_stream_belief =
+        stream_it != l2k_sender_stream_belief_state_.end();
+    const gtsam::Vector6 curr_mu =
+        has_previous_sender_stream_belief ? stream_it->second.mu
+                                          : gtsam::Vector6::Zero();
+    const gtsam::Matrix6 curr_cov =
+        has_previous_sender_stream_belief ? stream_it->second.covariance
+                                          : gtsam::Matrix6::Zero();
+    const double curr_before_trace =
+        has_previous_sender_stream_belief ? curr_cov.trace() : nanValue();
+    const std::string curr_origin_class =
+        has_previous_sender_stream_belief
+            ? "previous_same_sender_key_received_belief"
+            : "no_previous_same_sender_key_memory";
     const double hellinger_local_incoming =
-        has_local_before ? safeHellingerDistance(local_mu, local_cov, mu, covariance)
-                         : nanValue();
+        has_previous_sender_stream_belief
+            ? safeHellingerDistance(curr_mu, curr_cov, mu, covariance)
+            : nanValue();
     const double mahal_local_incoming =
-        has_local_before ? safeMahalanobisDistance(local_mu, local_cov, mu)
-                         : nanValue();
+        has_previous_sender_stream_belief
+            ? safeMahalanobisDistance(curr_mu, curr_cov, mu)
+            : nanValue();
     const double dmu_local_incoming =
-        has_local_before ? safeDeltaNorm(local_mu, mu) : nanValue();
+        has_previous_sender_stream_belief ? safeDeltaNorm(curr_mu, mu)
+                                          : nanValue();
 
     gtsam::Vector6 factor_mu = mu;
     gtsam::Matrix6 factor_covariance = covariance;
     double receiver_merged_trace = nanValue();
-    double receiver_posterior_pre_trace =
-        has_local_before ? local_before_trace : nanValue();
+    double receiver_posterior_pre_trace = curr_before_trace;
     double receiver_posterior_post_trace = nanValue();
     double hellinger_local_merged = nanValue();
     double dmu_local_merged = nanValue();
     double step = nanValue();
     double dxycurr = nanValue();
     double dxy_target = nanValue();
-    std::string status = "bootstrap_no_local_staged_prior";
-    double receiver_local_raw_trace =
-        has_local_before ? local_before_trace : nanValue();
+    std::string status = "seeded_no_factor_first_observation";
+    double receiver_local_raw_trace = local_before_trace;
     double receiver_local_anchored_trace = nanValue();
+    std::string contract_curr_source =
+        has_previous_sender_stream_belief
+            ? "previous_same_sender_key_received_belief"
+            : "seed_same_sender_key_memory";
 
     // Audit-only diagnostics for receiver local-before source semantics.
     const double gauge_variance = 1e6;
@@ -1200,10 +1251,45 @@ void VioBackend::collectExternalBeliefFactors(
                         strict_local_only_gauge_status,
                         gauge_variance);
 
-    if (has_local_before) {
+    if (!has_previous_sender_stream_belief) {
+      ExternalSenderStreamBeliefState seeded_stream_state;
+      seeded_stream_state.mu = mu;
+      seeded_stream_state.covariance = sanitizePoseCovariance(covariance);
+      seeded_stream_state.timestamp_ns = belief.sender_timestamp_ns;
+      seeded_stream_state.source_agent = belief.source_agent;
+      seeded_stream_state.sender_pose_index = belief.sender_pose_index;
+      seeded_stream_state.receiver_frame_id = local_frame_id;
+      l2k_sender_stream_belief_state_[stream_key] = seeded_stream_state;
+
+      ExternalPoseBelief belief_row = belief;
+      belief_row.received_trace = received_trace;
+      logMergeRow(belief_row,
+                  sender_key,
+                  receiver_pose_key,
+                  curr_before_trace,
+                  nanValue(),
+                  receiver_posterior_pre_trace,
+                  nanValue(),
+                  hellinger_local_incoming,
+                  nanValue(),
+                  mahal_local_incoming,
+                  status,
+                  contract_curr_source,
+                  receiver_local_raw_trace,
+                  receiver_local_anchored_trace,
+                  dmu_local_incoming,
+                  nanValue(),
+                  nanValue(),
+                  nanValue(),
+                  nanValue(),
+                  "seeded_no_factor_first_observation");
+      continue;
+    }
+
+    if (has_previous_sender_stream_belief) {
       const auto merge_result = runBpsamContractMerge(pose_key,
-                                                      local_mu,
-                                                      local_cov,
+                                                      curr_mu,
+                                                      curr_cov,
                                                       mu,
                                                       covariance,
                                                       belief.relax_factor);
@@ -1215,7 +1301,7 @@ void VioBackend::collectExternalBeliefFactors(
         logMergeRow(belief_row,
                     sender_key,
                     receiver_pose_key,
-                    local_before_trace,
+                    curr_before_trace,
                     nanValue(),
                     receiver_posterior_pre_trace,
                     nanValue(),
@@ -1223,14 +1309,24 @@ void VioBackend::collectExternalBeliefFactors(
                     nanValue(),
                     mahal_local_incoming,
                     "bpsam_contract_rejected",
-                    local_source,
+                    contract_curr_source,
                     receiver_local_raw_trace,
                     receiver_local_anchored_trace,
                     dmu_local_incoming,
                     nanValue(),
                     nanValue(),
                     nanValue(),
-                    nanValue());
+                    nanValue(),
+                    curr_origin_class);
+
+        ExternalSenderStreamBeliefState rejected_stream_state;
+        rejected_stream_state.mu = mu;
+        rejected_stream_state.covariance = sanitizePoseCovariance(covariance);
+        rejected_stream_state.timestamp_ns = belief.sender_timestamp_ns;
+        rejected_stream_state.source_agent = belief.source_agent;
+        rejected_stream_state.sender_pose_index = belief.sender_pose_index;
+        rejected_stream_state.receiver_frame_id = local_frame_id;
+        l2k_sender_stream_belief_state_[stream_key] = rejected_stream_state;
         continue;
       }
       factor_mu = merge_result.merged_mu;
@@ -1244,6 +1340,7 @@ void VioBackend::collectExternalBeliefFactors(
       dxy_target = merge_result.dxy_target;
       status = "bpsam_contract_merged";
       receiver_local_anchored_trace = receiver_merged_trace;
+      contract_curr_source = "previous_same_sender_key_received_belief";
     }
 
     const auto noise = gtsam::noiseModel::Gaussian::Covariance(factor_covariance);
@@ -1257,7 +1354,7 @@ void VioBackend::collectExternalBeliefFactors(
     logMergeRow(belief_row,
                 sender_key,
                 receiver_pose_key,
-                local_before_trace,
+                curr_before_trace,
                 receiver_merged_trace,
                 receiver_posterior_pre_trace,
                 receiver_posterior_post_trace,
@@ -1265,14 +1362,24 @@ void VioBackend::collectExternalBeliefFactors(
                 hellinger_local_merged,
                 mahal_local_incoming,
                 status,
-                local_source,
+                contract_curr_source,
                 receiver_local_raw_trace,
                 receiver_local_anchored_trace,
                 dmu_local_incoming,
                 dmu_local_merged,
                 step,
                 dxycurr,
-                dxy_target);
+                dxy_target,
+                curr_origin_class);
+
+    ExternalSenderStreamBeliefState next_stream_state;
+    next_stream_state.mu = mu;
+    next_stream_state.covariance = sanitizePoseCovariance(covariance);
+    next_stream_state.timestamp_ns = belief.sender_timestamp_ns;
+    next_stream_state.source_agent = belief.source_agent;
+    next_stream_state.sender_pose_index = belief.sender_pose_index;
+    next_stream_state.receiver_frame_id = local_frame_id;
+    l2k_sender_stream_belief_state_[stream_key] = next_stream_state;
   }
 
   external_beliefs_inserted_total_.fetch_add(inserted_factors,

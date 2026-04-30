@@ -447,6 +447,15 @@ class VioBackend {
     size_t slot = 0u;
   };
 
+  struct ExternalSenderStreamBeliefState {
+    gtsam::Vector6 mu = gtsam::Vector6::Zero();
+    gtsam::Matrix6 covariance = gtsam::Matrix6::Identity() * 1e-3;
+    uint64_t timestamp_ns = 0u;
+    uint8_t source_agent = 0u;
+    uint32_t sender_pose_index = 0u;
+    FrameId receiver_frame_id = 0;
+  };
+
   enum class ExternalBeliefRejectReason {
     kNone = 0,
     kWindow = 1,
@@ -672,9 +681,12 @@ class VioBackend {
   mutable std::mutex external_beliefs_mutex_;
   std::deque<ExternalPoseBelief> pending_external_pose_beliefs_;
   std::vector<ExternalBeliefFactorSlot> active_external_belief_factor_slots_;
+  std::map<std::pair<uint8_t, uint32_t>, ExternalSenderStreamBeliefState>
+      l2k_sender_stream_belief_state_;
   std::map<FrameId, double> keyframe_timestamp_sec_;
   size_t max_pending_external_pose_beliefs_ = 800u;
   double external_belief_timestamp_tolerance_sec_ = 0.2;
+  double l2k_receiver_covariance_scale_ = 1.0;
   // External-belief flow diagnostics (monotonic counters).
   std::atomic<size_t> external_beliefs_received_total_{0u};
   std::atomic<size_t> external_beliefs_queue_dropped_total_{0u};
