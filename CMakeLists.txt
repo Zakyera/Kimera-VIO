@@ -76,6 +76,13 @@ add_subdirectory(third_party)
 
 ### Compile the code
 add_library(${PROJECT_NAME} SHARED "")
+set(GTSAM_VENDORED_EIGEN_INCLUDE "${GTSAM_INCLUDE_DIR}/gtsam/3rdparty/Eigen")
+if(EXISTS "${GTSAM_VENDORED_EIGEN_INCLUDE}/Eigen/Dense")
+  target_include_directories(${PROJECT_NAME}
+    SYSTEM BEFORE PUBLIC
+      ${GTSAM_VENDORED_EIGEN_INCLUDE}
+  )
+endif()
 
 ### Add source code for data provider.
 add_subdirectory(include/kimera-vio/dataprovider)

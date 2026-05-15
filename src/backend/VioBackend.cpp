@@ -1174,6 +1174,12 @@ void VioBackend::collectExternalBeliefFactors(
     odom_belief.source_agent = static_cast<cbs::AgentId>(belief.source_agent);
     odom_belief.from_pose_key = from_pose_key;
     odom_belief.to_pose_key = to_pose_key;
+    odom_belief.sender_from_pose_key =
+        cbs::toPoseKey(static_cast<cbs::AgentId>(belief.source_agent),
+                       belief.sender_from_pose_index);
+    odom_belief.sender_to_pose_key =
+        cbs::toPoseKey(static_cast<cbs::AgentId>(belief.source_agent),
+                       belief.sender_to_pose_index);
     odom_belief.measured_from_to =
         gtsam::Pose3::Expmap(vector6FromArray(belief.relative_mu));
     odom_belief.covariance =
