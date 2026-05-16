@@ -37,6 +37,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -148,6 +149,10 @@ DEFINE_int32(cbs_odom_unmatched_retry_max_beliefs,
              500,
              "Maximum number of unmatched incoming CBS odometry beliefs kept "
              "for retry.");
+DEFINE_string(cbs_odom_sender_mode,
+              "adjacent_window",
+              "Sender-side CBS odometry mode: adjacent_window, latest_edge, "
+              "or new_edge_once.");
 DEFINE_bool(no_incremental_pose,
             false,
             "Flag to disable incremental pose usage in backend");
@@ -171,6 +176,34 @@ inline double wallTimeNowSec() {
   return std::chrono::duration<double>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
+}
+
+template <typename TimerStart>
+inline double elapsedSec(const TimerStart& start_time) {
+  return utils::Timer::toc<std::chrono::duration<double>>(start_time).count();
+}
+
+inline double secToMs(const double seconds) {
+  return seconds * 1000.0;
+}
+
+inline std::string normalizeCbsOdomSenderMode(std::string mode) {
+  std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  std::replace(mode.begin(), mode.end(), '-', '_');
+  if (mode == "adjacent" || mode == "adjacent_only") {
+    return "adjacent_window";
+  }
+  if (mode == "latest" || mode == "latest_only") {
+    return "latest_edge";
+  }
+  return mode;
+}
+
+inline bool isValidCbsOdomSenderMode(const std::string& mode) {
+  return mode == "adjacent_window" || mode == "latest_edge" ||
+         mode == "new_edge_once";
 }
 
 inline std::string formatPoseKeyToken(const uint8_t source_agent,
@@ -503,7 +536,15 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   }
   max_unmatched_external_odom_retry_beliefs_ = static_cast<size_t>(
       std::max(0, FLAGS_cbs_odom_unmatched_retry_max_beliefs));
-  LOG(INFO) << "CBS outgoing odometry mode: adjacent-only"
+  cbs_odom_sender_mode_ =
+      normalizeCbsOdomSenderMode(FLAGS_cbs_odom_sender_mode);
+  if (!isValidCbsOdomSenderMode(cbs_odom_sender_mode_)) {
+    LOG(WARNING) << "Invalid --cbs_odom_sender_mode="
+                 << FLAGS_cbs_odom_sender_mode
+                 << ", falling back to adjacent_window.";
+    cbs_odom_sender_mode_ = "adjacent_window";
+  }
+  LOG(INFO) << "CBS outgoing odometry mode: " << cbs_odom_sender_mode_
             << " retry_max_age="
             << external_odom_unmatched_retry_max_age_sec_
             << " retry_max_beliefs="
@@ -598,6 +639,13 @@ void VioBackend::initializePoseBeliefCovarianceSidecarAdapter() {
 
 /* -------------------------------------------------------------------------- */
 BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
+  const auto spin_once_start_time = utils::Timer::tic();
+  double backend_state_process_time_sec = 0.0;
+  double output_landmark_map_time_sec = 0.0;
+  double map_update_callback_time_sec = 0.0;
+  double backend_output_construct_time_sec = 0.0;
+  double backend_logger_output_time_sec = 0.0;
+
   if (VLOG_IS_ON(10)) {
     input.print();
   }
@@ -608,6 +656,7 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
 
   bool backend_status = false;
   const BackendState backend_state = backend_state_;
+  const auto backend_state_process_start_time = utils::Timer::tic();
   try {
     switch (backend_state) {
       case BackendState::Bootstrap: {
@@ -625,6 +674,7 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
         break;
       }
     }
+    backend_state_process_time_sec = elapsedSec(backend_state_process_start_time);
   } catch (const std::exception& e) {
     LOG(ERROR) << "VioBackend::spinOnce failed while processing backend state "
                << static_cast<int>(backend_state) << ": " << e.what();
@@ -658,6 +708,7 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
     LmkIdToLmkTypeMap lmk_id_to_lmk_type_map;
     PointsWithIdMap lmk_ids_to_3d_points_in_time_horizon;
     if (kOutputLmkMap) {
+      const auto output_landmark_map_start_time = utils::Timer::tic();
       // Generate this map only if requested, since costly.
       // Also, if lmk type requested, fill lmk id to lmk type object.
       // WARNING this also cleans the lmks inside the old_smart_factors map!
@@ -676,9 +727,11 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
                    << "landmark map.";
         throw;
       }
+      output_landmark_map_time_sec = elapsedSec(output_landmark_map_start_time);
     }
 
     if (map_update_callback_) {
+      const auto map_update_callback_start_time = utils::Timer::tic();
       try {
         map_update_callback_(lmk_ids_to_3d_points_in_time_horizon);
       } catch (const std::exception& e) {
@@ -689,6 +742,7 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
         LOG(ERROR) << "VioBackend::spinOnce map update callback failed.";
         throw;
       }
+      map_update_callback_time_sec = elapsedSec(map_update_callback_start_time);
     } else {
       LOG(FATAL) << "Did you forget to register the Map "
                     "Update callback for at least the "
@@ -697,6 +751,7 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
     }
 
     // Create Backend Output Payload.
+    const auto backend_output_construct_start_time = utils::Timer::tic();
     try {
       output_payload = std::make_unique<BackendOutput>(
           VioNavStateTimestamped(
@@ -738,8 +793,11 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
           << "VioBackend::spinOnce failed while creating backend output.";
       throw;
     }
+    backend_output_construct_time_sec =
+        elapsedSec(backend_output_construct_start_time);
 
     if (logger_) {
+      const auto backend_logger_output_start_time = utils::Timer::tic();
       try {
         logger_->logBackendOutput(*output_payload);
       } catch (const std::exception& e) {
@@ -752,8 +810,22 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
             << "VioBackend::spinOnce failed while logging backend output.";
         throw;
       }
+      backend_logger_output_time_sec =
+          elapsedSec(backend_logger_output_start_time);
     }
   }
+
+  const double spin_once_total_time_sec = elapsedSec(spin_once_start_time);
+  LOG(INFO) << "KIMERA_BACKEND_SPINONCE_TIMING_ROW,"
+            << curr_kf_id_ << ","
+            << secToMs(spin_once_total_time_sec) << ","
+            << secToMs(backend_state_process_time_sec) << ","
+            << secToMs(output_landmark_map_time_sec) << ","
+            << secToMs(map_update_callback_time_sec) << ","
+            << secToMs(backend_output_construct_time_sec) << ","
+            << secToMs(backend_logger_output_time_sec) << ","
+            << static_cast<int>(backend_state) << ","
+            << (backend_status ? 1 : 0);
 
   return output_payload;
 }
@@ -1362,8 +1434,12 @@ void VioBackend::collectExternalBeliefFactors(
 }
 
 void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
+  const auto cbs_outgoing_start_time = utils::Timer::tic();
   cbs_outgoing_odom_beliefs_.clear();
   cbs_belief_generation_time_sec_per_update_ = 0.0;
+  cbs_outgoing_total_time_sec_per_update_ = 0.0;
+  cbs_set_marginalization_graph_time_sec_per_update_ = 0.0;
+  cbs_get_odometry_beliefs_time_sec_per_update_ = 0.0;
   cbs_marginalization_graph_factor_count_ = 0u;
 
   if (!smoother_) {
@@ -1373,15 +1449,45 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
   const FrameId oldest_active_frame_id =
       computeOldestActiveFrameId(cur_id, backend_params_);
   gtsam::KeySet request_keys;
+  std::vector<std::pair<FrameId, gtsam::Key>> timestamped_pose_keys;
   for (FrameId frame_id = oldest_active_frame_id; frame_id <= cur_id;
        ++frame_id) {
     const gtsam::Key pose_key = gtsam::Symbol(kPoseSymbolChar, frame_id);
     if (smoother_->valueExists(pose_key)) {
-      request_keys.insert(pose_key);
+      if (cbs_odom_sender_mode_ == "adjacent_window") {
+        request_keys.insert(pose_key);
+      } else {
+        const auto stamp_it = keyframe_timestamp_sec_.find(frame_id);
+        if (stamp_it != keyframe_timestamp_sec_.end() &&
+            std::isfinite(stamp_it->second) && stamp_it->second > 0.0) {
+          timestamped_pose_keys.emplace_back(frame_id, pose_key);
+        }
+      }
     }
     if (frame_id == std::numeric_limits<FrameId>::max()) {
       break;
     }
+  }
+
+  bool latest_pair_valid = false;
+  gtsam::Key latest_from_key = 0u;
+  gtsam::Key latest_to_key = 0u;
+  if (cbs_odom_sender_mode_ == "latest_edge" ||
+      cbs_odom_sender_mode_ == "new_edge_once") {
+    if (timestamped_pose_keys.size() < 2u) {
+      return;
+    }
+    latest_from_key = timestamped_pose_keys[timestamped_pose_keys.size() - 2u].second;
+    latest_to_key = timestamped_pose_keys.back().second;
+    latest_pair_valid = true;
+    if (cbs_odom_sender_mode_ == "new_edge_once" &&
+        last_cbs_outgoing_odom_pair_valid_ &&
+        latest_from_key == last_cbs_outgoing_odom_from_key_ &&
+        latest_to_key == last_cbs_outgoing_odom_to_key_) {
+      return;
+    }
+    request_keys.insert(latest_from_key);
+    request_keys.insert(latest_to_key);
   }
 
   if (request_keys.empty()) {
@@ -1389,7 +1495,10 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
   }
 
   try {
+    const auto set_marginalization_graph_start_time = utils::Timer::tic();
     smoother_->setMarginalizationGraph(cbs::BPSAM::MarginalizationType::LOCAL);
+    cbs_set_marginalization_graph_time_sec_per_update_ =
+        elapsedSec(set_marginalization_graph_start_time);
     cbs_marginalization_graph_factor_count_ =
         smoother_->marginalizationGraphFactorCount();
 
@@ -1400,6 +1509,8 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
     cbs_belief_generation_time_sec_per_update_ =
         utils::Timer::toc<std::chrono::duration<double>>(get_beliefs_start)
             .count();
+    cbs_get_odometry_beliefs_time_sec_per_update_ =
+        cbs_belief_generation_time_sec_per_update_;
 
     for (const auto& odom : outgoing) {
       const gtsam::Symbol from_symbol(odom.from_pose_key);
@@ -1437,11 +1548,25 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
                      &stamped_belief.covariance);
       cbs_outgoing_odom_beliefs_.push_back(stamped_belief);
     }
+    if (latest_pair_valid && !cbs_outgoing_odom_beliefs_.empty()) {
+      last_cbs_outgoing_odom_pair_valid_ = true;
+      last_cbs_outgoing_odom_from_key_ = latest_from_key;
+      last_cbs_outgoing_odom_to_key_ = latest_to_key;
+    }
   } catch (const std::exception& e) {
     LOG(WARNING) << "Kimera CBS getOdometryBeliefs failed: " << e.what();
   } catch (...) {
     LOG(WARNING) << "Kimera CBS getOdometryBeliefs failed.";
   }
+  cbs_outgoing_total_time_sec_per_update_ = elapsedSec(cbs_outgoing_start_time);
+  LOG(INFO) << "KIMERA_CBS_OUTGOING_TIMING_ROW,"
+            << cur_id << ","
+            << secToMs(cbs_outgoing_total_time_sec_per_update_) << ","
+            << secToMs(cbs_set_marginalization_graph_time_sec_per_update_) << ","
+            << secToMs(cbs_get_odometry_beliefs_time_sec_per_update_) << ","
+            << cbs_outgoing_odom_beliefs_.size() << ","
+            << cbs_marginalization_graph_factor_count_ << ","
+            << request_keys.size();
 }
 
 void VioBackend::refreshExternalBeliefFactorSlots(
@@ -2359,8 +2484,20 @@ bool VioBackend::optimize(
   external_beliefs_rejected_exception_per_update_ = 0u;
   optimization_time_sec_per_update_ = 0.0;
   cbs_belief_generation_time_sec_per_update_ = 0.0;
+  cbs_outgoing_total_time_sec_per_update_ = 0.0;
+  cbs_set_marginalization_graph_time_sec_per_update_ = 0.0;
+  cbs_get_odometry_beliefs_time_sec_per_update_ = 0.0;
   cbs_marginalization_graph_factor_count_ = 0u;
   cbs_outgoing_odom_beliefs_.clear();
+  double factor_preparation_time_sec = 0.0;
+  double collect_external_beliefs_time_sec = 0.0;
+  double delete_slots_sort_time_sec = 0.0;
+  double smoother_update_time_sec = 0.0;
+  double slot_bookkeeping_time_sec = 0.0;
+  double extra_iterations_time_sec = 0.0;
+  double update_states_time_sec = 0.0;
+  double compute_state_covariance_time_sec = 0.0;
+  double post_debug_time_sec = 0.0;
 
   // Only for statistics and debugging.
   // Store start time to calculate absolute total time taken.
@@ -2500,6 +2637,8 @@ bool VioBackend::optimize(
 
   const size_t num_factors_before_external = new_factors_tmp.size();
   std::vector<ExternalBeliefFactorId> inserted_external_factor_ids;
+  factor_preparation_time_sec = elapsedSec(total_start_time);
+  const auto collect_external_beliefs_start_time = utils::Timer::tic();
   try {
     collectExternalBeliefFactors(
         cur_id, &delete_slots, &new_factors_tmp, &inserted_external_factor_ids);
@@ -2512,12 +2651,16 @@ bool VioBackend::optimize(
                << "for frame " << cur_id << ".";
     throw;
   }
+  collect_external_beliefs_time_sec =
+      elapsedSec(collect_external_beliefs_start_time);
 
   // Avoid repeated deletions of the same slot when replacing beliefs and
   // removing stale factors in the same iteration.
+  const auto delete_slots_sort_start_time = utils::Timer::tic();
   std::sort(delete_slots.begin(), delete_slots.end());
   delete_slots.erase(std::unique(delete_slots.begin(), delete_slots.end()),
                      delete_slots.end());
+  delete_slots_sort_time_sec = elapsedSec(delete_slots_sort_start_time);
 
   //////////////////////////////////////////////////////////////////////////////
 
@@ -2595,6 +2738,7 @@ bool VioBackend::optimize(
   optimization_time_sec_per_update_ +=
       utils::Timer::toc<std::chrono::duration<double>>(optimizer_start_time)
           .count();
+  smoother_update_time_sec = optimization_time_sec_per_update_;
   VLOG(10) << "Finished first update.";
 
   // Store time after iSAM update.
@@ -2606,6 +2750,7 @@ bool VioBackend::optimize(
 
   /////////////////////////// BOOKKEEPING //////////////////////////////////////
   if (is_smoother_ok) {
+    const auto slot_bookkeeping_start_time = utils::Timer::tic();
     pose_belief_local_covariance_valid_ = false;
     pose_belief_covariance_source_ = "unused_bpsam_getBeliefs";
 
@@ -2628,6 +2773,7 @@ bool VioBackend::optimize(
                                &old_smart_factors_);
     refreshExternalBeliefFactorSlots(num_factors_before_external,
                                      inserted_external_factor_ids);
+    slot_bookkeeping_time_sec = elapsedSec(slot_bookkeeping_start_time);
     VLOG(10) << "Finished to find smart factors slots.";
 
     if (VLOG_IS_ON(5) || log_output_) {
@@ -2639,6 +2785,7 @@ bool VioBackend::optimize(
     ////////////////////////////////////////////////////////////////////////////
 
     // Do some more optimization iterations.
+    const auto extra_iterations_start_time = utils::Timer::tic();
     for (size_t n_iter = 1; n_iter < max_extra_iterations && is_smoother_ok;
          ++n_iter) {
       VLOG(10) << "Doing extra iteration nr: " << n_iter;
@@ -2660,6 +2807,8 @@ bool VioBackend::optimize(
               extra_iteration_start_time)
               .count();
     }
+    extra_iterations_time_sec = elapsedSec(extra_iterations_start_time);
+    smoother_update_time_sec = optimization_time_sec_per_update_;
 
     if (VLOG_IS_ON(5) || log_output_) {
       debug_info_.extraIterationsTime_ =
@@ -2669,6 +2818,7 @@ bool VioBackend::optimize(
 
     // Update states we need for next iteration, if smoother is ok.
     if (is_smoother_ok) {
+      const auto update_states_start_time = utils::Timer::tic();
       try {
         updateStates(cur_id);
       } catch (const std::exception& e) {
@@ -2680,6 +2830,7 @@ bool VioBackend::optimize(
                    << cur_id << ".";
         throw;
       }
+      update_states_time_sec = elapsedSec(update_states_start_time);
 
       try {
         refreshCbsOutgoingBeliefs(cur_id);
@@ -2697,18 +2848,42 @@ bool VioBackend::optimize(
 
       // TODO: Add Update latest covariance --> move flag
       if (FLAGS_compute_state_covariance) {
+        const auto compute_state_covariance_start_time = utils::Timer::tic();
         computeStateCovariance();
+        compute_state_covariance_time_sec =
+            elapsedSec(compute_state_covariance_start_time);
       }
       if (FLAGS_cbs_log_covariance_sanity_diff) {
         logPoseBeliefCovarianceSanityDiff(cur_id);
       }
 
       // Debug.
+      const auto post_debug_start_time = utils::Timer::tic();
       postDebug(total_start_time, start_time);
+      post_debug_time_sec = elapsedSec(post_debug_start_time);
     } else {
       LOG(ERROR) << "Smoother is not ok! Not updating Backend state.";
     }
   }
+  const double optimize_total_time_sec = elapsedSec(total_start_time);
+  LOG(INFO) << "KIMERA_OPTIMIZE_TIMING_ROW,"
+            << cur_id << ","
+            << secToMs(optimize_total_time_sec) << ","
+            << secToMs(factor_preparation_time_sec) << ","
+            << secToMs(collect_external_beliefs_time_sec) << ","
+            << secToMs(delete_slots_sort_time_sec) << ","
+            << secToMs(smoother_update_time_sec) << ","
+            << secToMs(slot_bookkeeping_time_sec) << ","
+            << secToMs(extra_iterations_time_sec) << ","
+            << secToMs(update_states_time_sec) << ","
+            << secToMs(cbs_outgoing_total_time_sec_per_update_) << ","
+            << secToMs(cbs_set_marginalization_graph_time_sec_per_update_) << ","
+            << secToMs(cbs_get_odometry_beliefs_time_sec_per_update_) << ","
+            << secToMs(compute_state_covariance_time_sec) << ","
+            << secToMs(post_debug_time_sec) << ","
+            << cbs_outgoing_odom_beliefs_.size() << ","
+            << cbs_marginalization_graph_factor_count_ << ","
+            << (is_smoother_ok ? 1 : 0);
   return is_smoother_ok;
 }
 

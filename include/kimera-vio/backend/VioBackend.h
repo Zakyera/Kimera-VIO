@@ -618,8 +618,15 @@ class VioBackend {
   size_t external_beliefs_rejected_exception_per_update_ = 0u;
   double optimization_time_sec_per_update_ = 0.0;
   double cbs_belief_generation_time_sec_per_update_ = 0.0;
+  double cbs_outgoing_total_time_sec_per_update_ = 0.0;
+  double cbs_set_marginalization_graph_time_sec_per_update_ = 0.0;
+  double cbs_get_odometry_beliefs_time_sec_per_update_ = 0.0;
   size_t cbs_marginalization_graph_factor_count_ = 0u;
   std::vector<ExternalOdometryBelief> cbs_outgoing_odom_beliefs_;
+  std::string cbs_odom_sender_mode_ = "adjacent_window";
+  bool last_cbs_outgoing_odom_pair_valid_ = false;
+  gtsam::Key last_cbs_outgoing_odom_from_key_ = 0u;
+  gtsam::Key last_cbs_outgoing_odom_to_key_ = 0u;
 
   // Vision params.
   gtsam::SmartStereoProjectionParams smart_factors_params_;
