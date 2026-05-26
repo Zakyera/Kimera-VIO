@@ -95,6 +95,11 @@ DEFINE_bool(cbs_use_persistent_bpsam_for_main_backend,
 DEFINE_bool(cbs_log_covariance_sanity_diff,
             false,
             "Log debug-only local-vs-fused pose covariance sanity metrics.");
+DEFINE_bool(cbs_backend_enable,
+            true,
+            "Enable Kimera backend CBS computation paths. When false, skip "
+            "incoming external belief factor collection, outgoing belief "
+            "generation, and CBS covariance debug work.");
 DEFINE_bool(cbs_use_temporary_cbs_linear_factors,
             true,
             "Linearize accepted CBS odometry factors inside the current "
@@ -549,6 +554,8 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << external_odom_unmatched_retry_max_age_sec_
             << " retry_max_beliefs="
             << max_unmatched_external_odom_retry_beliefs_;
+  LOG(INFO) << "CBS backend computation paths: "
+            << (FLAGS_cbs_backend_enable ? "enabled" : "disabled");
   LOG(INFO) << "CBS external belief soft reset: "
             << (FLAGS_cbs_enable_soft_reset ? "enabled" : "disabled");
   LOG(INFO) << "CBS reject first message: "
@@ -557,7 +564,9 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << (FLAGS_cbs_use_temporary_cbs_linear_factors ? "enabled"
                                                            : "disabled");
 
-  initializePoseBeliefCovarianceSidecarAdapter();
+  if (FLAGS_cbs_backend_enable) {
+    initializePoseBeliefCovarianceSidecarAdapter();
+  }
 
   // Set parameters for all factors.
   setFactorsParams(backend_params,
@@ -2638,21 +2647,27 @@ bool VioBackend::optimize(
   const size_t num_factors_before_external = new_factors_tmp.size();
   std::vector<ExternalBeliefFactorId> inserted_external_factor_ids;
   factor_preparation_time_sec = elapsedSec(total_start_time);
-  const auto collect_external_beliefs_start_time = utils::Timer::tic();
-  try {
-    collectExternalBeliefFactors(
-        cur_id, &delete_slots, &new_factors_tmp, &inserted_external_factor_ids);
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "VioBackend::optimize failed in collectExternalBeliefFactors "
-               << "for frame " << cur_id << ": " << e.what();
-    throw;
-  } catch (...) {
-    LOG(ERROR) << "VioBackend::optimize failed in collectExternalBeliefFactors "
-               << "for frame " << cur_id << ".";
-    throw;
+  if (FLAGS_cbs_backend_enable) {
+    const auto collect_external_beliefs_start_time = utils::Timer::tic();
+    try {
+      collectExternalBeliefFactors(cur_id,
+                                   &delete_slots,
+                                   &new_factors_tmp,
+                                   &inserted_external_factor_ids);
+    } catch (const std::exception& e) {
+      LOG(ERROR)
+          << "VioBackend::optimize failed in collectExternalBeliefFactors "
+          << "for frame " << cur_id << ": " << e.what();
+      throw;
+    } catch (...) {
+      LOG(ERROR)
+          << "VioBackend::optimize failed in collectExternalBeliefFactors "
+          << "for frame " << cur_id << ".";
+      throw;
+    }
+    collect_external_beliefs_time_sec =
+        elapsedSec(collect_external_beliefs_start_time);
   }
-  collect_external_beliefs_time_sec =
-      elapsedSec(collect_external_beliefs_start_time);
 
   // Avoid repeated deletions of the same slot when replacing beliefs and
   // removing stale factors in the same iteration.
@@ -2832,18 +2847,20 @@ bool VioBackend::optimize(
       }
       update_states_time_sec = elapsedSec(update_states_start_time);
 
-      try {
-        refreshCbsOutgoingBeliefs(cur_id);
-      } catch (const std::exception& e) {
-        LOG(ERROR)
-            << "VioBackend::optimize failed in refreshCbsOutgoingBeliefs "
-            << "for frame " << cur_id << ": " << e.what();
-        throw;
-      } catch (...) {
-        LOG(ERROR)
-            << "VioBackend::optimize failed in refreshCbsOutgoingBeliefs "
-            << "for frame " << cur_id << ".";
-        throw;
+      if (FLAGS_cbs_backend_enable) {
+        try {
+          refreshCbsOutgoingBeliefs(cur_id);
+        } catch (const std::exception& e) {
+          LOG(ERROR)
+              << "VioBackend::optimize failed in refreshCbsOutgoingBeliefs "
+              << "for frame " << cur_id << ": " << e.what();
+          throw;
+        } catch (...) {
+          LOG(ERROR)
+              << "VioBackend::optimize failed in refreshCbsOutgoingBeliefs "
+              << "for frame " << cur_id << ".";
+          throw;
+        }
       }
 
       // TODO: Add Update latest covariance --> move flag
@@ -2853,7 +2870,7 @@ bool VioBackend::optimize(
         compute_state_covariance_time_sec =
             elapsedSec(compute_state_covariance_start_time);
       }
-      if (FLAGS_cbs_log_covariance_sanity_diff) {
+      if (FLAGS_cbs_backend_enable && FLAGS_cbs_log_covariance_sanity_diff) {
         logPoseBeliefCovarianceSanityDiff(cur_id);
       }
 
