@@ -157,7 +157,37 @@ DEFINE_int32(cbs_odom_unmatched_retry_max_beliefs,
 DEFINE_string(cbs_odom_sender_mode,
               "adjacent_window",
               "Sender-side CBS odometry mode: adjacent_window, latest_edge, "
-              "or new_edge_once.");
+              "new_edge_once, or time_horizon_window.");
+DEFINE_string(cbs_odom_requesting_agent_id,
+              "l",
+              "Peer agent id used to label outgoing CBS odometry belief "
+              "diagnostics.");
+DEFINE_bool(cbs_external_odom_duration_gate_enable,
+            false,
+            "Reject incoming CBS odometry beliefs when the sender edge duration "
+            "does not match the matched receiver edge duration.");
+DEFINE_double(cbs_external_odom_duration_tolerance_sec,
+              0.06,
+              "Absolute sender/receiver edge duration tolerance in seconds.");
+DEFINE_double(cbs_external_odom_duration_ratio_min,
+              0.5,
+              "Minimum sender_dt / receiver_dt ratio for CBS odometry duration "
+              "gating. Set <= 0 to disable the lower ratio bound.");
+DEFINE_double(cbs_external_odom_duration_ratio_max,
+              2.0,
+              "Maximum sender_dt / receiver_dt ratio for CBS odometry duration "
+              "gating. Set <= 0 to disable the upper ratio bound.");
+DEFINE_double(cbs_odom_horizon_sec,
+              0.20,
+              "Target sender edge duration for CBS time_horizon_window mode.");
+DEFINE_double(cbs_odom_horizon_tolerance_sec,
+              0.06,
+              "Allowed absolute duration error for selecting CBS "
+              "time_horizon_window sender edges.");
+DEFINE_int32(cbs_odom_max_horizon_pairs_per_update,
+             25,
+             "Maximum number of CBS time_horizon_window sender edges generated "
+             "per backend update.");
 DEFINE_bool(no_incremental_pose,
             false,
             "Flag to disable incremental pose usage in backend");
@@ -203,12 +233,21 @@ inline std::string normalizeCbsOdomSenderMode(std::string mode) {
   if (mode == "latest" || mode == "latest_only") {
     return "latest_edge";
   }
+  if (mode == "time_horizon" || mode == "horizon_window") {
+    return "time_horizon_window";
+  }
   return mode;
 }
 
 inline bool isValidCbsOdomSenderMode(const std::string& mode) {
   return mode == "adjacent_window" || mode == "latest_edge" ||
-         mode == "new_edge_once";
+         mode == "new_edge_once" || mode == "time_horizon_window";
+}
+
+inline uint8_t parseCbsAgentId(const std::string& agent_id,
+                               const uint8_t fallback) {
+  return agent_id.empty() ? fallback
+                          : static_cast<uint8_t>(agent_id.front());
 }
 
 inline std::string formatPoseKeyToken(const uint8_t source_agent,
@@ -237,6 +276,8 @@ inline const char* externalBeliefRejectReasonToken(const int reason) {
       return "missing_state";
     case 4:
       return "covariance";
+    case 5:
+      return "duration";
   }
   return "unknown";
 }
@@ -495,6 +536,9 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
     bpsam_params.external_factor_covariance_scale_by_source
         [static_cast<cbs::AgentId>('l')] =
             FLAGS_cbs_l2k_odom_factor_covariance_scale;
+    bpsam_params.external_factor_covariance_scale_by_source
+        [static_cast<cbs::AgentId>('g')] =
+            FLAGS_cbs_l2k_odom_factor_covariance_scale;
   }
 
   smoother_ =
@@ -549,7 +593,55 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
                  << ", falling back to adjacent_window.";
     cbs_odom_sender_mode_ = "adjacent_window";
   }
+  cbs_odom_requesting_agent_id_ =
+      parseCbsAgentId(FLAGS_cbs_odom_requesting_agent_id,
+                      cbs_odom_requesting_agent_id_);
+  external_odom_duration_gate_enable_ =
+      FLAGS_cbs_external_odom_duration_gate_enable;
+  if (std::isfinite(FLAGS_cbs_external_odom_duration_tolerance_sec) &&
+      FLAGS_cbs_external_odom_duration_tolerance_sec >= 0.0) {
+    external_odom_duration_tolerance_sec_ =
+        FLAGS_cbs_external_odom_duration_tolerance_sec;
+  }
+  if (std::isfinite(FLAGS_cbs_external_odom_duration_ratio_min) &&
+      FLAGS_cbs_external_odom_duration_ratio_min >= 0.0) {
+    external_odom_duration_ratio_min_ =
+        FLAGS_cbs_external_odom_duration_ratio_min;
+  }
+  if (std::isfinite(FLAGS_cbs_external_odom_duration_ratio_max) &&
+      FLAGS_cbs_external_odom_duration_ratio_max >= 0.0) {
+    external_odom_duration_ratio_max_ =
+        FLAGS_cbs_external_odom_duration_ratio_max;
+  }
+  if (external_odom_duration_ratio_min_ > 0.0 &&
+      external_odom_duration_ratio_max_ > 0.0 &&
+      external_odom_duration_ratio_min_ > external_odom_duration_ratio_max_) {
+    std::swap(external_odom_duration_ratio_min_,
+              external_odom_duration_ratio_max_);
+  }
+  if (std::isfinite(FLAGS_cbs_odom_horizon_sec) &&
+      FLAGS_cbs_odom_horizon_sec > 0.0) {
+    cbs_odom_horizon_sec_ = FLAGS_cbs_odom_horizon_sec;
+  }
+  if (std::isfinite(FLAGS_cbs_odom_horizon_tolerance_sec) &&
+      FLAGS_cbs_odom_horizon_tolerance_sec >= 0.0) {
+    cbs_odom_horizon_tolerance_sec_ = FLAGS_cbs_odom_horizon_tolerance_sec;
+  }
+  cbs_odom_max_horizon_pairs_per_update_ = static_cast<size_t>(
+      std::max(0, FLAGS_cbs_odom_max_horizon_pairs_per_update));
   LOG(INFO) << "CBS outgoing odometry mode: " << cbs_odom_sender_mode_
+            << " requesting_agent="
+            << static_cast<char>(cbs_odom_requesting_agent_id_)
+            << " horizon=" << cbs_odom_horizon_sec_
+            << "+/-" << cbs_odom_horizon_tolerance_sec_
+            << " max_horizon_pairs="
+            << cbs_odom_max_horizon_pairs_per_update_
+            << " duration_gate="
+            << (external_odom_duration_gate_enable_ ? "enabled" : "disabled")
+            << " duration_tol=" << external_odom_duration_tolerance_sec_
+            << " duration_ratio=["
+            << external_odom_duration_ratio_min_ << ","
+            << external_odom_duration_ratio_max_ << "]"
             << " retry_max_age="
             << external_odom_unmatched_retry_max_age_sec_
             << " retry_max_beliefs="
@@ -1080,8 +1172,12 @@ bool VioBackend::shouldRetryExternalOdometryBelief(
   const bool keep = max_unmatched_external_odom_retry_beliefs_ > 0u &&
                     (!std::isfinite(age_sec) ||
                      age_sec <= external_odom_unmatched_retry_max_age_sec_);
+  const char source_char = static_cast<char>(std::toupper(
+      static_cast<unsigned char>(belief.source_agent)));
+  const std::string row_marker =
+      std::string("CBS_ODOM_RETRY_ROW_") + source_char + "2K";
   LOG(INFO) << std::fixed << std::setprecision(9)
-            << "CBS_ODOM_RETRY_ROW_L2K,"
+            << row_marker << ","
             << formatPoseKeyToken(belief.source_agent,
                                   belief.sender_from_pose_index)
             << "->"
@@ -1126,6 +1222,7 @@ void VioBackend::collectExternalBeliefFactors(
   size_t rejected_timestamp = 0u;
   size_t rejected_missing_state = 0u;
   size_t rejected_covariance = 0u;
+  size_t rejected_duration = 0u;
   size_t rejected_by_bpsam = 0u;
   size_t rejected_bpsam_first_message = 0u;
   size_t rejected_bpsam_update_status = 0u;
@@ -1155,8 +1252,22 @@ void VioBackend::collectExternalBeliefFactors(
             has_to_candidate
                 ? formatPoseKeyToken(static_cast<uint8_t>('k'), to_best_frame_id)
                 : std::string("na");
+        const double sender_dt = belief.to_stamp_sec - belief.from_stamp_sec;
+        const double receiver_dt =
+            (has_from_candidate && has_to_candidate)
+                ? to_best_stamp_sec - from_best_stamp_sec
+                : std::numeric_limits<double>::quiet_NaN();
+        const double duration_error =
+            std::abs(sender_dt - receiver_dt);
+        const double duration_ratio =
+            receiver_dt > 0.0 ? sender_dt / receiver_dt
+                              : std::numeric_limits<double>::quiet_NaN();
+        const char source_char = static_cast<char>(std::toupper(
+            static_cast<unsigned char>(belief.source_agent)));
+        const std::string row_marker =
+            std::string("CBS_ODOM_MATCH_ROW_") + source_char + "2K";
         LOG(INFO) << std::fixed << std::setprecision(9)
-                  << "CBS_ODOM_MATCH_ROW_L2K,"
+                  << row_marker << ","
                   << formatPoseKeyToken(belief.source_agent,
                                         belief.sender_from_pose_index)
                   << "->"
@@ -1173,7 +1284,9 @@ void VioBackend::collectExternalBeliefFactors(
                   << externalBeliefRejectReasonToken(
                          static_cast<int>(to_reject_reason))
                   << ","
-                  << sanitizeLogToken(decision);
+                  << sanitizeLogToken(decision) << "," << sender_dt << ","
+                  << receiver_dt << "," << duration_error << ","
+                  << duration_ratio;
       };
 
   for (const auto& belief : pending_odom_beliefs) {
@@ -1250,6 +1363,69 @@ void VioBackend::collectExternalBeliefFactors(
         gtsam::Symbol(kPoseSymbolChar, from_frame_id);
     const gtsam::Key to_pose_key =
         gtsam::Symbol(kPoseSymbolChar, to_frame_id);
+    const double sender_dt = belief.to_stamp_sec - belief.from_stamp_sec;
+    const double receiver_dt = to_best_stamp_sec - from_best_stamp_sec;
+    const double duration_error = std::abs(sender_dt - receiver_dt);
+    const double duration_ratio =
+        receiver_dt > 0.0 ? sender_dt / receiver_dt
+                          : std::numeric_limits<double>::quiet_NaN();
+    if (from_frame_id == to_frame_id) {
+      if (shouldRetryExternalOdometryBelief(belief, cur_id, "same_local_key")) {
+        ++retried_unmatched;
+        retry_beliefs.push_back(belief);
+        log_match_decision(belief,
+                           from_best_frame_id,
+                           from_best_stamp_sec,
+                           from_best_abs_dt,
+                           ExternalBeliefRejectReason::kDuration,
+                           to_best_frame_id,
+                           to_best_stamp_sec,
+                           to_best_abs_dt,
+                           ExternalBeliefRejectReason::kDuration,
+                           "retry_same_local_key");
+      } else {
+        ++dropped_unmatched;
+        ++rejected_duration;
+        log_match_decision(belief,
+                           from_best_frame_id,
+                           from_best_stamp_sec,
+                           from_best_abs_dt,
+                           ExternalBeliefRejectReason::kDuration,
+                           to_best_frame_id,
+                           to_best_stamp_sec,
+                           to_best_abs_dt,
+                           ExternalBeliefRejectReason::kDuration,
+                           "dropped_same_local_key");
+      }
+      continue;
+    }
+    bool duration_ok = true;
+    if (external_odom_duration_gate_enable_) {
+      duration_ok = std::isfinite(sender_dt) && std::isfinite(receiver_dt) &&
+                    sender_dt > 0.0 && receiver_dt > 0.0 &&
+                    duration_error <= external_odom_duration_tolerance_sec_;
+      if (duration_ok && external_odom_duration_ratio_min_ > 0.0) {
+        duration_ok = duration_ratio >= external_odom_duration_ratio_min_;
+      }
+      if (duration_ok && external_odom_duration_ratio_max_ > 0.0) {
+        duration_ok = duration_ratio <= external_odom_duration_ratio_max_;
+      }
+    }
+    if (!duration_ok) {
+      ++dropped_unmatched;
+      ++rejected_duration;
+      log_match_decision(belief,
+                         from_best_frame_id,
+                         from_best_stamp_sec,
+                         from_best_abs_dt,
+                         ExternalBeliefRejectReason::kDuration,
+                         to_best_frame_id,
+                         to_best_stamp_sec,
+                         to_best_abs_dt,
+                         ExternalBeliefRejectReason::kDuration,
+                         "dropped_duration_mismatch");
+      continue;
+    }
 
     cbs::BPSAM::CbsOdometryBelief odom_belief;
     odom_belief.source_agent = static_cast<cbs::AgentId>(belief.source_agent);
@@ -1322,7 +1498,11 @@ void VioBackend::collectExternalBeliefFactors(
                            to_best_abs_dt,
                            to_reject_reason,
                            detail.message);
-        LOG(INFO) << "CBS_BPSAM_ODOM_ADD_ROW_L2K,"
+        const char source_char = static_cast<char>(std::toupper(
+            static_cast<unsigned char>(belief.source_agent)));
+        const std::string add_row_marker =
+            std::string("CBS_BPSAM_ODOM_ADD_ROW_") + source_char + "2K";
+        LOG(INFO) << add_row_marker << ","
                   << formatPoseKeyToken(belief.source_agent,
                                         belief.sender_from_pose_index)
                   << "->"
@@ -1406,6 +1586,8 @@ void VioBackend::collectExternalBeliefFactors(
       rejected_missing_state, std::memory_order_relaxed);
   external_beliefs_rejected_covariance_total_.fetch_add(
       rejected_covariance, std::memory_order_relaxed);
+  external_beliefs_rejected_duration_total_.fetch_add(
+      rejected_duration, std::memory_order_relaxed);
   external_beliefs_rejected_first_message_total_.fetch_add(
       rejected_bpsam_first_message, std::memory_order_relaxed);
   external_beliefs_rejected_update_status_total_.fetch_add(
@@ -1432,6 +1614,7 @@ void VioBackend::collectExternalBeliefFactors(
             << ",timestamp=" << rejected_timestamp
             << ",state=" << rejected_missing_state
             << ",covariance=" << rejected_covariance
+            << ",duration=" << rejected_duration
             << ",bpsam=" << rejected_by_bpsam
             << ",bpsam_first_message=" << rejected_bpsam_first_message
             << ",bpsam_update_status=" << rejected_bpsam_update_status
@@ -1481,6 +1664,7 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
   bool latest_pair_valid = false;
   gtsam::Key latest_from_key = 0u;
   gtsam::Key latest_to_key = 0u;
+  std::vector<std::pair<gtsam::Key, gtsam::Key>> explicit_pairs;
   if (cbs_odom_sender_mode_ == "latest_edge" ||
       cbs_odom_sender_mode_ == "new_edge_once") {
     if (timestamped_pose_keys.size() < 2u) {
@@ -1497,9 +1681,44 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
     }
     request_keys.insert(latest_from_key);
     request_keys.insert(latest_to_key);
+  } else if (cbs_odom_sender_mode_ == "time_horizon_window") {
+    if (timestamped_pose_keys.size() < 2u ||
+        cbs_odom_max_horizon_pairs_per_update_ == 0u) {
+      return;
+    }
+    for (size_t to_i = 1u; to_i < timestamped_pose_keys.size(); ++to_i) {
+      const double to_stamp =
+          keyframe_timestamp_sec_.at(timestamped_pose_keys[to_i].first);
+      size_t best_from_i = timestamped_pose_keys.size();
+      double best_error = std::numeric_limits<double>::infinity();
+      for (size_t from_i = 0u; from_i < to_i; ++from_i) {
+        const double from_stamp =
+            keyframe_timestamp_sec_.at(timestamped_pose_keys[from_i].first);
+        const double dt = to_stamp - from_stamp;
+        if (!std::isfinite(dt) || dt <= 0.0) {
+          continue;
+        }
+        const double error = std::abs(dt - cbs_odom_horizon_sec_);
+        if (error < best_error) {
+          best_error = error;
+          best_from_i = from_i;
+        }
+      }
+      if (best_from_i != timestamped_pose_keys.size() &&
+          best_error <= cbs_odom_horizon_tolerance_sec_) {
+        explicit_pairs.emplace_back(timestamped_pose_keys[best_from_i].second,
+                                    timestamped_pose_keys[to_i].second);
+      }
+    }
+    if (explicit_pairs.size() > cbs_odom_max_horizon_pairs_per_update_) {
+      const size_t drop_count =
+          explicit_pairs.size() - cbs_odom_max_horizon_pairs_per_update_;
+      explicit_pairs.erase(explicit_pairs.begin(),
+                           explicit_pairs.begin() + drop_count);
+    }
   }
 
-  if (request_keys.empty()) {
+  if (request_keys.empty() && explicit_pairs.empty()) {
     return;
   }
 
@@ -1512,9 +1731,26 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
         smoother_->marginalizationGraphFactorCount();
 
     const auto get_beliefs_start = utils::Timer::tic();
-    const auto outgoing =
-        smoother_->getOdometryBeliefs(request_keys,
-                                      static_cast<cbs::AgentId>('l'));
+    std::vector<cbs::BPSAM::CbsOdometryBelief> outgoing;
+    if (!explicit_pairs.empty()) {
+      for (const auto& pair : explicit_pairs) {
+        gtsam::KeySet pair_keys;
+        pair_keys.insert(pair.first);
+        pair_keys.insert(pair.second);
+        const auto pair_outgoing =
+            smoother_->getOdometryBeliefs(pair_keys,
+                                          static_cast<cbs::AgentId>(
+                                              cbs_odom_requesting_agent_id_));
+        outgoing.insert(outgoing.end(),
+                        pair_outgoing.begin(),
+                        pair_outgoing.end());
+      }
+    } else {
+      outgoing =
+          smoother_->getOdometryBeliefs(request_keys,
+                                        static_cast<cbs::AgentId>(
+                                            cbs_odom_requesting_agent_id_));
+    }
     cbs_belief_generation_time_sec_per_update_ =
         utils::Timer::toc<std::chrono::duration<double>>(get_beliefs_start)
             .count();
@@ -1575,7 +1811,8 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
             << secToMs(cbs_get_odometry_beliefs_time_sec_per_update_) << ","
             << cbs_outgoing_odom_beliefs_.size() << ","
             << cbs_marginalization_graph_factor_count_ << ","
-            << request_keys.size();
+            << (explicit_pairs.empty() ? request_keys.size()
+                                       : explicit_pairs.size() * 2u);
 }
 
 void VioBackend::refreshExternalBeliefFactorSlots(

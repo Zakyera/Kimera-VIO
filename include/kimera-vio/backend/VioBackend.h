@@ -453,6 +453,7 @@ class VioBackend {
     kTimestamp = 2,
     kMissingState = 3,
     kCovariance = 4,
+    kDuration = 5,
   };
 
   void updateKeyframeTimestampIndex(const FrameId& frame_id,
@@ -624,6 +625,14 @@ class VioBackend {
   size_t cbs_marginalization_graph_factor_count_ = 0u;
   std::vector<ExternalOdometryBelief> cbs_outgoing_odom_beliefs_;
   std::string cbs_odom_sender_mode_ = "adjacent_window";
+  uint8_t cbs_odom_requesting_agent_id_ = static_cast<uint8_t>('l');
+  bool external_odom_duration_gate_enable_ = false;
+  double external_odom_duration_tolerance_sec_ = 0.06;
+  double external_odom_duration_ratio_min_ = 0.5;
+  double external_odom_duration_ratio_max_ = 2.0;
+  double cbs_odom_horizon_sec_ = 0.20;
+  double cbs_odom_horizon_tolerance_sec_ = 0.06;
+  size_t cbs_odom_max_horizon_pairs_per_update_ = 25u;
   bool last_cbs_outgoing_odom_pair_valid_ = false;
   gtsam::Key last_cbs_outgoing_odom_from_key_ = 0u;
   gtsam::Key last_cbs_outgoing_odom_to_key_ = 0u;
@@ -718,6 +727,7 @@ class VioBackend {
   std::atomic<size_t> external_beliefs_rejected_timestamp_total_{0u};
   std::atomic<size_t> external_beliefs_rejected_missing_state_total_{0u};
   std::atomic<size_t> external_beliefs_rejected_covariance_total_{0u};
+  std::atomic<size_t> external_beliefs_rejected_duration_total_{0u};
   std::atomic<size_t> external_beliefs_rejected_first_message_total_{0u};
   std::atomic<size_t> external_beliefs_rejected_update_status_total_{0u};
   std::atomic<size_t> external_beliefs_rejected_inactive_window_total_{0u};
