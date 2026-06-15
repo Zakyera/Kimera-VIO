@@ -55,6 +55,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <cbs/utils/health_aware_relative_cbs.h>
+
 #include "kimera-vio/backend/VioBackend-definitions.h"
 #include "kimera-vio/backend/VioBackendParams.h"
 #include "kimera-vio/factors/PointPlaneFactor.h"
@@ -636,6 +638,8 @@ class VioBackend {
   bool last_cbs_outgoing_odom_pair_valid_ = false;
   gtsam::Key last_cbs_outgoing_odom_from_key_ = 0u;
   gtsam::Key last_cbs_outgoing_odom_to_key_ = 0u;
+  cbs::health_aware::Params cbs_health_params_;
+  cbs::health_aware::SenderHealthState cbs_sender_health_state_;
 
   // Vision params.
   gtsam::SmartStereoProjectionParams smart_factors_params_;

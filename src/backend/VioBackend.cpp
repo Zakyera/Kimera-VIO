@@ -33,6 +33,7 @@
 #include <cbs/gbp/contraction/hellinger.h>
 #include <cbs/key.h>
 #include <cbs/utils/gtsam_compat.h>
+#include <cbs/utils/health_aware_relative_cbs.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -44,6 +45,7 @@
 #include <iomanip>
 #include <limits>  // for numeric_limits<>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -188,6 +190,67 @@ DEFINE_int32(cbs_odom_max_horizon_pairs_per_update,
              25,
              "Maximum number of CBS time_horizon_window sender edges generated "
              "per backend update.");
+DEFINE_bool(cbs_health_aware_enable,
+            false,
+            "Enable health-aware relative CBS covariance scaling.");
+DEFINE_bool(cbs_health_sender_enable,
+            true,
+            "Enable sender-side CBS covariance scaling from local absolute "
+            "pose covariance health.");
+DEFINE_bool(cbs_health_receiver_nis_enable,
+            true,
+            "Enable receiver-side CBS NIS covariance inflation.");
+DEFINE_double(cbs_health_alpha_min,
+              1.0,
+              "Minimum health-aware sender covariance multiplier.");
+DEFINE_double(cbs_health_alpha_max,
+              10.0,
+              "Maximum health-aware sender covariance multiplier.");
+DEFINE_double(cbs_health_alpha_cons_max,
+              100.0,
+              "Maximum receiver-side NIS covariance multiplier.");
+DEFINE_double(cbs_health_chi2_threshold,
+              16.81,
+              "Chi-square threshold for 6D receiver-side CBS NIS gating.");
+DEFINE_double(cbs_health_beta_receiver_cov,
+              1.0,
+              "Receiver relative covariance multiplier in CBS NIS S matrix.");
+DEFINE_double(cbs_health_w_logdet,
+              1.0,
+              "Weight for normalized absolute covariance log-det health.");
+DEFINE_double(cbs_health_w_lambda,
+              0.0,
+              "Weight for normalized absolute covariance maximum eigenvalue "
+              "health.");
+DEFINE_double(cbs_health_w_growth,
+              1.0,
+              "Weight for positive normalized absolute covariance log-det "
+              "growth.");
+DEFINE_double(cbs_health_kappa,
+              1.0,
+              "Exponential gain for sender health covariance scaling.");
+DEFINE_int32(cbs_health_warmup_samples,
+             20,
+             "Number of sender absolute covariance samples used to initialize "
+             "the health baseline.");
+DEFINE_double(cbs_health_rot_sigma0_rad,
+              0.05235987755982989,
+              "Nominal healthy rotation sigma used to normalize absolute "
+              "pose covariance.");
+DEFINE_double(cbs_health_trans_sigma0_m,
+              0.10,
+              "Nominal healthy translation sigma used to normalize absolute "
+              "pose covariance.");
+DEFINE_double(cbs_health_floor_rot_sigma_rad,
+              0.017453292519943295,
+              "Rotation sigma floor added to health-aware outgoing covariance.");
+DEFINE_double(cbs_health_floor_trans_sigma_m,
+              0.03,
+              "Translation sigma floor added to health-aware outgoing "
+              "covariance.");
+DEFINE_double(cbs_health_eps,
+              1e-9,
+              "Numerical epsilon for health-aware covariance calculations.");
 DEFINE_bool(no_incremental_pose,
             false,
             "Flag to disable incremental pose usage in backend");
@@ -262,6 +325,58 @@ inline std::string sanitizeLogToken(std::string token) {
   std::replace(token.begin(), token.end(), '\n', '_');
   std::replace(token.begin(), token.end(), '\r', '_');
   return token.empty() ? "na" : token;
+}
+
+inline std::string cbsAgentToken(const uint8_t agent_id) {
+  if (std::isprint(agent_id)) {
+    return std::string(1, static_cast<char>(agent_id));
+  }
+  return std::to_string(static_cast<int>(agent_id));
+}
+
+inline std::string cbsDirectionToken(const uint8_t sender_agent,
+                                     const uint8_t receiver_agent) {
+  std::string sender = cbsAgentToken(sender_agent);
+  std::string receiver = cbsAgentToken(receiver_agent);
+  std::transform(sender.begin(), sender.end(), sender.begin(), ::toupper);
+  std::transform(receiver.begin(), receiver.end(), receiver.begin(), ::toupper);
+  return sender + "2" + receiver;
+}
+
+inline std::string poseKeyToken(const gtsam::Key key) {
+  try {
+    const gtsam::Symbol symbol(key);
+    if (std::isprint(symbol.chr())) {
+      return std::string(1, symbol.chr()) + std::to_string(symbol.index());
+    }
+  } catch (...) {
+  }
+  return std::to_string(key);
+}
+
+void logHealthAwareSenderRow(
+    const uint8_t sender_agent,
+    const uint8_t receiver_agent,
+    const gtsam::Key from_pose_key,
+    const gtsam::Key to_pose_key,
+    const cbs::health_aware::SenderHealthResult& result) {
+  LOG(INFO) << "CBS_HEALTH_AWARE_SENDER_ROW,"
+            << cbsDirectionToken(sender_agent, receiver_agent) << ","
+            << sanitizeLogToken(cbsAgentToken(sender_agent)) << ","
+            << sanitizeLogToken(cbsAgentToken(receiver_agent)) << ","
+            << sanitizeLogToken(poseKeyToken(from_pose_key)) << ","
+            << sanitizeLogToken(poseKeyToken(to_pose_key)) << ","
+            << (result.enabled ? 1 : 0) << ","
+            << sanitizeLogToken(result.status) << ","
+            << result.raw_rel_trace << ","
+            << result.abs_trace << ","
+            << result.u << ","
+            << result.u0 << ","
+            << result.g_det << ","
+            << result.g_tr << ","
+            << result.alpha_health << ","
+            << result.floor_covariance.trace() << ","
+            << result.final_trace;
 }
 
 inline const char* externalBeliefRejectReasonToken(const int reason) {
@@ -540,6 +655,30 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
         [static_cast<cbs::AgentId>('g')] =
             FLAGS_cbs_l2k_odom_factor_covariance_scale;
   }
+  cbs_health_params_.enable = FLAGS_cbs_health_aware_enable;
+  cbs_health_params_.sender_enable = FLAGS_cbs_health_sender_enable;
+  cbs_health_params_.receiver_nis_enable = FLAGS_cbs_health_receiver_nis_enable;
+  cbs_health_params_.alpha_min = FLAGS_cbs_health_alpha_min;
+  cbs_health_params_.alpha_max = FLAGS_cbs_health_alpha_max;
+  if (cbs_health_params_.alpha_max < cbs_health_params_.alpha_min) {
+    std::swap(cbs_health_params_.alpha_min, cbs_health_params_.alpha_max);
+  }
+  cbs_health_params_.alpha_cons_max = FLAGS_cbs_health_alpha_cons_max;
+  cbs_health_params_.chi2_threshold = FLAGS_cbs_health_chi2_threshold;
+  cbs_health_params_.beta_receiver_cov = FLAGS_cbs_health_beta_receiver_cov;
+  cbs_health_params_.w_logdet = FLAGS_cbs_health_w_logdet;
+  cbs_health_params_.w_lambda = FLAGS_cbs_health_w_lambda;
+  cbs_health_params_.w_growth = FLAGS_cbs_health_w_growth;
+  cbs_health_params_.kappa = FLAGS_cbs_health_kappa;
+  cbs_health_params_.warmup_samples =
+      std::max(1, FLAGS_cbs_health_warmup_samples);
+  cbs_health_params_.rot_sigma0_rad = FLAGS_cbs_health_rot_sigma0_rad;
+  cbs_health_params_.trans_sigma0_m = FLAGS_cbs_health_trans_sigma0_m;
+  cbs_health_params_.floor_rot_sigma_rad = FLAGS_cbs_health_floor_rot_sigma_rad;
+  cbs_health_params_.floor_trans_sigma_m =
+      FLAGS_cbs_health_floor_trans_sigma_m;
+  cbs_health_params_.eps = FLAGS_cbs_health_eps;
+  bpsam_params.health_aware_params = cbs_health_params_;
 
   smoother_ =
       std::make_unique<Smoother>(backend_params.nr_states_, bpsam_params);
@@ -655,6 +794,16 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   LOG(INFO) << "CBS temporary linear odometry factors: "
             << (FLAGS_cbs_use_temporary_cbs_linear_factors ? "enabled"
                                                            : "disabled");
+  LOG(INFO) << "CBS health-aware relative odometry: "
+            << (cbs_health_params_.enable ? "enabled" : "disabled")
+            << " sender=" << (cbs_health_params_.sender_enable ? "on" : "off")
+            << " receiver_nis="
+            << (cbs_health_params_.receiver_nis_enable ? "on" : "off")
+            << " alpha=[" << cbs_health_params_.alpha_min << ","
+            << cbs_health_params_.alpha_max << "]"
+            << " alpha_cons_max=" << cbs_health_params_.alpha_cons_max
+            << " chi2=" << cbs_health_params_.chi2_threshold
+            << " warmup=" << cbs_health_params_.warmup_samples;
 
   if (FLAGS_cbs_backend_enable) {
     initializePoseBeliefCovarianceSidecarAdapter();
@@ -1787,9 +1936,27 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
       stamped_belief.sender_frame_id = "odom";
       stamped_belief.received_wall_time_sec = wallTimeNowSec();
       stamped_belief.relax_factor = odom.relax_factor;
+      gtsam::Matrix covariance_to_send = odom.covariance;
+      if (cbs_health_params_.enable && cbs_health_params_.sender_enable) {
+        std::optional<gtsam::Matrix> absolute_covariance;
+        if (odom.to_pose_covariance_valid) {
+          absolute_covariance = odom.to_pose_covariance;
+        }
+        const auto health_result = cbs::health_aware::applySenderHealth(
+            odom.covariance,
+            absolute_covariance,
+            &cbs_sender_health_state_,
+            cbs_health_params_);
+        covariance_to_send = health_result.covariance;
+        logHealthAwareSenderRow(static_cast<uint8_t>('k'),
+                                cbs_odom_requesting_agent_id_,
+                                odom.from_pose_key,
+                                odom.to_pose_key,
+                                health_result);
+      }
       vector6ToArray(gtsam::Pose3::Logmap(odom.measured_from_to),
                      &stamped_belief.relative_mu);
-      matrix6ToArray(poseCovarianceFromMatrix(odom.covariance),
+      matrix6ToArray(poseCovarianceFromMatrix(covariance_to_send),
                      &stamped_belief.covariance);
       cbs_outgoing_odom_beliefs_.push_back(stamped_belief);
     }
