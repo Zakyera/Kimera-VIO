@@ -343,6 +343,41 @@ struct PersistentBpsamLocalCovarianceSidecar::Impl {
     cbs::BPSAM::UpdateParams update_params;
     update_params.removeFactorIndices = filterExistingFactorSlots(delete_slots);
 
+    std::vector<cbs::BPSAM::ActiveWindowCbsOdomFactorRemoval>
+        active_window_cbs_removals;
+    if (bpsam_.usesActiveWindowTemporaryCbsOdomFactors()) {
+      gtsam::KeySet active_keys_after_update;
+      for (const auto& [key, timestamp] : key_timestamp_map_) {
+        if (timestamp >= keep_from_timestamp) {
+          active_keys_after_update.insert(key);
+        }
+      }
+      for (const gtsam::Key key : marginalizable_keys) {
+        active_keys_after_update.erase(key);
+      }
+
+      active_window_cbs_removals =
+          bpsam_.activeWindowTemporaryCbsOdomFactorRemovalsOutsideKeys(
+              active_keys_after_update);
+      const gtsam::FactorIndices cbs_slots_to_remove =
+          bpsam_.activeWindowTemporaryCbsOdomFactorRemovalSlots(
+              active_window_cbs_removals);
+      update_params.removeFactorIndices.insert(
+          update_params.removeFactorIndices.end(),
+          cbs_slots_to_remove.begin(),
+          cbs_slots_to_remove.end());
+      update_params.removeFactorIndices =
+          filterExistingFactorSlots(update_params.removeFactorIndices);
+
+      if (!active_window_cbs_removals.empty()) {
+        LOG(INFO) << "Persistent BPSAM sidecar [" << robot_id_
+                  << "] scheduling "
+                  << active_window_cbs_removals.size()
+                  << " active-window CBS odometry removals before "
+                     "marginalization.";
+      }
+    }
+
     const auto constrained_keys = createOrderingConstraints(marginalizable_keys);
     if (constrained_keys) {
       update_params.constrainedKeys = constrained_keys;
@@ -357,6 +392,11 @@ struct PersistentBpsamLocalCovarianceSidecar::Impl {
     const gtsam::ISAM2Result result =
         bpsam_.update(new_factors, new_values, update_params);
     last_update_result_ = result;
+
+    if (!active_window_cbs_removals.empty()) {
+      bpsam_.commitActiveWindowTemporaryCbsOdomFactorRemovals(
+          active_window_cbs_removals);
+    }
 
     if (smart_factor_slots_out) {
       smart_factor_slots_out->clear();
@@ -383,6 +423,7 @@ struct PersistentBpsamLocalCovarianceSidecar::Impl {
         marginalized_now_count = leaf_keys.size();
         eraseKeyTimestampMap(
             gtsam::KeyVector(leaf_keys.begin(), leaf_keys.end()));
+        bpsam_.pruneTrackedCbsFactors();
       }
     }
 

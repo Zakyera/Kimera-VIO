@@ -48,6 +48,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>  // for make_pair
 #include <vector>
@@ -108,6 +109,11 @@ DEFINE_bool(cbs_use_temporary_cbs_linear_factors,
             "iSAM2 update and use them only in a temporary augmented linear "
             "delta solve. They are never inserted into the persistent factor "
             "graph.");
+DEFINE_string(cbs_odom_factor_mode,
+              "legacy",
+              "CBS odometry factor receiver mode: legacy, persistent, "
+              "temporary_linear, or active_window_temporary. legacy preserves "
+              "cbs_use_temporary_cbs_linear_factors behavior.");
 DEFINE_bool(cbs_temporary_linear_already_applied_gate_enable,
             true,
             "In temporary-linear CBS mode, skip near-identical beliefs from "
@@ -268,6 +274,26 @@ inline FrameId computeOldestActiveFrameId(const FrameId cur_id,
   const FrameId window_size =
       std::max<FrameId>(1u, static_cast<FrameId>(backend_params.nr_states_));
   return saturatingSubFrameId(cur_id, window_size - 1u);
+}
+
+cbs::BPSAM::CbsOdomFactorMode parseCbsOdomFactorMode(
+    const std::string& mode) {
+  if (mode == "legacy") {
+    return cbs::BPSAM::CbsOdomFactorMode::Legacy;
+  }
+  if (mode == "persistent" || mode == "inject_persistent") {
+    return cbs::BPSAM::CbsOdomFactorMode::Persistent;
+  }
+  if (mode == "temporary_linear") {
+    return cbs::BPSAM::CbsOdomFactorMode::TemporaryLinear;
+  }
+  if (mode == "active_window_temporary" ||
+      mode == "fixed_lag_temporary") {
+    return cbs::BPSAM::CbsOdomFactorMode::ActiveWindowTemporary;
+  }
+  LOG(WARNING) << "Invalid cbs_odom_factor_mode='" << mode
+               << "'; falling back to legacy.";
+  return cbs::BPSAM::CbsOdomFactorMode::Legacy;
 }
 
 inline double wallTimeNowSec() {
@@ -638,6 +664,8 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
   bpsam_params.reject_first_message = FLAGS_cbs_reject_first_message;
   bpsam_params.use_temporary_cbs_linear_factors =
       FLAGS_cbs_use_temporary_cbs_linear_factors;
+  bpsam_params.cbs_odom_factor_mode =
+      parseCbsOdomFactorMode(FLAGS_cbs_odom_factor_mode);
   bpsam_params.temporary_linear_already_applied_gate_enable =
       FLAGS_cbs_temporary_linear_already_applied_gate_enable;
   bpsam_params.temporary_linear_already_applied_metric_threshold =
@@ -791,6 +819,7 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << (FLAGS_cbs_enable_soft_reset ? "enabled" : "disabled");
   LOG(INFO) << "CBS reject first message: "
             << (FLAGS_cbs_reject_first_message ? "enabled" : "disabled");
+  LOG(INFO) << "CBS odometry factor mode: " << FLAGS_cbs_odom_factor_mode;
   LOG(INFO) << "CBS temporary linear odometry factors: "
             << (FLAGS_cbs_use_temporary_cbs_linear_factors ? "enabled"
                                                            : "disabled");
@@ -1003,6 +1032,43 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
     // Create Backend Output Payload.
     const auto backend_output_construct_start_time = utils::Timer::tic();
     try {
+      const gtsam::Quaternion state_quat =
+          W_Pose_B_lkf_from_state_.rotation().toQuaternion();
+      const gtsam::Quaternion increments_quat =
+          W_Pose_B_lkf_from_increments_.rotation().toQuaternion();
+      const gtsam::Pose3 state_T_increments =
+          W_Pose_B_lkf_from_state_.inverse() * W_Pose_B_lkf_from_increments_;
+      const gtsam::Vector3 state_p_increments =
+          state_T_increments.translation();
+      const double yaw_diff =
+          std::remainder(W_Pose_B_lkf_from_increments_.rotation().yaw() -
+                             W_Pose_B_lkf_from_state_.rotation().yaw(),
+                         2.0 * M_PI);
+      LOG(INFO) << "KIMERA_BACKEND_POSE_PATH_ROW,"
+                << static_cast<double>(input.timestamp_) * 1e-9 << ','
+                << curr_kf_id_ << ','
+                << W_Pose_B_lkf_from_state_.x() << ','
+                << W_Pose_B_lkf_from_state_.y() << ','
+                << W_Pose_B_lkf_from_state_.z() << ','
+                << state_quat.w() << ','
+                << state_quat.x() << ','
+                << state_quat.y() << ','
+                << state_quat.z() << ','
+                << W_Pose_B_lkf_from_increments_.x() << ','
+                << W_Pose_B_lkf_from_increments_.y() << ','
+                << W_Pose_B_lkf_from_increments_.z() << ','
+                << increments_quat.w() << ','
+                << increments_quat.x() << ','
+                << increments_quat.y() << ','
+                << increments_quat.z() << ','
+                << state_p_increments.x() << ','
+                << state_p_increments.y() << ','
+                << state_p_increments.z() << ','
+                << state_p_increments.norm() << ','
+                << W_Pose_B_lkf_from_state_.rotation().yaw() << ','
+                << W_Pose_B_lkf_from_increments_.rotation().yaw() << ','
+                << yaw_diff << ','
+                << FLAGS_no_incremental_pose;
       output_payload = std::make_unique<BackendOutput>(
           VioNavStateTimestamped(
               input.timestamp_,
@@ -1438,6 +1504,28 @@ void VioBackend::collectExternalBeliefFactors(
                   << duration_ratio;
       };
 
+  struct MatchedExternalOdomCandidate {
+    ExternalOdometryBelief belief;
+    FrameId from_frame_id = 0u;
+    FrameId to_frame_id = 0u;
+    FrameId from_best_frame_id = 0u;
+    FrameId to_best_frame_id = 0u;
+    double from_best_stamp_sec = std::numeric_limits<double>::quiet_NaN();
+    double to_best_stamp_sec = std::numeric_limits<double>::quiet_NaN();
+    double from_best_abs_dt = std::numeric_limits<double>::quiet_NaN();
+    double to_best_abs_dt = std::numeric_limits<double>::quiet_NaN();
+    ExternalBeliefRejectReason from_reject_reason =
+        ExternalBeliefRejectReason::kNone;
+    ExternalBeliefRejectReason to_reject_reason =
+        ExternalBeliefRejectReason::kNone;
+    double duration_error = std::numeric_limits<double>::infinity();
+    double score = std::numeric_limits<double>::infinity();
+    cbs::BPSAM::CbsOdometryBelief odom_belief;
+  };
+  using ReceiverEdgeKey = std::tuple<uint8_t, FrameId, FrameId>;
+  std::vector<MatchedExternalOdomCandidate> matched_candidates;
+  std::map<ReceiverEdgeKey, size_t> best_candidate_by_receiver_edge;
+
   for (const auto& belief : pending_odom_beliefs) {
     FrameId from_frame_id = 0u;
     FrameId to_frame_id = 0u;
@@ -1592,123 +1680,239 @@ void VioBackend::collectExternalBeliefFactors(
         poseCovarianceFromMatrix(matrix6FromArray(belief.covariance));
     odom_belief.relax_factor = belief.relax_factor;
 
-    try {
-      std::vector<cbs::BPSAM::CbsOdometryBelief> single_belief;
-      single_belief.push_back(std::move(odom_belief));
-      const auto add_result =
-          smoother_->addOdometryBeliefsDetailed(std::move(single_belief));
-      const bool retry_bpsam_inactive =
-          add_result.accepted == 0u &&
-          add_result.rejected_inactive_window > 0u &&
-          add_result.rejected() == add_result.rejected_inactive_window &&
-          shouldRetryExternalOdometryBelief(belief,
-                                            cur_id,
-                                            "bpsam_inactive_window");
-      if (retry_bpsam_inactive) {
-        ++retried_unmatched;
-        retry_beliefs.push_back(belief);
-        log_match_decision(belief,
-                           from_best_frame_id,
-                           from_best_stamp_sec,
-                           from_best_abs_dt,
-                           from_reject_reason,
-                           to_best_frame_id,
-                           to_best_stamp_sec,
-                           to_best_abs_dt,
-                           to_reject_reason,
-                           "retry_bpsam_inactive_window");
-        continue;
-      }
-      external_beliefs_added_per_update_ += add_result.accepted;
-      rejected_by_bpsam += add_result.rejected();
-      rejected_bpsam_inactive_window += add_result.rejected_inactive_window;
-      rejected_bpsam_shape += add_result.rejected_shape;
-      rejected_bpsam_exception += add_result.rejected_exception;
-      if (add_result.details.empty()) {
-        log_match_decision(belief,
-                           from_best_frame_id,
-                           from_best_stamp_sec,
-                           from_best_abs_dt,
-                           from_reject_reason,
-                           to_best_frame_id,
-                           to_best_stamp_sec,
-                           to_best_abs_dt,
-                           to_reject_reason,
-                           "bpsam_no_detail");
-      }
-      for (const auto& detail : add_result.details) {
-        log_match_decision(belief,
-                           from_best_frame_id,
-                           from_best_stamp_sec,
-                           from_best_abs_dt,
-                           from_reject_reason,
-                           to_best_frame_id,
-                           to_best_stamp_sec,
-                           to_best_abs_dt,
-                           to_reject_reason,
+    MatchedExternalOdomCandidate candidate;
+    candidate.belief = belief;
+    candidate.from_frame_id = from_frame_id;
+    candidate.to_frame_id = to_frame_id;
+    candidate.from_best_frame_id = from_best_frame_id;
+    candidate.to_best_frame_id = to_best_frame_id;
+    candidate.from_best_stamp_sec = from_best_stamp_sec;
+    candidate.to_best_stamp_sec = to_best_stamp_sec;
+    candidate.from_best_abs_dt = from_best_abs_dt;
+    candidate.to_best_abs_dt = to_best_abs_dt;
+    candidate.from_reject_reason = from_reject_reason;
+    candidate.to_reject_reason = to_reject_reason;
+    candidate.duration_error = duration_error;
+    candidate.score = from_best_abs_dt + to_best_abs_dt + duration_error;
+    candidate.odom_belief = std::move(odom_belief);
+
+    const ReceiverEdgeKey receiver_edge{belief.source_agent,
+                                        from_frame_id,
+                                        to_frame_id};
+    const size_t candidate_index = matched_candidates.size();
+    matched_candidates.push_back(std::move(candidate));
+    const auto best_it = best_candidate_by_receiver_edge.find(receiver_edge);
+    if (best_it == best_candidate_by_receiver_edge.end() ||
+        matched_candidates[candidate_index].score <
+            matched_candidates[best_it->second].score) {
+      best_candidate_by_receiver_edge[receiver_edge] = candidate_index;
+    }
+  }
+
+  std::vector<size_t> selected_candidate_indices;
+  selected_candidate_indices.reserve(best_candidate_by_receiver_edge.size());
+  std::unordered_set<size_t> selected_candidate_set;
+  for (const auto& [receiver_edge, candidate_index] :
+       best_candidate_by_receiver_edge) {
+    (void)receiver_edge;
+    selected_candidate_indices.push_back(candidate_index);
+    selected_candidate_set.insert(candidate_index);
+  }
+  std::sort(selected_candidate_indices.begin(),
+            selected_candidate_indices.end());
+
+  for (size_t i = 0; i < matched_candidates.size(); ++i) {
+    if (selected_candidate_set.find(i) != selected_candidate_set.end()) {
+      continue;
+    }
+    const auto& candidate = matched_candidates[i];
+    log_match_decision(candidate.belief,
+                       candidate.from_best_frame_id,
+                       candidate.from_best_stamp_sec,
+                       candidate.from_best_abs_dt,
+                       candidate.from_reject_reason,
+                       candidate.to_best_frame_id,
+                       candidate.to_best_stamp_sec,
+                       candidate.to_best_abs_dt,
+                       candidate.to_reject_reason,
+                       "receiver_edge_superseded_by_better_candidate");
+  }
+
+  const auto log_bpsam_add_detail =
+      [&](const MatchedExternalOdomCandidate& candidate,
+          const cbs::BPSAM::AddOdometryBeliefDetail& detail) {
+        log_match_decision(candidate.belief,
+                           candidate.from_best_frame_id,
+                           candidate.from_best_stamp_sec,
+                           candidate.from_best_abs_dt,
+                           candidate.from_reject_reason,
+                           candidate.to_best_frame_id,
+                           candidate.to_best_stamp_sec,
+                           candidate.to_best_abs_dt,
+                           candidate.to_reject_reason,
                            detail.message);
         const char source_char = static_cast<char>(std::toupper(
-            static_cast<unsigned char>(belief.source_agent)));
+            static_cast<unsigned char>(candidate.belief.source_agent)));
         const std::string add_row_marker =
             std::string("CBS_BPSAM_ODOM_ADD_ROW_") + source_char + "2K";
         LOG(INFO) << add_row_marker << ","
-                  << formatPoseKeyToken(belief.source_agent,
-                                        belief.sender_from_pose_index)
+                  << formatPoseKeyToken(candidate.belief.source_agent,
+                                        candidate.belief.sender_from_pose_index)
                   << "->"
-                  << formatPoseKeyToken(belief.source_agent,
-                                        belief.sender_to_pose_index)
+                  << formatPoseKeyToken(candidate.belief.source_agent,
+                                        candidate.belief.sender_to_pose_index)
                   << ","
                   << formatPoseKeyToken(static_cast<uint8_t>('k'),
-                                        from_frame_id)
+                                        candidate.from_frame_id)
                   << "->"
                   << formatPoseKeyToken(static_cast<uint8_t>('k'),
-                                        to_frame_id)
+                                        candidate.to_frame_id)
                   << "," << static_cast<int>(detail.status) << ","
                   << detail.covariance_trace << ","
                   << sanitizeLogToken(detail.message);
+      };
+
+  if (!selected_candidate_indices.empty()) {
+    std::vector<cbs::BPSAM::CbsOdometryBelief> odom_beliefs;
+    odom_beliefs.reserve(selected_candidate_indices.size());
+    for (const size_t candidate_index : selected_candidate_indices) {
+      odom_beliefs.push_back(matched_candidates[candidate_index].odom_belief);
+    }
+
+    try {
+      const auto add_result =
+          smoother_->addOdometryBeliefsDetailed(std::move(odom_beliefs));
+      if (add_result.details.empty()) {
+        for (const size_t candidate_index : selected_candidate_indices) {
+          const auto& candidate = matched_candidates[candidate_index];
+          log_match_decision(candidate.belief,
+                             candidate.from_best_frame_id,
+                             candidate.from_best_stamp_sec,
+                             candidate.from_best_abs_dt,
+                             candidate.from_reject_reason,
+                             candidate.to_best_frame_id,
+                             candidate.to_best_stamp_sec,
+                             candidate.to_best_abs_dt,
+                             candidate.to_reject_reason,
+                             "bpsam_no_detail");
+        }
+      }
+
+      const size_t detail_count =
+          std::min(add_result.details.size(), selected_candidate_indices.size());
+      for (size_t i = 0; i < detail_count; ++i) {
+        const auto& candidate =
+            matched_candidates[selected_candidate_indices[i]];
+        const auto& detail = add_result.details[i];
+
+        if (detail.status ==
+            cbs::BPSAM::AddOdometryBeliefStatus::RejectedInactiveWindow) {
+          const bool retry_bpsam_inactive =
+              shouldRetryExternalOdometryBelief(candidate.belief,
+                                                cur_id,
+                                                "bpsam_inactive_window");
+          if (retry_bpsam_inactive) {
+            ++retried_unmatched;
+            retry_beliefs.push_back(candidate.belief);
+            log_match_decision(candidate.belief,
+                               candidate.from_best_frame_id,
+                               candidate.from_best_stamp_sec,
+                               candidate.from_best_abs_dt,
+                               candidate.from_reject_reason,
+                               candidate.to_best_frame_id,
+                               candidate.to_best_stamp_sec,
+                               candidate.to_best_abs_dt,
+                               candidate.to_reject_reason,
+                               "retry_bpsam_inactive_window");
+            continue;
+          }
+        }
+
+        switch (detail.status) {
+          case cbs::BPSAM::AddOdometryBeliefStatus::Accepted:
+            ++external_beliefs_added_per_update_;
+            break;
+          case cbs::BPSAM::AddOdometryBeliefStatus::
+              AcceptedButSkippedAlreadyApplied:
+            break;
+          case cbs::BPSAM::AddOdometryBeliefStatus::RejectedInactiveWindow:
+            ++rejected_by_bpsam;
+            ++rejected_bpsam_inactive_window;
+            break;
+          case cbs::BPSAM::AddOdometryBeliefStatus::RejectedShape:
+            ++rejected_by_bpsam;
+            ++rejected_bpsam_shape;
+            break;
+          case cbs::BPSAM::AddOdometryBeliefStatus::Exception:
+            ++rejected_by_bpsam;
+            ++rejected_bpsam_exception;
+            break;
+        }
+        log_bpsam_add_detail(candidate, detail);
+      }
+
+      for (size_t i = detail_count; i < selected_candidate_indices.size(); ++i) {
+        const auto& candidate =
+            matched_candidates[selected_candidate_indices[i]];
+        log_match_decision(candidate.belief,
+                           candidate.from_best_frame_id,
+                           candidate.from_best_stamp_sec,
+                           candidate.from_best_abs_dt,
+                           candidate.from_reject_reason,
+                           candidate.to_best_frame_id,
+                           candidate.to_best_stamp_sec,
+                           candidate.to_best_abs_dt,
+                           candidate.to_reject_reason,
+                           "bpsam_missing_detail");
       }
     } catch (const std::exception& e) {
-      ++rejected_by_bpsam;
-      ++rejected_bpsam_exception;
-      log_match_decision(belief,
-                         from_best_frame_id,
-                         from_best_stamp_sec,
-                         from_best_abs_dt,
-                         from_reject_reason,
-                         to_best_frame_id,
-                         to_best_stamp_sec,
-                         to_best_abs_dt,
-                         to_reject_reason,
-                         "bpsam_exception");
-      LOG(WARNING) << "BPSAM rejected external CBS odometry "
-                   << formatPoseKeyToken(belief.source_agent,
-                                         belief.sender_from_pose_index)
-                   << "->"
-                   << formatPoseKeyToken(belief.source_agent,
-                                         belief.sender_to_pose_index)
-                   << " for Kimera frames " << from_frame_id << "->"
-                   << to_frame_id << ": " << e.what();
+      for (const size_t candidate_index : selected_candidate_indices) {
+        const auto& candidate = matched_candidates[candidate_index];
+        ++rejected_by_bpsam;
+        ++rejected_bpsam_exception;
+        log_match_decision(candidate.belief,
+                           candidate.from_best_frame_id,
+                           candidate.from_best_stamp_sec,
+                           candidate.from_best_abs_dt,
+                           candidate.from_reject_reason,
+                           candidate.to_best_frame_id,
+                           candidate.to_best_stamp_sec,
+                           candidate.to_best_abs_dt,
+                           candidate.to_reject_reason,
+                           "bpsam_exception");
+        LOG(WARNING) << "BPSAM rejected external CBS odometry "
+                     << formatPoseKeyToken(candidate.belief.source_agent,
+                                           candidate.belief.sender_from_pose_index)
+                     << "->"
+                     << formatPoseKeyToken(candidate.belief.source_agent,
+                                           candidate.belief.sender_to_pose_index)
+                     << " for Kimera frames " << candidate.from_frame_id << "->"
+                     << candidate.to_frame_id << ": " << e.what();
+      }
     } catch (...) {
-      ++rejected_by_bpsam;
-      ++rejected_bpsam_exception;
-      log_match_decision(belief,
-                         from_best_frame_id,
-                         from_best_stamp_sec,
-                         from_best_abs_dt,
-                         from_reject_reason,
-                         to_best_frame_id,
-                         to_best_stamp_sec,
-                         to_best_abs_dt,
-                         to_reject_reason,
-                         "bpsam_unknown_exception");
-      LOG(WARNING) << "BPSAM rejected external CBS odometry "
-                   << formatPoseKeyToken(belief.source_agent,
-                                         belief.sender_from_pose_index)
-                   << "->"
-                   << formatPoseKeyToken(belief.source_agent,
-                                         belief.sender_to_pose_index)
-                   << " for Kimera frames " << from_frame_id << "->"
-                   << to_frame_id << ".";
+      for (const size_t candidate_index : selected_candidate_indices) {
+        const auto& candidate = matched_candidates[candidate_index];
+        ++rejected_by_bpsam;
+        ++rejected_bpsam_exception;
+        log_match_decision(candidate.belief,
+                           candidate.from_best_frame_id,
+                           candidate.from_best_stamp_sec,
+                           candidate.from_best_abs_dt,
+                           candidate.from_reject_reason,
+                           candidate.to_best_frame_id,
+                           candidate.to_best_stamp_sec,
+                           candidate.to_best_abs_dt,
+                           candidate.to_reject_reason,
+                           "bpsam_unknown_exception");
+        LOG(WARNING) << "BPSAM rejected external CBS odometry "
+                     << formatPoseKeyToken(candidate.belief.source_agent,
+                                           candidate.belief.sender_from_pose_index)
+                     << "->"
+                     << formatPoseKeyToken(candidate.belief.source_agent,
+                                           candidate.belief.sender_to_pose_index)
+                     << " for Kimera frames " << candidate.from_frame_id << "->"
+                     << candidate.to_frame_id << ".";
+      }
     }
   }
 
@@ -3620,6 +3824,11 @@ bool VioBackend::updateSmoother(gtsam::FixedLagSmoother::Result* result,
       printSmootherInfo(new_factors, delete_slots);
     }
 
+    // Build recovery priors from the last known-good smoother state.  The
+    // failed update may already have mutated smoother_ into an invalid state.
+    *smoother_ = smoother_backup;
+    LOG(WARNING) << "Smoother recovery priors will use backup_state.";
+
     // Add priors on all variables to fix indeterminant linear system
     gtsam::Values values = smoother_->calculateEstimate();
 
@@ -3684,12 +3893,12 @@ bool VioBackend::updateSmoother(gtsam::FixedLagSmoother::Result* result,
 
     // Update with graph and GN optimized values
     try {
-      // Update smoother
+      // Update smoother from the restored backup state.
       LOG(ERROR) << "Attempting to update smoother with added prior factors";
-      *smoother_ = smoother_backup;  // reset isam to backup
       *result = smoother_->update(
           new_factors_mutable, new_values, timestamps, delete_slots);
     } catch (...) {
+      *smoother_ = smoother_backup;
       // Catch the rest of exceptions.
       LOG(ERROR) << "Smoother recovery failed. Most likely, the additional "
                     "prior factors were insufficient to keep the system from "
