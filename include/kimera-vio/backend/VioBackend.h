@@ -620,6 +620,9 @@ class VioBackend {
   size_t external_beliefs_rejected_shape_per_update_ = 0u;
   size_t external_beliefs_rejected_exception_per_update_ = 0u;
   double optimization_time_sec_per_update_ = 0.0;
+  double optimize_total_time_sec_per_update_ = 0.0;
+  double collect_external_beliefs_time_sec_per_update_ = 0.0;
+  double compute_state_covariance_time_sec_per_update_ = 0.0;
   double cbs_belief_generation_time_sec_per_update_ = 0.0;
   double cbs_outgoing_total_time_sec_per_update_ = 0.0;
   double cbs_set_marginalization_graph_time_sec_per_update_ = 0.0;
@@ -638,7 +641,8 @@ class VioBackend {
   bool last_cbs_outgoing_odom_pair_valid_ = false;
   gtsam::Key last_cbs_outgoing_odom_from_key_ = 0u;
   gtsam::Key last_cbs_outgoing_odom_to_key_ = 0u;
-  cbs::health_aware::Params cbs_health_params_;
+  cbs::health_aware::Params cbs_health_sender_params_;
+  cbs::health_aware::Params cbs_health_receiver_params_;
   cbs::health_aware::SenderHealthState cbs_sender_health_state_;
 
   // Vision params.

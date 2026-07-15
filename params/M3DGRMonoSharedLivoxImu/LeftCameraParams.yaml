@@ -1,0 +1,23 @@
+%YAML:1.0
+# General sensor definitions.
+camera_id: left_cam
+
+# M3DGR D435i RGB camera wrt. the shared Livox Avia IMU body frame.
+# Experimental only: this shared-Livox-IMU geometry did not validate in the
+# Dynamic01 smoke test. Derived as inv(T_camera_imu_livox_avia_imu) *
+# T_camera_imu_camera.
+T_BS:
+  cols: 4
+  rows: 4
+  data: [0.0210770523, -0.0038718515, 0.9997703613, -0.2031988078,
+        -0.9993969161, 0.0275205912, 0.0211757589, -0.0113089883,
+        -0.0275962607, -0.9996137335, -0.0032894587, 0.1188482863,
+         0.0, 0.0, 0.0, 1.0]
+
+# Camera specific definitions.
+rate_hz: 30
+resolution: [640, 480]
+camera_model: pinhole
+intrinsics: [607.79772949218, 607.83526613281, 328.79772949218, 245.53321838378] #fu, fv, cu, cv
+distortion_model: radial-tangential
+distortion_coefficients: [0.0, 0.0, 0.0, 0.0]

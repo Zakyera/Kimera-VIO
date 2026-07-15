@@ -114,6 +114,14 @@ DEFINE_string(cbs_odom_factor_mode,
               "CBS odometry factor receiver mode: legacy, persistent, "
               "temporary_linear, or active_window_temporary. legacy preserves "
               "cbs_use_temporary_cbs_linear_factors behavior.");
+DEFINE_string(cbs_odom_covariance_mode,
+              "schur_relative_between",
+              "CBS outgoing odometry covariance mode: "
+              "schur_relative_between or conditional_to_pose.");
+DEFINE_bool(cbs_active_factor_diagnostic_enable,
+            true,
+            "Log active CBS odometry factor Hessian diagnostics against local "
+            "backend factors.");
 DEFINE_bool(cbs_temporary_linear_already_applied_gate_enable,
             true,
             "In temporary-linear CBS mode, skip near-identical beliefs from "
@@ -221,6 +229,34 @@ DEFINE_double(cbs_health_chi2_threshold,
 DEFINE_double(cbs_health_beta_receiver_cov,
               1.0,
               "Receiver relative covariance multiplier in CBS NIS S matrix.");
+DEFINE_bool(cbs_health_relative_trust_enable,
+            false,
+            "Enable receiver-side CBS NIS covariance weighting from relative "
+            "sender/receiver covariance trust.");
+DEFINE_bool(cbs_health_relative_trust_calibrated_enable,
+            false,
+            "Compare receiver-side CBS relative-trust uncertainty against "
+            "per-direction warmup baselines instead of raw covariance scale.");
+DEFINE_double(cbs_health_relative_trust_kappa,
+              1.0,
+              "Exponential gain for receiver-side CBS relative-trust NIS "
+              "weighting.");
+DEFINE_double(cbs_health_relative_trust_min_weight,
+              0.20,
+              "Minimum multiplier applied to CBS NIS disagreement inflation "
+              "when the sender covariance is more trusted than the receiver.");
+DEFINE_double(cbs_health_relative_trust_max_weight,
+              5.0,
+              "Maximum multiplier applied to CBS NIS disagreement inflation "
+              "when the sender covariance is less trusted than the receiver.");
+DEFINE_double(cbs_health_relative_trust_deadband,
+              0.0,
+              "Absolute normalized log-det sender/receiver uncertainty "
+              "difference below which CBS relative-trust weighting is neutral.");
+DEFINE_int32(cbs_health_relative_trust_warmup_samples,
+             20,
+             "Warmup samples per incoming CBS source used to calibrate "
+             "relative-trust sender/receiver covariance baselines.");
 DEFINE_double(cbs_health_w_logdet,
               1.0,
               "Weight for normalized absolute covariance log-det health.");
@@ -257,6 +293,98 @@ DEFINE_double(cbs_health_floor_trans_sigma_m,
 DEFINE_double(cbs_health_eps,
               1e-9,
               "Numerical epsilon for health-aware covariance calculations.");
+DEFINE_double(cbs_sender_health_alpha_min,
+              -1.0,
+              "Sender-specific CBS health alpha_min. Negative inherits "
+              "cbs_health_alpha_min.");
+DEFINE_double(cbs_sender_health_alpha_max,
+              -1.0,
+              "Sender-specific CBS health alpha_max. Negative inherits "
+              "cbs_health_alpha_max.");
+DEFINE_double(cbs_sender_health_w_logdet,
+              -1.0,
+              "Sender-specific CBS health log-det weight. Negative inherits "
+              "cbs_health_w_logdet.");
+DEFINE_double(cbs_sender_health_w_lambda,
+              -1.0,
+              "Sender-specific CBS health max-eigenvalue weight. Negative "
+              "inherits cbs_health_w_lambda.");
+DEFINE_double(cbs_sender_health_w_growth,
+              -1.0,
+              "Sender-specific CBS health positive-growth weight. Negative "
+              "inherits cbs_health_w_growth.");
+DEFINE_double(cbs_sender_health_kappa,
+              -1.0,
+              "Sender-specific CBS health exponential gain. Negative inherits "
+              "cbs_health_kappa.");
+DEFINE_int32(cbs_sender_health_warmup_samples,
+             -1,
+             "Sender-specific CBS health warmup samples. Negative inherits "
+             "cbs_health_warmup_samples.");
+DEFINE_double(cbs_sender_health_rot_sigma0_rad,
+              -1.0,
+              "Sender-specific CBS health nominal rotation sigma. Negative "
+              "inherits cbs_health_rot_sigma0_rad.");
+DEFINE_double(cbs_sender_health_trans_sigma0_m,
+              -1.0,
+              "Sender-specific CBS health nominal translation sigma. Negative "
+              "inherits cbs_health_trans_sigma0_m.");
+DEFINE_double(cbs_sender_health_floor_rot_sigma_rad,
+              -1.0,
+              "Sender-specific CBS health rotation covariance floor sigma. "
+              "Negative inherits cbs_health_floor_rot_sigma_rad.");
+DEFINE_double(cbs_sender_health_floor_trans_sigma_m,
+              -1.0,
+              "Sender-specific CBS health translation covariance floor sigma. "
+              "Negative inherits cbs_health_floor_trans_sigma_m.");
+DEFINE_double(cbs_sender_health_eps,
+              -1.0,
+              "Sender-specific CBS health epsilon. Negative inherits "
+              "cbs_health_eps.");
+DEFINE_double(cbs_receiver_health_alpha_cons_max,
+              -1.0,
+              "Receiver-specific CBS NIS max covariance multiplier. Negative "
+              "inherits cbs_health_alpha_cons_max.");
+DEFINE_double(cbs_receiver_health_chi2_threshold,
+              -1.0,
+              "Receiver-specific CBS NIS chi-square threshold. Negative "
+              "inherits cbs_health_chi2_threshold.");
+DEFINE_double(cbs_receiver_health_beta_receiver_cov,
+              -1.0,
+              "Receiver-specific CBS NIS receiver covariance weight. Negative "
+              "inherits cbs_health_beta_receiver_cov.");
+DEFINE_double(cbs_receiver_health_relative_trust_kappa,
+              -1.0,
+              "Receiver-specific CBS relative-trust gain. Negative inherits "
+              "cbs_health_relative_trust_kappa.");
+DEFINE_double(cbs_receiver_health_relative_trust_min_weight,
+              -1.0,
+              "Receiver-specific CBS relative-trust minimum weight. Negative "
+              "inherits cbs_health_relative_trust_min_weight.");
+DEFINE_double(cbs_receiver_health_relative_trust_max_weight,
+              -1.0,
+              "Receiver-specific CBS relative-trust maximum weight. Negative "
+              "inherits cbs_health_relative_trust_max_weight.");
+DEFINE_double(cbs_receiver_health_relative_trust_deadband,
+              -1.0,
+              "Receiver-specific CBS relative-trust deadband. Negative "
+              "inherits cbs_health_relative_trust_deadband.");
+DEFINE_int32(cbs_receiver_health_relative_trust_warmup_samples,
+             -1,
+             "Receiver-specific CBS relative-trust warmup samples. Negative "
+             "inherits cbs_health_relative_trust_warmup_samples.");
+DEFINE_double(cbs_receiver_health_floor_rot_sigma_rad,
+              -1.0,
+              "Receiver-specific CBS NIS rotation covariance floor sigma. "
+              "Negative inherits cbs_health_floor_rot_sigma_rad.");
+DEFINE_double(cbs_receiver_health_floor_trans_sigma_m,
+              -1.0,
+              "Receiver-specific CBS NIS translation covariance floor sigma. "
+              "Negative inherits cbs_health_floor_trans_sigma_m.");
+DEFINE_double(cbs_receiver_health_eps,
+              -1.0,
+              "Receiver-specific CBS NIS epsilon. Negative inherits "
+              "cbs_health_eps.");
 DEFINE_bool(no_incremental_pose,
             false,
             "Flag to disable incremental pose usage in backend");
@@ -326,6 +454,126 @@ inline std::string normalizeCbsOdomSenderMode(std::string mode) {
     return "time_horizon_window";
   }
   return mode;
+}
+
+inline void sanitizeHealthParams(cbs::health_aware::Params* params) {
+  if (!params) {
+    return;
+  }
+  if (params->alpha_max < params->alpha_min) {
+    std::swap(params->alpha_min, params->alpha_max);
+  }
+  params->warmup_samples = std::max(1, params->warmup_samples);
+  params->relative_trust_warmup_samples =
+      std::max(1, params->relative_trust_warmup_samples);
+  params->relative_trust_min_weight =
+      std::max(0.0, params->relative_trust_min_weight);
+  params->relative_trust_max_weight =
+      std::max(params->relative_trust_min_weight,
+               params->relative_trust_max_weight);
+  params->relative_trust_deadband =
+      std::max(0.0, params->relative_trust_deadband);
+}
+
+inline void overrideNonnegative(const double value, double* target) {
+  if (target && std::isfinite(value) && value >= 0.0) {
+    *target = value;
+  }
+}
+
+inline void overridePositiveInt(const int value, int* target) {
+  if (target && value > 0) {
+    *target = value;
+  }
+}
+
+inline cbs::health_aware::Params makeCommonHealthParamsFromFlags() {
+  cbs::health_aware::Params params;
+  params.enable = FLAGS_cbs_health_aware_enable;
+  params.sender_enable = FLAGS_cbs_health_sender_enable;
+  params.receiver_nis_enable = FLAGS_cbs_health_receiver_nis_enable;
+  params.alpha_min = FLAGS_cbs_health_alpha_min;
+  params.alpha_max = FLAGS_cbs_health_alpha_max;
+  params.alpha_cons_max = FLAGS_cbs_health_alpha_cons_max;
+  params.chi2_threshold = FLAGS_cbs_health_chi2_threshold;
+  params.beta_receiver_cov = FLAGS_cbs_health_beta_receiver_cov;
+  params.relative_trust_enable = FLAGS_cbs_health_relative_trust_enable;
+  params.relative_trust_calibrated_enable =
+      FLAGS_cbs_health_relative_trust_calibrated_enable;
+  params.relative_trust_kappa = FLAGS_cbs_health_relative_trust_kappa;
+  params.relative_trust_min_weight =
+      FLAGS_cbs_health_relative_trust_min_weight;
+  params.relative_trust_max_weight =
+      FLAGS_cbs_health_relative_trust_max_weight;
+  params.relative_trust_deadband = FLAGS_cbs_health_relative_trust_deadband;
+  params.relative_trust_warmup_samples =
+      FLAGS_cbs_health_relative_trust_warmup_samples;
+  params.w_logdet = FLAGS_cbs_health_w_logdet;
+  params.w_lambda = FLAGS_cbs_health_w_lambda;
+  params.w_growth = FLAGS_cbs_health_w_growth;
+  params.kappa = FLAGS_cbs_health_kappa;
+  params.warmup_samples = FLAGS_cbs_health_warmup_samples;
+  params.rot_sigma0_rad = FLAGS_cbs_health_rot_sigma0_rad;
+  params.trans_sigma0_m = FLAGS_cbs_health_trans_sigma0_m;
+  params.floor_rot_sigma_rad = FLAGS_cbs_health_floor_rot_sigma_rad;
+  params.floor_trans_sigma_m = FLAGS_cbs_health_floor_trans_sigma_m;
+  params.eps = FLAGS_cbs_health_eps;
+  sanitizeHealthParams(&params);
+  return params;
+}
+
+inline void applySenderHealthFlagOverrides(
+    cbs::health_aware::Params* params) {
+  if (!params) {
+    return;
+  }
+  overrideNonnegative(FLAGS_cbs_sender_health_alpha_min, &params->alpha_min);
+  overrideNonnegative(FLAGS_cbs_sender_health_alpha_max, &params->alpha_max);
+  overrideNonnegative(FLAGS_cbs_sender_health_w_logdet, &params->w_logdet);
+  overrideNonnegative(FLAGS_cbs_sender_health_w_lambda, &params->w_lambda);
+  overrideNonnegative(FLAGS_cbs_sender_health_w_growth, &params->w_growth);
+  overrideNonnegative(FLAGS_cbs_sender_health_kappa, &params->kappa);
+  overridePositiveInt(FLAGS_cbs_sender_health_warmup_samples,
+                      &params->warmup_samples);
+  overrideNonnegative(FLAGS_cbs_sender_health_rot_sigma0_rad,
+                      &params->rot_sigma0_rad);
+  overrideNonnegative(FLAGS_cbs_sender_health_trans_sigma0_m,
+                      &params->trans_sigma0_m);
+  overrideNonnegative(FLAGS_cbs_sender_health_floor_rot_sigma_rad,
+                      &params->floor_rot_sigma_rad);
+  overrideNonnegative(FLAGS_cbs_sender_health_floor_trans_sigma_m,
+                      &params->floor_trans_sigma_m);
+  overrideNonnegative(FLAGS_cbs_sender_health_eps, &params->eps);
+  sanitizeHealthParams(params);
+}
+
+inline void applyReceiverHealthFlagOverrides(
+    cbs::health_aware::Params* params) {
+  if (!params) {
+    return;
+  }
+  overrideNonnegative(FLAGS_cbs_receiver_health_alpha_cons_max,
+                      &params->alpha_cons_max);
+  overrideNonnegative(FLAGS_cbs_receiver_health_chi2_threshold,
+                      &params->chi2_threshold);
+  overrideNonnegative(FLAGS_cbs_receiver_health_beta_receiver_cov,
+                      &params->beta_receiver_cov);
+  overrideNonnegative(FLAGS_cbs_receiver_health_relative_trust_kappa,
+                      &params->relative_trust_kappa);
+  overrideNonnegative(FLAGS_cbs_receiver_health_relative_trust_min_weight,
+                      &params->relative_trust_min_weight);
+  overrideNonnegative(FLAGS_cbs_receiver_health_relative_trust_max_weight,
+                      &params->relative_trust_max_weight);
+  overrideNonnegative(FLAGS_cbs_receiver_health_relative_trust_deadband,
+                      &params->relative_trust_deadband);
+  overridePositiveInt(FLAGS_cbs_receiver_health_relative_trust_warmup_samples,
+                      &params->relative_trust_warmup_samples);
+  overrideNonnegative(FLAGS_cbs_receiver_health_floor_rot_sigma_rad,
+                      &params->floor_rot_sigma_rad);
+  overrideNonnegative(FLAGS_cbs_receiver_health_floor_trans_sigma_m,
+                      &params->floor_trans_sigma_m);
+  overrideNonnegative(FLAGS_cbs_receiver_health_eps, &params->eps);
+  sanitizeHealthParams(params);
 }
 
 inline bool isValidCbsOdomSenderMode(const std::string& mode) {
@@ -666,6 +914,10 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
       FLAGS_cbs_use_temporary_cbs_linear_factors;
   bpsam_params.cbs_odom_factor_mode =
       parseCbsOdomFactorMode(FLAGS_cbs_odom_factor_mode);
+  bpsam_params.outgoing_odom_covariance_mode =
+      FLAGS_cbs_odom_covariance_mode;
+  bpsam_params.active_cbs_odom_factor_diagnostics_enable =
+      FLAGS_cbs_active_factor_diagnostic_enable;
   bpsam_params.temporary_linear_already_applied_gate_enable =
       FLAGS_cbs_temporary_linear_already_applied_gate_enable;
   bpsam_params.temporary_linear_already_applied_metric_threshold =
@@ -683,30 +935,15 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
         [static_cast<cbs::AgentId>('g')] =
             FLAGS_cbs_l2k_odom_factor_covariance_scale;
   }
-  cbs_health_params_.enable = FLAGS_cbs_health_aware_enable;
-  cbs_health_params_.sender_enable = FLAGS_cbs_health_sender_enable;
-  cbs_health_params_.receiver_nis_enable = FLAGS_cbs_health_receiver_nis_enable;
-  cbs_health_params_.alpha_min = FLAGS_cbs_health_alpha_min;
-  cbs_health_params_.alpha_max = FLAGS_cbs_health_alpha_max;
-  if (cbs_health_params_.alpha_max < cbs_health_params_.alpha_min) {
-    std::swap(cbs_health_params_.alpha_min, cbs_health_params_.alpha_max);
-  }
-  cbs_health_params_.alpha_cons_max = FLAGS_cbs_health_alpha_cons_max;
-  cbs_health_params_.chi2_threshold = FLAGS_cbs_health_chi2_threshold;
-  cbs_health_params_.beta_receiver_cov = FLAGS_cbs_health_beta_receiver_cov;
-  cbs_health_params_.w_logdet = FLAGS_cbs_health_w_logdet;
-  cbs_health_params_.w_lambda = FLAGS_cbs_health_w_lambda;
-  cbs_health_params_.w_growth = FLAGS_cbs_health_w_growth;
-  cbs_health_params_.kappa = FLAGS_cbs_health_kappa;
-  cbs_health_params_.warmup_samples =
-      std::max(1, FLAGS_cbs_health_warmup_samples);
-  cbs_health_params_.rot_sigma0_rad = FLAGS_cbs_health_rot_sigma0_rad;
-  cbs_health_params_.trans_sigma0_m = FLAGS_cbs_health_trans_sigma0_m;
-  cbs_health_params_.floor_rot_sigma_rad = FLAGS_cbs_health_floor_rot_sigma_rad;
-  cbs_health_params_.floor_trans_sigma_m =
-      FLAGS_cbs_health_floor_trans_sigma_m;
-  cbs_health_params_.eps = FLAGS_cbs_health_eps;
-  bpsam_params.health_aware_params = cbs_health_params_;
+  const cbs::health_aware::Params common_health_params =
+      makeCommonHealthParamsFromFlags();
+  cbs_health_sender_params_ = common_health_params;
+  cbs_health_receiver_params_ = common_health_params;
+  applySenderHealthFlagOverrides(&cbs_health_sender_params_);
+  applyReceiverHealthFlagOverrides(&cbs_health_receiver_params_);
+  bpsam_params.health_aware_params = cbs_health_receiver_params_;
+  bpsam_params.health_aware_receiver_params = cbs_health_receiver_params_;
+  bpsam_params.has_health_aware_receiver_params = true;
 
   smoother_ =
       std::make_unique<Smoother>(backend_params.nr_states_, bpsam_params);
@@ -824,15 +1061,17 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
             << (FLAGS_cbs_use_temporary_cbs_linear_factors ? "enabled"
                                                            : "disabled");
   LOG(INFO) << "CBS health-aware relative odometry: "
-            << (cbs_health_params_.enable ? "enabled" : "disabled")
-            << " sender=" << (cbs_health_params_.sender_enable ? "on" : "off")
+            << (cbs_health_sender_params_.enable ? "enabled" : "disabled")
+            << " sender="
+            << (cbs_health_sender_params_.sender_enable ? "on" : "off")
             << " receiver_nis="
-            << (cbs_health_params_.receiver_nis_enable ? "on" : "off")
-            << " alpha=[" << cbs_health_params_.alpha_min << ","
-            << cbs_health_params_.alpha_max << "]"
-            << " alpha_cons_max=" << cbs_health_params_.alpha_cons_max
-            << " chi2=" << cbs_health_params_.chi2_threshold
-            << " warmup=" << cbs_health_params_.warmup_samples;
+            << (cbs_health_receiver_params_.receiver_nis_enable ? "on" : "off")
+            << " sender_alpha=[" << cbs_health_sender_params_.alpha_min << ","
+            << cbs_health_sender_params_.alpha_max << "]"
+            << " receiver_alpha_cons_max="
+            << cbs_health_receiver_params_.alpha_cons_max
+            << " receiver_chi2=" << cbs_health_receiver_params_.chi2_threshold
+            << " sender_warmup=" << cbs_health_sender_params_.warmup_samples;
 
   if (FLAGS_cbs_backend_enable) {
     initializePoseBeliefCovarianceSidecarAdapter();
@@ -1096,7 +1335,13 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
           external_beliefs_rejected_shape_per_update_,
           external_beliefs_rejected_exception_per_update_,
           optimization_time_sec_per_update_,
+          optimize_total_time_sec_per_update_,
+          collect_external_beliefs_time_sec_per_update_,
+          compute_state_covariance_time_sec_per_update_,
           cbs_belief_generation_time_sec_per_update_,
+          cbs_outgoing_total_time_sec_per_update_,
+          cbs_set_marginalization_graph_time_sec_per_update_,
+          cbs_get_odometry_beliefs_time_sec_per_update_,
           cbs_marginalization_graph_factor_count_,
           cbs_outgoing_odom_beliefs_);
     } catch (const std::exception& e) {
@@ -2141,7 +2386,8 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
       stamped_belief.received_wall_time_sec = wallTimeNowSec();
       stamped_belief.relax_factor = odom.relax_factor;
       gtsam::Matrix covariance_to_send = odom.covariance;
-      if (cbs_health_params_.enable && cbs_health_params_.sender_enable) {
+      if (cbs_health_sender_params_.enable &&
+          cbs_health_sender_params_.sender_enable) {
         std::optional<gtsam::Matrix> absolute_covariance;
         if (odom.to_pose_covariance_valid) {
           absolute_covariance = odom.to_pose_covariance;
@@ -2150,7 +2396,7 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
             odom.covariance,
             absolute_covariance,
             &cbs_sender_health_state_,
-            cbs_health_params_);
+            cbs_health_sender_params_);
         covariance_to_send = health_result.covariance;
         logHealthAwareSenderRow(static_cast<uint8_t>('k'),
                                 cbs_odom_requesting_agent_id_,
@@ -3100,6 +3346,9 @@ bool VioBackend::optimize(
   external_beliefs_rejected_shape_per_update_ = 0u;
   external_beliefs_rejected_exception_per_update_ = 0u;
   optimization_time_sec_per_update_ = 0.0;
+  optimize_total_time_sec_per_update_ = 0.0;
+  collect_external_beliefs_time_sec_per_update_ = 0.0;
+  compute_state_covariance_time_sec_per_update_ = 0.0;
   cbs_belief_generation_time_sec_per_update_ = 0.0;
   cbs_outgoing_total_time_sec_per_update_ = 0.0;
   cbs_set_marginalization_graph_time_sec_per_update_ = 0.0;
@@ -3491,6 +3740,11 @@ bool VioBackend::optimize(
     }
   }
   const double optimize_total_time_sec = elapsedSec(total_start_time);
+  optimize_total_time_sec_per_update_ = optimize_total_time_sec;
+  collect_external_beliefs_time_sec_per_update_ =
+      collect_external_beliefs_time_sec;
+  compute_state_covariance_time_sec_per_update_ =
+      compute_state_covariance_time_sec;
   LOG(INFO) << "KIMERA_OPTIMIZE_TIMING_ROW,"
             << cur_id << ","
             << secToMs(optimize_total_time_sec) << ","

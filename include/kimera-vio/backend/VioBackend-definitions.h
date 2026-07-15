@@ -335,7 +335,13 @@ struct BackendOutput : public PipelinePayload {
       size_t external_beliefs_rejected_shape_per_update = 0u,
       size_t external_beliefs_rejected_exception_per_update = 0u,
       double optimization_time_sec = 0.0,
+      double optimize_total_time_sec = 0.0,
+      double collect_external_beliefs_time_sec = 0.0,
+      double compute_state_covariance_time_sec = 0.0,
       double cbs_belief_generation_time_sec = 0.0,
+      double cbs_outgoing_total_time_sec = 0.0,
+      double cbs_set_marginalization_graph_time_sec = 0.0,
+      double cbs_get_odometry_beliefs_time_sec = 0.0,
       size_t cbs_marginalization_graph_factor_count = 0u,
       std::vector<ExternalOdometryBelief> cbs_outgoing_odom_beliefs = {})
       : PipelinePayload(timestamp_kf),
@@ -365,7 +371,16 @@ struct BackendOutput : public PipelinePayload {
         external_beliefs_rejected_exception_per_update_(
             external_beliefs_rejected_exception_per_update),
         optimization_time_sec_(optimization_time_sec),
+        optimize_total_time_sec_(optimize_total_time_sec),
+        collect_external_beliefs_time_sec_(
+            collect_external_beliefs_time_sec),
+        compute_state_covariance_time_sec_(compute_state_covariance_time_sec),
         cbs_belief_generation_time_sec_(cbs_belief_generation_time_sec),
+        cbs_outgoing_total_time_sec_(cbs_outgoing_total_time_sec),
+        cbs_set_marginalization_graph_time_sec_(
+            cbs_set_marginalization_graph_time_sec),
+        cbs_get_odometry_beliefs_time_sec_(
+            cbs_get_odometry_beliefs_time_sec),
         cbs_marginalization_graph_factor_count_(
             cbs_marginalization_graph_factor_count),
         cbs_outgoing_odom_beliefs_(std::move(cbs_outgoing_odom_beliefs)) {}
@@ -391,7 +406,13 @@ struct BackendOutput : public PipelinePayload {
       size_t external_beliefs_rejected_shape_per_update = 0u,
       size_t external_beliefs_rejected_exception_per_update = 0u,
       double optimization_time_sec = 0.0,
+      double optimize_total_time_sec = 0.0,
+      double collect_external_beliefs_time_sec = 0.0,
+      double compute_state_covariance_time_sec = 0.0,
       double cbs_belief_generation_time_sec = 0.0,
+      double cbs_outgoing_total_time_sec = 0.0,
+      double cbs_set_marginalization_graph_time_sec = 0.0,
+      double cbs_get_odometry_beliefs_time_sec = 0.0,
       size_t cbs_marginalization_graph_factor_count = 0u,
       std::vector<ExternalOdometryBelief> cbs_outgoing_odom_beliefs = {})
       : PipelinePayload(vio_navstate_timestamped.timestamp_),
@@ -421,7 +442,16 @@ struct BackendOutput : public PipelinePayload {
         external_beliefs_rejected_exception_per_update_(
             external_beliefs_rejected_exception_per_update),
         optimization_time_sec_(optimization_time_sec),
+        optimize_total_time_sec_(optimize_total_time_sec),
+        collect_external_beliefs_time_sec_(
+            collect_external_beliefs_time_sec),
+        compute_state_covariance_time_sec_(compute_state_covariance_time_sec),
         cbs_belief_generation_time_sec_(cbs_belief_generation_time_sec),
+        cbs_outgoing_total_time_sec_(cbs_outgoing_total_time_sec),
+        cbs_set_marginalization_graph_time_sec_(
+            cbs_set_marginalization_graph_time_sec),
+        cbs_get_odometry_beliefs_time_sec_(
+            cbs_get_odometry_beliefs_time_sec),
         cbs_marginalization_graph_factor_count_(
             cbs_marginalization_graph_factor_count),
         cbs_outgoing_odom_beliefs_(std::move(cbs_outgoing_odom_beliefs)) {}
@@ -446,7 +476,13 @@ struct BackendOutput : public PipelinePayload {
   const size_t external_beliefs_rejected_shape_per_update_;
   const size_t external_beliefs_rejected_exception_per_update_;
   const double optimization_time_sec_;
+  const double optimize_total_time_sec_;
+  const double collect_external_beliefs_time_sec_;
+  const double compute_state_covariance_time_sec_;
   const double cbs_belief_generation_time_sec_;
+  const double cbs_outgoing_total_time_sec_;
+  const double cbs_set_marginalization_graph_time_sec_;
+  const double cbs_get_odometry_beliefs_time_sec_;
   const size_t cbs_marginalization_graph_factor_count_;
   const std::vector<ExternalOdometryBelief> cbs_outgoing_odom_beliefs_;
 };
