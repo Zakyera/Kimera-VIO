@@ -37,10 +37,13 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <cxxabi.h>
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <iomanip>
 #include <limits>  // for numeric_limits<>
@@ -49,6 +52,7 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <typeinfo>
 #include <unordered_set>
 #include <utility>  // for make_pair
 #include <vector>
@@ -118,10 +122,44 @@ DEFINE_string(cbs_odom_covariance_mode,
               "schur_relative_between",
               "CBS outgoing odometry covariance mode: "
               "schur_relative_between or conditional_to_pose.");
+DEFINE_bool(cbs_relative_covariance_matrix_dump_enable,
+            false,
+            "Log raw joint marginal information/covariance matrices for a "
+            "bounded number of outgoing CBS odometry covariance samples.");
+DEFINE_int32(cbs_relative_covariance_matrix_dump_skip,
+             0,
+             "Skip this many eligible outgoing CBS odometry covariance "
+             "computations before dumping matrices.");
+DEFINE_int32(cbs_relative_covariance_matrix_dump_limit,
+             3,
+             "Maximum outgoing CBS odometry covariance samples to dump. "
+             "Use -1 for unlimited samples.");
+DEFINE_double(cbs_relative_covariance_matrix_dump_trace_max,
+              0.0,
+              "Only dump raw CBS odometry covariance matrices when the Schur "
+              "relative covariance trace is at or below this value. "
+              "Use <=0 to disable trace filtering.");
 DEFINE_bool(cbs_active_factor_diagnostic_enable,
             true,
             "Log active CBS odometry factor Hessian diagnostics against local "
             "backend factors.");
+DEFINE_bool(cbs_active_factor_detail_diagnostic_enable,
+            false,
+            "Log per-factor type/key/error/Hessian diagnostics for active CBS "
+            "odometry factors against local backend factors.");
+DEFINE_bool(kimera_factor_graph_audit_enable,
+            false,
+            "Log diagnostic-only Kimera smoother factor graph size and factor "
+            "type composition after each backend optimization update.");
+DEFINE_bool(kimera_shadow_acceptance_audit_enable,
+            false,
+            "Run a discarded copy of each BPSAM-backed Kimera update with "
+            "forced relinearization and a full delta solve, then compare its "
+            "objective and pose movement with the accepted production update.");
+DEFINE_int32(cbs_active_factor_detail_max_rows_per_update,
+             1000,
+             "Maximum per-factor active CBS diagnostic rows to emit per "
+             "backend update. Use 0 to disable detail logging.");
 DEFINE_bool(cbs_temporary_linear_already_applied_gate_enable,
             true,
             "In temporary-linear CBS mode, skip near-identical beliefs from "
@@ -438,6 +476,175 @@ inline double elapsedSec(const TimerStart& start_time) {
 inline double secToMs(const double seconds) {
   return seconds * 1000.0;
 }
+
+double shadowAcceptanceObjectiveRatio(
+    const Smoother::ShadowAcceptanceAudit& audit) {
+  if (!audit.valid || std::abs(audit.objective_before) < 1e-15) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  return audit.objective_after / audit.objective_before;
+}
+
+Smoother::ShadowAcceptancePoseMovementSummary
+summarizeShadowCandidateDifference(const gtsam::Values& normal,
+                                   const gtsam::Values& shadow) {
+  Smoother::ShadowAcceptancePoseMovementSummary summary;
+  double translation_sum = 0.0;
+  double rotation_sum_deg = 0.0;
+  constexpr double kRadiansToDegrees =
+      57.295779513082320876798154814105;
+  for (const gtsam::Key key : normal.keys()) {
+    if (gtsam::Symbol(key).chr() != 'x' || !shadow.exists(key)) {
+      continue;
+    }
+    try {
+      const gtsam::Pose3 delta =
+          normal.at<gtsam::Pose3>(key).between(
+              shadow.at<gtsam::Pose3>(key));
+      const double translation_m = delta.translation().norm();
+      const double rotation_deg =
+          gtsam::Rot3::Logmap(delta.rotation()).norm() *
+          kRadiansToDegrees;
+      ++summary.pose_count;
+      translation_sum += translation_m;
+      rotation_sum_deg += rotation_deg;
+      summary.translation_max_m =
+          std::max(summary.translation_max_m, translation_m);
+      summary.rotation_max_deg =
+          std::max(summary.rotation_max_deg, rotation_deg);
+    } catch (const std::exception&) {
+    }
+  }
+  if (summary.pose_count > 0u) {
+    summary.translation_mean_m =
+        translation_sum / static_cast<double>(summary.pose_count);
+    summary.rotation_mean_deg =
+        rotation_sum_deg / static_cast<double>(summary.pose_count);
+  }
+  return summary;
+}
+
+void logShadowAcceptanceFactorErrors(
+    const char* candidate,
+    const Smoother::ShadowAcceptanceAudit& audit) {
+  for (const auto& [category, summary] : audit.factor_errors) {
+    LOG(INFO) << std::setprecision(17)
+              << "KIMERA_SHADOW_ACCEPTANCE_FACTOR_ROW,"
+              << audit.timestamp << "," << audit.latest_frame << ","
+              << candidate << "," << category << "," << summary.count << ","
+              << summary.before_valid << "," << summary.after_valid << ","
+              << summary.before_error << "," << summary.after_error;
+  }
+}
+
+void logShadowAcceptanceComparison(
+    const Smoother::ShadowAcceptanceAudit& normal,
+    const Smoother::ShadowAcceptanceAudit& shadow,
+    const std::string& status) {
+  const auto normal_vs_shadow = summarizeShadowCandidateDifference(
+      normal.candidate_values, shadow.candidate_values);
+  LOG(INFO) << std::setprecision(17)
+            << "KIMERA_SHADOW_ACCEPTANCE_ROW," << normal.timestamp << ","
+            << normal.latest_frame << "," << status << "," << normal.valid
+            << "," << normal.objective_before << "," << normal.objective_after
+            << "," << shadowAcceptanceObjectiveRatio(normal) << ","
+            << normal.movement.pose_count << ","
+            << normal.movement.translation_mean_m << ","
+            << normal.movement.translation_max_m << ","
+            << normal.movement.rotation_mean_deg << ","
+            << normal.movement.rotation_max_deg << ","
+            << normal.variables_relinearized << ","
+            << normal.variables_reeliminated << "," << shadow.valid << ","
+            << shadow.objective_before << "," << shadow.objective_after << ","
+            << shadowAcceptanceObjectiveRatio(shadow) << ","
+            << shadow.movement.pose_count << ","
+            << shadow.movement.translation_mean_m << ","
+            << shadow.movement.translation_max_m << ","
+            << shadow.movement.rotation_mean_deg << ","
+            << shadow.movement.rotation_max_deg << ","
+            << shadow.variables_relinearized << ","
+            << shadow.variables_reeliminated << ","
+            << normal_vs_shadow.pose_count << ","
+            << normal_vs_shadow.translation_mean_m << ","
+            << normal_vs_shadow.translation_max_m << ","
+            << normal_vs_shadow.rotation_mean_deg << ","
+            << normal_vs_shadow.rotation_max_deg;
+  logShadowAcceptanceFactorErrors("normal", normal);
+  logShadowAcceptanceFactorErrors("shadow_forced_full", shadow);
+}
+
+std::string sanitizeAuditToken(std::string token) {
+  for (char& ch : token) {
+    if (ch == ',' || ch == '\n' || ch == '\r' || ch == '\t' ||
+        std::isspace(static_cast<unsigned char>(ch))) {
+      ch = '_';
+    }
+  }
+  return token;
+}
+
+std::string demangledTypeName(const std::type_info& type_info) {
+  int status = 0;
+  char* demangled =
+      abi::__cxa_demangle(type_info.name(), nullptr, nullptr, &status);
+  std::string name =
+      status == 0 && demangled ? std::string(demangled) : type_info.name();
+  std::free(demangled);
+  return sanitizeAuditToken(name);
+}
+
+std::map<char, size_t> keySymbolCounts(const gtsam::KeyVector& keys) {
+  std::map<char, size_t> counts;
+  for (const auto& key : keys) {
+    const gtsam::Symbol symbol(key);
+    char chr = symbol.chr();
+    if (!std::isprint(static_cast<unsigned char>(chr))) {
+      chr = '?';
+    }
+    ++counts[chr];
+  }
+  return counts;
+}
+
+std::string keySignatureToken(const gtsam::KeyVector& keys) {
+  const auto counts = keySymbolCounts(keys);
+  if (counts.empty()) {
+    return "none";
+  }
+  std::ostringstream ss;
+  bool first = true;
+  for (const auto& [chr, count] : counts) {
+    if (!first) {
+      ss << "|";
+    }
+    first = false;
+    ss << chr << ":" << count;
+  }
+  return sanitizeAuditToken(ss.str());
+}
+
+std::string formattedKeyListToken(const gtsam::KeyVector& keys) {
+  std::ostringstream ss;
+  bool first = true;
+  for (const gtsam::Key key : keys) {
+    if (!first) {
+      ss << "|";
+    }
+    first = false;
+    ss << gtsam::DefaultKeyFormatter(key);
+  }
+  return sanitizeAuditToken(ss.str());
+}
+
+struct FactorGraphAuditSummary {
+  size_t count = 0u;
+  size_t key_count_sum = 0u;
+  size_t pose_key_count_sum = 0u;
+  size_t velocity_key_count_sum = 0u;
+  size_t bias_key_count_sum = 0u;
+  size_t landmark_key_count_sum = 0u;
+  size_t other_key_count_sum = 0u;
+};
 
 inline std::string normalizeCbsOdomSenderMode(std::string mode) {
   std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
@@ -916,8 +1123,23 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
       parseCbsOdomFactorMode(FLAGS_cbs_odom_factor_mode);
   bpsam_params.outgoing_odom_covariance_mode =
       FLAGS_cbs_odom_covariance_mode;
+  bpsam_params.relative_covariance_matrix_dump_enable =
+      FLAGS_cbs_relative_covariance_matrix_dump_enable;
+  bpsam_params.relative_covariance_matrix_dump_skip =
+      FLAGS_cbs_relative_covariance_matrix_dump_skip;
+  bpsam_params.relative_covariance_matrix_dump_limit =
+      FLAGS_cbs_relative_covariance_matrix_dump_limit;
+  bpsam_params.relative_covariance_matrix_dump_trace_max =
+      FLAGS_cbs_relative_covariance_matrix_dump_trace_max;
   bpsam_params.active_cbs_odom_factor_diagnostics_enable =
       FLAGS_cbs_active_factor_diagnostic_enable;
+  bpsam_params.active_cbs_odom_factor_detail_diagnostics_enable =
+      FLAGS_cbs_active_factor_detail_diagnostic_enable;
+  bpsam_params.active_cbs_odom_factor_detail_max_rows_per_update =
+      FLAGS_cbs_active_factor_detail_max_rows_per_update > 0
+          ? static_cast<size_t>(
+                FLAGS_cbs_active_factor_detail_max_rows_per_update)
+          : 0u;
   bpsam_params.temporary_linear_already_applied_gate_enable =
       FLAGS_cbs_temporary_linear_already_applied_gate_enable;
   bpsam_params.temporary_linear_already_applied_metric_threshold =
@@ -1343,7 +1565,9 @@ BackendOutput::UniquePtr VioBackend::spinOnce(const BackendInput& input) {
           cbs_set_marginalization_graph_time_sec_per_update_,
           cbs_get_odometry_beliefs_time_sec_per_update_,
           cbs_marginalization_graph_factor_count_,
-          cbs_outgoing_odom_beliefs_);
+          cbs_outgoing_odom_beliefs_,
+          smoother_->trackedCbsOdomFactors(),
+          cbs_pose_merge_diagnostic_);
     } catch (const std::exception& e) {
       LOG(ERROR)
           << "VioBackend::spinOnce failed while creating backend output: "
@@ -2076,6 +2300,46 @@ void VioBackend::collectExternalBeliefFactors(
         switch (detail.status) {
           case cbs::BPSAM::AddOdometryBeliefStatus::Accepted:
             ++external_beliefs_added_per_update_;
+            {
+              const gtsam::Key from_key =
+                  candidate.odom_belief.from_pose_key;
+              const gtsam::Key to_key = candidate.odom_belief.to_pose_key;
+              const auto pose_before = [this](const gtsam::Key key,
+                                              gtsam::Pose3* pose) {
+                CHECK_NOTNULL(pose);
+                if (new_values_.exists(key)) {
+                  *pose = new_values_.at<gtsam::Pose3>(key);
+                  return true;
+                }
+                if (state_.exists(key)) {
+                  *pose = state_.at<gtsam::Pose3>(key);
+                  return true;
+                }
+                return false;
+              };
+
+              gtsam::Pose3 from_pose_before;
+              gtsam::Pose3 to_pose_before;
+              CbsPoseMergeDiagnostic diagnostic;
+              diagnostic.valid = pose_before(from_key, &from_pose_before) &&
+                                 pose_before(to_key, &to_pose_before);
+              diagnostic.optimization_frame_id = cur_id;
+              diagnostic.from_pose_key = from_key;
+              diagnostic.to_pose_key = to_key;
+              diagnostic.local_relative_before =
+                  from_pose_before.between(to_pose_before);
+              diagnostic.external_relative =
+                  candidate.odom_belief.measured_from_to;
+
+              if (diagnostic.valid &&
+                  (!pending_cbs_pose_merge_diagnostic_.valid ||
+                   gtsam::Symbol(to_key).index() >=
+                       gtsam::Symbol(
+                           pending_cbs_pose_merge_diagnostic_.to_pose_key)
+                           .index())) {
+                pending_cbs_pose_merge_diagnostic_ = std::move(diagnostic);
+              }
+            }
             break;
           case cbs::BPSAM::AddOdometryBeliefStatus::
               AcceptedButSkippedAlreadyApplied:
@@ -3355,6 +3619,7 @@ bool VioBackend::optimize(
   cbs_get_odometry_beliefs_time_sec_per_update_ = 0.0;
   cbs_marginalization_graph_factor_count_ = 0u;
   cbs_outgoing_odom_beliefs_.clear();
+  pending_cbs_pose_merge_diagnostic_ = CbsPoseMergeDiagnostic();
   double factor_preparation_time_sec = 0.0;
   double collect_external_beliefs_time_sec = 0.0;
   double delete_slots_sort_time_sec = 0.0;
@@ -3398,6 +3663,52 @@ bool VioBackend::optimize(
                           new_imu_prior_and_other_factors_.size());
   new_factors_local_belief_cov.reserve(new_smart_factors_size +
                                        new_imu_prior_and_other_factors_.size());
+  const double smart_marginal_cutoff =
+      static_cast<double>(cur_id) -
+      static_cast<double>(backend_params_.nr_states_);
+  const auto log_smart_marginal_separator =
+      [&](const LandmarkId lmk_id,
+          const SmartStereoFactor::shared_ptr& factor,
+          const Slot slot,
+          const char* lifecycle) {
+        if (!FLAGS_cbs_active_factor_detail_diagnostic_enable || !factor ||
+            smart_marginal_cutoff <= 0.0) {
+          return;
+        }
+
+        gtsam::KeyVector pose_keys;
+        gtsam::KeyVector marginal_pose_keys;
+        for (const gtsam::Key key : factor->keys()) {
+          const gtsam::Symbol symbol(key);
+          if (symbol.chr() != kPoseSymbolChar) {
+            continue;
+          }
+          pose_keys.push_back(key);
+          if (static_cast<double>(symbol.index()) < smart_marginal_cutoff) {
+            marginal_pose_keys.push_back(key);
+          }
+        }
+        if (marginal_pose_keys.empty()) {
+          return;
+        }
+
+        const gtsam::Symbol first_pose(pose_keys.front());
+        const gtsam::Symbol last_pose(pose_keys.back());
+        LOG(INFO) << "KIMERA_SMART_MARGINAL_SEPARATOR_ROW,"
+                  << cur_id << ","
+                  << smart_marginal_cutoff << ","
+                  << lmk_id << ","
+                  << lifecycle << ","
+                  << slot << ","
+                  << pose_keys.size() << ","
+                  << first_pose.index() << ","
+                  << last_pose.index() << ","
+                  << (last_pose.index() - first_pose.index()) << ","
+                  << marginal_pose_keys.size() << ","
+                  << formattedKeyListToken(marginal_pose_keys) << ","
+                  << formattedKeyListToken(pose_keys);
+      };
+
   for (const auto& new_smart_factor : new_smart_factors_) {
     // Push back the smart factor to the list of new factors to add to the
     // graph. // Smart factor, so same address right?
@@ -3424,6 +3735,8 @@ bool VioBackend::optimize(
         new_factors_tmp.push_back(new_smart_factor.second);
         // Store lmk id of the smart factor to add to the graph.
         lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
+        log_smart_marginal_separator(
+            lmk_id, new_smart_factor.second, slot, "updated_replacement");
       } else {
         // This should not happen, unless feature tracks are so long
         // (longer than factor graph's time horizon), than the factor has been
@@ -3440,7 +3753,23 @@ bool VioBackend::optimize(
       new_factors_tmp.push_back(new_smart_factor.second);
       // Store lmk id of the smart factor to add to the graph.
       lmk_ids_of_new_smart_factors_tmp.push_back(lmk_id);
+      log_smart_marginal_separator(
+          lmk_id, new_smart_factor.second, slot, "updated_new");
     }
+  }
+
+  for (const auto& [lmk_id, old_smart_factor] : old_smart_factors_) {
+    if (new_smart_factors_.find(lmk_id) != new_smart_factors_.end()) {
+      continue;
+    }
+    const Slot slot = old_smart_factor.second;
+    if (slot < 0 || !mainBackendFactorExists(static_cast<size_t>(slot)) ||
+        mainBackendFactorAt(static_cast<size_t>(slot)) !=
+            old_smart_factor.first) {
+      continue;
+    }
+    log_smart_marginal_separator(
+        lmk_id, old_smart_factor.first, slot, "retained_existing");
   }
 
   // Add also other factors (imu, priors).
@@ -3702,7 +4031,43 @@ bool VioBackend::optimize(
                    << cur_id << ".";
         throw;
       }
+
+      if (pending_cbs_pose_merge_diagnostic_.valid) {
+        const gtsam::Key from_key =
+            pending_cbs_pose_merge_diagnostic_.from_pose_key;
+        const gtsam::Key to_key = pending_cbs_pose_merge_diagnostic_.to_pose_key;
+        if (state_.exists(from_key) && state_.exists(to_key)) {
+          pending_cbs_pose_merge_diagnostic_.final_relative_after =
+              state_.at<gtsam::Pose3>(from_key)
+                  .between(state_.at<gtsam::Pose3>(to_key));
+          cbs_pose_merge_diagnostic_ = pending_cbs_pose_merge_diagnostic_;
+
+          const gtsam::Vector6 local_to_external = gtsam::Pose3::Logmap(
+              cbs_pose_merge_diagnostic_.local_relative_before.between(
+                  cbs_pose_merge_diagnostic_.external_relative));
+          const gtsam::Vector6 final_to_external = gtsam::Pose3::Logmap(
+              cbs_pose_merge_diagnostic_.final_relative_after.between(
+                  cbs_pose_merge_diagnostic_.external_relative));
+          LOG(INFO) << "KIMERA_CBS_POSE_MERGE_ROW,"
+                    << cbs_pose_merge_diagnostic_.optimization_frame_id << ","
+                    << gtsam::DefaultKeyFormatter(from_key) << "->"
+                    << gtsam::DefaultKeyFormatter(to_key) << ","
+                    << local_to_external.head<3>().norm() << ","
+                    << local_to_external.tail<3>().norm() << ","
+                    << final_to_external.head<3>().norm() << ","
+                    << final_to_external.tail<3>().norm();
+        }
+      }
       update_states_time_sec = elapsedSec(update_states_start_time);
+
+      if (FLAGS_kimera_factor_graph_audit_enable) {
+        logFactorGraphAudit(cur_id,
+                            timestamp_kf_nsec,
+                            new_factors_tmp.size(),
+                            delete_slots.size(),
+                            num_factors_before_external,
+                            inserted_external_factor_ids.size());
+      }
 
       if (FLAGS_cbs_backend_enable) {
         try {
@@ -3768,6 +4133,136 @@ bool VioBackend::optimize(
 
 /// Private methods.
 /* -------------------------------------------------------------------------- */
+void VioBackend::logFactorGraphAudit(
+    const FrameId& cur_id,
+    const Timestamp& timestamp_kf_nsec,
+    const size_t new_factor_count,
+    const size_t delete_slot_count,
+    const size_t num_factors_before_external,
+    const size_t inserted_external_factor_count) const {
+  const auto& graph = getMainBackendFactors();
+  const size_t graph_slots = graph.size();
+  size_t live_factor_count = 0u;
+  std::map<std::pair<std::string, std::string>, FactorGraphAuditSummary>
+      factor_summaries;
+
+  for (size_t slot = 0u; slot < graph_slots; ++slot) {
+    if (!graph.exists(slot)) {
+      continue;
+    }
+    const auto& factor = graph.at(slot);
+    if (!factor) {
+      continue;
+    }
+    ++live_factor_count;
+
+    const std::string factor_type = demangledTypeName(typeid(*factor));
+    const std::string key_signature = keySignatureToken(factor->keys());
+    const auto symbol_counts = keySymbolCounts(factor->keys());
+    auto& summary = factor_summaries[{factor_type, key_signature}];
+    const size_t key_count = factor->keys().size();
+    const size_t pose_count =
+        symbol_counts.count(kPoseSymbolChar) ? symbol_counts.at(kPoseSymbolChar)
+                                             : 0u;
+    const size_t velocity_count =
+        symbol_counts.count(kVelocitySymbolChar)
+            ? symbol_counts.at(kVelocitySymbolChar)
+            : 0u;
+    const size_t bias_count =
+        symbol_counts.count(kImuBiasSymbolChar)
+            ? symbol_counts.at(kImuBiasSymbolChar)
+            : 0u;
+    const size_t landmark_count =
+        symbol_counts.count(kLandmarkSymbolChar)
+            ? symbol_counts.at(kLandmarkSymbolChar)
+            : 0u;
+    const size_t known_count =
+        pose_count + velocity_count + bias_count + landmark_count;
+    ++summary.count;
+    summary.key_count_sum += key_count;
+    summary.pose_key_count_sum += pose_count;
+    summary.velocity_key_count_sum += velocity_count;
+    summary.bias_key_count_sum += bias_count;
+    summary.landmark_key_count_sum += landmark_count;
+    summary.other_key_count_sum +=
+        key_count > known_count ? key_count - known_count : 0u;
+  }
+
+  size_t state_pose_count = 0u;
+  size_t state_velocity_count = 0u;
+  size_t state_bias_count = 0u;
+  size_t state_landmark_count = 0u;
+  size_t state_other_count = 0u;
+  for (const auto& key_value : state_) {
+    const gtsam::Symbol symbol(key_value.key);
+    switch (symbol.chr()) {
+      case kPoseSymbolChar:
+        ++state_pose_count;
+        break;
+      case kVelocitySymbolChar:
+        ++state_velocity_count;
+        break;
+      case kImuBiasSymbolChar:
+        ++state_bias_count;
+        break;
+      case kLandmarkSymbolChar:
+        ++state_landmark_count;
+        break;
+      default:
+        ++state_other_count;
+        break;
+    }
+  }
+
+  const size_t null_factor_slots =
+      graph_slots >= live_factor_count ? graph_slots - live_factor_count : 0u;
+  LOG(INFO) << "KIMERA_FACTOR_GRAPH_AUDIT_ROW,"
+            << cur_id << ","
+            << static_cast<double>(timestamp_kf_nsec) * 1e-9 << ","
+            << backend_params_.nr_states_ << ","
+            << graph_slots << ","
+            << live_factor_count << ","
+            << null_factor_slots << ","
+            << new_factor_count << ","
+            << delete_slot_count << ","
+            << num_factors_before_external << ","
+            << inserted_external_factor_count << ","
+            << state_.size() << ","
+            << state_pose_count << ","
+            << state_velocity_count << ","
+            << state_bias_count << ","
+            << state_landmark_count << ","
+            << state_other_count << ","
+            << old_smart_factors_.size() << ","
+            << new_smart_factors_.size() << ","
+            << landmark_count_;
+
+  for (const auto& [key, summary] : factor_summaries) {
+    if (summary.count == 0u) {
+      continue;
+    }
+    const auto mean = [&summary](const size_t value) {
+      return static_cast<double>(value) /
+             static_cast<double>(std::max<size_t>(summary.count, 1u));
+    };
+    LOG(INFO) << "KIMERA_FACTOR_GRAPH_FACTOR_DETAIL_ROW,"
+              << cur_id << ","
+              << static_cast<double>(timestamp_kf_nsec) * 1e-9 << ","
+              << backend_params_.nr_states_ << ","
+              << graph_slots << ","
+              << live_factor_count << ","
+              << sanitizeAuditToken(key.first) << ","
+              << sanitizeAuditToken(key.second) << ","
+              << summary.count << ","
+              << mean(summary.key_count_sum) << ","
+              << mean(summary.pose_key_count_sum) << ","
+              << mean(summary.velocity_key_count_sum) << ","
+              << mean(summary.bias_key_count_sum) << ","
+              << mean(summary.landmark_key_count_sum) << ","
+              << mean(summary.other_key_count_sum);
+  }
+}
+
 void VioBackend::addInitialPriorFactors(const FrameId& frame_id) {
   // Set initial covariance for inertial factors
   // W_Pose_Blkf_ set by motion capture to start with
@@ -3913,7 +4408,8 @@ bool VioBackend::updateSmoother(gtsam::FixedLagSmoother::Result* result,
                                              timestamps,
                                              delete_slots,
                                              0u,
-                                             &ignored_smart_slots);
+                                             &ignored_smart_slots,
+                                             FLAGS_kimera_shadow_acceptance_audit_enable);
         };
 
     if (try_main_backend_update(new_factors, new_values)) {
@@ -4050,14 +4546,44 @@ bool VioBackend::updateSmoother(gtsam::FixedLagSmoother::Result* result,
   // This is not doing a full deep copy: it is keeping same shared_ptrs for
   // factors but copying the isam result.
   Smoother smoother_backup(*smoother_);
+  std::unique_ptr<Smoother> shadow_smoother;
+  gtsam::NonlinearFactorGraph shadow_new_factors;
+  Smoother::ShadowAcceptanceAudit normal_shadow_audit;
+  bool normal_shadow_audit_captured = false;
+  std::string shadow_acceptance_status = "disabled";
+  if (FLAGS_kimera_shadow_acceptance_audit_enable) {
+    try {
+      shadow_smoother = std::make_unique<Smoother>(smoother_backup);
+      shadow_smoother->bpsam().isolateNonlinearFactorsForAudit();
+      shadow_new_factors = new_factors.clone();
+      shadow_acceptance_status = "prepared_native_fixed_lag";
+    } catch (const std::exception& e) {
+      shadow_smoother.reset();
+      shadow_acceptance_status =
+          "prepare_exception_" + sanitizeAuditToken(e.what());
+    } catch (...) {
+      shadow_smoother.reset();
+      shadow_acceptance_status = "prepare_exception_unknown";
+    }
+  }
 
   bool got_cheirality_exception = false;
   gtsam::Symbol lmk_symbol_cheirality;
   try {
     // Update smoother.
     VLOG(10) << "Starting update of smoother_...";
-    *result =
-        smoother_->update(new_factors, new_values, timestamps, delete_slots);
+    if (FLAGS_kimera_shadow_acceptance_audit_enable) {
+      *result = smoother_->updateWithShadowAcceptanceAudit(new_factors,
+                                                          new_values,
+                                                          timestamps,
+                                                          delete_slots,
+                                                          false,
+                                                          &normal_shadow_audit);
+      normal_shadow_audit_captured = true;
+    } else {
+      *result =
+          smoother_->update(new_factors, new_values, timestamps, delete_slots);
+    }
     VLOG(10) << "Finished update of smoother_.";
     if (debug_smoother_) {
       printSmootherInfo(new_factors, delete_slots, "CATCHING EXCEPTION", false);
@@ -4294,6 +4820,34 @@ bool VioBackend::updateSmoother(gtsam::FixedLagSmoother::Result* result,
     } else {
       counter_of_exceptions_ = 0;
     }
+  }
+
+  if (FLAGS_kimera_shadow_acceptance_audit_enable &&
+      normal_shadow_audit_captured) {
+    Smoother::ShadowAcceptanceAudit forced_shadow_audit;
+    if (shadow_smoother) {
+      try {
+        gtsam::FixedLagSmoother::Result ignored_shadow_result;
+        ignored_shadow_result =
+            shadow_smoother->updateWithShadowAcceptanceAudit(
+                shadow_new_factors,
+                new_values,
+                timestamps,
+                delete_slots,
+                true,
+                &forced_shadow_audit);
+        (void)ignored_shadow_result;
+        shadow_acceptance_status = "ok_native_fixed_lag";
+      } catch (const std::exception& e) {
+        shadow_acceptance_status =
+            "shadow_exception_" + sanitizeAuditToken(e.what());
+      } catch (...) {
+        shadow_acceptance_status = "shadow_exception_unknown";
+      }
+    }
+    logShadowAcceptanceComparison(normal_shadow_audit,
+                                  forced_shadow_audit,
+                                  shadow_acceptance_status);
   }
 
   return true;

@@ -3,10 +3,18 @@
 #include <cbs/bpsam/bpsam.h>
 #include <glog/logging.h>
 #include <gtsam/inference/Symbol.h>
+#include <gtsam/nonlinear/LinearContainerFactor.h>
 
 #include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <limits>
+#include <map>
 #include <optional>
 #include <set>
+#include <sstream>
+#include <string>
+#include <typeinfo>
 #include <utility>
 
 namespace VIO {
@@ -80,6 +88,35 @@ std::optional<gtsam::Matrix> computePoseBeliefCovarianceWithBpsamSnapshot(
 }
 
 struct PersistentBpsamLocalCovarianceSidecar::Impl {
+  struct FactorErrorSummary {
+    size_t count = 0u;
+    size_t before_valid = 0u;
+    size_t after_valid = 0u;
+    double before_error = 0.0;
+    double after_error = 0.0;
+  };
+
+  struct PoseMovementSummary {
+    size_t pose_count = 0u;
+    double translation_mean_m = 0.0;
+    double translation_max_m = 0.0;
+    double rotation_mean_deg = 0.0;
+    double rotation_max_deg = 0.0;
+  };
+
+  struct CandidateAudit {
+    bool valid = false;
+    double timestamp = 0.0;
+    size_t latest_frame = 0u;
+    double objective_before = std::numeric_limits<double>::quiet_NaN();
+    double objective_after = std::numeric_limits<double>::quiet_NaN();
+    PoseMovementSummary movement;
+    size_t variables_relinearized = 0u;
+    size_t variables_reeliminated = 0u;
+    std::map<std::string, FactorErrorSummary> factor_errors;
+    gtsam::Values candidate_values;
+  };
+
   struct StateFrameCoverage {
     size_t frames_total = 0u;
     size_t complete_frames = 0u;
@@ -102,6 +139,219 @@ struct PersistentBpsamLocalCovarianceSidecar::Impl {
           params.belief_similarity_threshold = 0.0;
           return params;
         }()) {}
+
+  static std::string factorAuditCategory(
+      const gtsam::NonlinearFactor::shared_ptr& factor) {
+    if (!factor) {
+      return "null";
+    }
+    if (dynamic_cast<const gtsam::LinearContainerFactor*>(factor.get())) {
+      return "marginal_prior";
+    }
+
+    const std::string type_name = typeid(*factor).name();
+    if (type_name.find("SmartStereoProjection") != std::string::npos) {
+      return "smart_stereo";
+    }
+    if (type_name.find("ImuFactor") != std::string::npos) {
+      return "imu";
+    }
+    if (type_name.find("PriorFactor") != std::string::npos) {
+      return "prior";
+    }
+    if (type_name.find("BetweenFactor") != std::string::npos) {
+      bool has_pose = false;
+      bool has_bias = false;
+      for (const gtsam::Key key : factor->keys()) {
+        const char symbol = gtsam::Symbol(key).chr();
+        has_pose = has_pose || symbol == 'x';
+        has_bias = has_bias || symbol == 'b';
+      }
+      if (has_bias) {
+        return "bias_between";
+      }
+      if (has_pose) {
+        return "pose_between";
+      }
+      return "between_other";
+    }
+    return "other";
+  }
+
+  static double factorErrorOrNan(
+      const gtsam::NonlinearFactor::shared_ptr& factor,
+      const gtsam::Values& values) {
+    try {
+      return factor ? factor->error(values)
+                    : std::numeric_limits<double>::quiet_NaN();
+    } catch (const std::exception&) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+  }
+
+  static gtsam::Values initializedValues(
+      const gtsam::Values& before,
+      const gtsam::Values& new_values) {
+    gtsam::Values initialized(before);
+    for (const auto& key_value : new_values) {
+      if (!initialized.exists(key_value.key)) {
+        initialized.insert(key_value.key, key_value.value);
+      }
+    }
+    return initialized;
+  }
+
+  static PoseMovementSummary summarizePoseMovement(
+      const gtsam::Values& before,
+      const gtsam::Values& after) {
+    PoseMovementSummary summary;
+    double translation_sum = 0.0;
+    double rotation_sum_deg = 0.0;
+    for (const gtsam::Key key : after.keys()) {
+      if (gtsam::Symbol(key).chr() != 'x' || !before.exists(key)) {
+        continue;
+      }
+      try {
+        const gtsam::Pose3 before_pose = before.at<gtsam::Pose3>(key);
+        const gtsam::Pose3 after_pose = after.at<gtsam::Pose3>(key);
+        const gtsam::Pose3 delta = before_pose.between(after_pose);
+        const double translation_m = delta.translation().norm();
+        const double rotation_deg =
+            gtsam::Rot3::Logmap(delta.rotation()).norm() * 180.0 / M_PI;
+        ++summary.pose_count;
+        translation_sum += translation_m;
+        rotation_sum_deg += rotation_deg;
+        summary.translation_max_m =
+            std::max(summary.translation_max_m, translation_m);
+        summary.rotation_max_deg =
+            std::max(summary.rotation_max_deg, rotation_deg);
+      } catch (const std::exception&) {
+      }
+    }
+    if (summary.pose_count > 0u) {
+      summary.translation_mean_m =
+          translation_sum / static_cast<double>(summary.pose_count);
+      summary.rotation_mean_deg =
+          rotation_sum_deg / static_cast<double>(summary.pose_count);
+    }
+    return summary;
+  }
+
+  static CandidateAudit captureCandidateAudit(
+      const double timestamp,
+      const gtsam::NonlinearFactorGraph& graph,
+      const gtsam::Values& before,
+      const gtsam::Values& after,
+      const gtsam::ISAM2Result& result) {
+    CandidateAudit audit;
+    audit.timestamp = timestamp;
+    audit.candidate_values = after;
+    audit.movement = summarizePoseMovement(before, after);
+    audit.variables_relinearized = result.variablesRelinearized;
+    audit.variables_reeliminated = result.variablesReeliminated;
+
+    for (const gtsam::Key key : after.keys()) {
+      const gtsam::Symbol symbol(key);
+      if (symbol.chr() == 'x') {
+        audit.latest_frame = std::max(audit.latest_frame, symbol.index());
+      }
+    }
+
+    double before_total = 0.0;
+    double after_total = 0.0;
+    bool all_before_valid = true;
+    bool all_after_valid = true;
+    for (const auto& factor : graph) {
+      if (!factor) {
+        continue;
+      }
+      FactorErrorSummary& summary =
+          audit.factor_errors[factorAuditCategory(factor)];
+      ++summary.count;
+
+      const double before_error = factorErrorOrNan(factor, before);
+      if (std::isfinite(before_error)) {
+        ++summary.before_valid;
+        summary.before_error += before_error;
+        before_total += before_error;
+      } else {
+        all_before_valid = false;
+      }
+
+      const double after_error = factorErrorOrNan(factor, after);
+      if (std::isfinite(after_error)) {
+        ++summary.after_valid;
+        summary.after_error += after_error;
+        after_total += after_error;
+      } else {
+        all_after_valid = false;
+      }
+    }
+
+    audit.objective_before =
+        all_before_valid ? before_total
+                         : std::numeric_limits<double>::quiet_NaN();
+    audit.objective_after =
+        all_after_valid ? after_total
+                        : std::numeric_limits<double>::quiet_NaN();
+    audit.valid = all_before_valid && all_after_valid &&
+                  std::isfinite(audit.objective_before) &&
+                  std::isfinite(audit.objective_after);
+    return audit;
+  }
+
+  static double objectiveRatio(const CandidateAudit& audit) {
+    if (!audit.valid || std::abs(audit.objective_before) < 1e-15) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    return audit.objective_after / audit.objective_before;
+  }
+
+  static void logCandidateFactorErrors(const char* candidate,
+                                       const CandidateAudit& audit) {
+    for (const auto& [category, summary] : audit.factor_errors) {
+      LOG(INFO) << std::setprecision(17)
+                << "KIMERA_SHADOW_ACCEPTANCE_FACTOR_ROW,"
+                << audit.timestamp << "," << audit.latest_frame << ","
+                << candidate << "," << category << "," << summary.count
+                << "," << summary.before_valid << "," << summary.after_valid
+                << "," << summary.before_error << "," << summary.after_error;
+    }
+  }
+
+  static void logShadowAcceptanceAudit(const CandidateAudit& normal,
+                                       const CandidateAudit& shadow,
+                                       const std::string& status) {
+    const PoseMovementSummary normal_vs_shadow =
+        summarizePoseMovement(normal.candidate_values, shadow.candidate_values);
+    LOG(INFO) << std::setprecision(17)
+              << "KIMERA_SHADOW_ACCEPTANCE_ROW," << normal.timestamp << ","
+              << normal.latest_frame << "," << status << ","
+              << normal.valid << "," << normal.objective_before << ","
+              << normal.objective_after << "," << objectiveRatio(normal) << ","
+              << normal.movement.pose_count << ","
+              << normal.movement.translation_mean_m << ","
+              << normal.movement.translation_max_m << ","
+              << normal.movement.rotation_mean_deg << ","
+              << normal.movement.rotation_max_deg << ","
+              << normal.variables_relinearized << ","
+              << normal.variables_reeliminated << "," << shadow.valid << ","
+              << shadow.objective_before << "," << shadow.objective_after << ","
+              << objectiveRatio(shadow) << "," << shadow.movement.pose_count
+              << "," << shadow.movement.translation_mean_m << ","
+              << shadow.movement.translation_max_m << ","
+              << shadow.movement.rotation_mean_deg << ","
+              << shadow.movement.rotation_max_deg << ","
+              << shadow.variables_relinearized << ","
+              << shadow.variables_reeliminated << ","
+              << normal_vs_shadow.pose_count << ","
+              << normal_vs_shadow.translation_mean_m << ","
+              << normal_vs_shadow.translation_max_m << ","
+              << normal_vs_shadow.rotation_mean_deg << ","
+              << normal_vs_shadow.rotation_max_deg;
+    logCandidateFactorErrors("normal", normal);
+    logCandidateFactorErrors("shadow_forced_full", shadow);
+  }
 
   void logDiagnostics(size_t new_factor_count,
                       size_t removed_factor_slots_count,
@@ -331,7 +581,15 @@ struct PersistentBpsamLocalCovarianceSidecar::Impl {
               const std::map<gtsam::Key, double>& timestamps,
               const gtsam::FactorIndices& delete_slots,
               size_t num_smart_factors,
-              std::vector<size_t>* smart_factor_slots_out) {
+              std::vector<size_t>* smart_factor_slots_out,
+              bool force_full_solve,
+              bool emit_diagnostics,
+              CandidateAudit* candidate_audit_out) {
+    std::optional<gtsam::Values> initialized_values;
+    if (candidate_audit_out) {
+      initialized_values =
+          initializedValues(bpsam_.calculateEstimate(), new_values);
+    }
     updateKeyTimestampMap(timestamps);
 
     const double current_timestamp = getCurrentTimestamp();
@@ -388,10 +646,22 @@ struct PersistentBpsamLocalCovarianceSidecar::Impl {
     if (additional_marked_keys) {
       update_params.extraReelimKeys = additional_marked_keys;
     }
+    update_params.force_relinearize = force_full_solve;
+    update_params.forceFullSolve = force_full_solve;
 
     const gtsam::ISAM2Result result =
         bpsam_.update(new_factors, new_values, update_params);
     last_update_result_ = result;
+    if (candidate_audit_out && initialized_values) {
+      const gtsam::NonlinearFactorGraph audit_graph =
+          bpsam_.getFactorsUnsafe().clone();
+      *candidate_audit_out = captureCandidateAudit(
+          current_timestamp,
+          audit_graph,
+          *initialized_values,
+          bpsam_.calculateEstimate(),
+          result);
+    }
 
     if (!active_window_cbs_removals.empty()) {
       bpsam_.commitActiveWindowTemporaryCbsOdomFactorRemovals(
@@ -431,13 +701,19 @@ struct PersistentBpsamLocalCovarianceSidecar::Impl {
         countTrackedKeysBefore(keep_from_timestamp);
     const StateFrameCoverage frame_coverage = computeStateFrameCoverage();
 
-    logDiagnostics(new_factors.size(),
-                   update_params.removeFactorIndices.size(),
-                   marginalizable_keys.size(),
-                   marginalized_now_count,
-                   stale_tracked_keys_after_marginalization,
-                   frame_coverage);
+    if (emit_diagnostics) {
+      logDiagnostics(new_factors.size(),
+                     update_params.removeFactorIndices.size(),
+                     marginalizable_keys.size(),
+                     marginalized_now_count,
+                     stale_tracked_keys_after_marginalization,
+                     frame_coverage);
+    }
     return true;
+  }
+
+  void isolateForShadowAudit() {
+    bpsam_.isolateNonlinearFactorsForAudit();
   }
 
   std::optional<gtsam::Matrix> computePoseCovariance(gtsam::Key pose_key) {
@@ -498,17 +774,67 @@ bool PersistentBpsamLocalCovarianceSidecar::update(
     const std::map<gtsam::Key, double>& timestamps,
     const gtsam::FactorIndices& delete_slots,
     size_t num_smart_factors,
-    std::vector<size_t>* smart_factor_slots_out) {
+    std::vector<size_t>* smart_factor_slots_out,
+    bool shadow_acceptance_audit_enable) {
+  std::unique_ptr<Impl> shadow_impl;
+  gtsam::NonlinearFactorGraph shadow_new_factors;
+  std::string shadow_status = "disabled";
+  if (shadow_acceptance_audit_enable) {
+    try {
+      shadow_impl = std::make_unique<Impl>(*impl_);
+      shadow_impl->isolateForShadowAudit();
+      shadow_new_factors = new_factors.clone();
+      shadow_status = "prepared";
+    } catch (const std::exception& e) {
+      shadow_impl.reset();
+      shadow_status = std::string("prepare_exception_") + e.what();
+    } catch (...) {
+      shadow_impl.reset();
+      shadow_status = "prepare_exception_unknown";
+    }
+  }
+
+  Impl::CandidateAudit normal_audit;
   try {
-    return impl_->update(new_factors,
-                         new_values,
-                         timestamps,
-                         delete_slots,
-                         num_smart_factors,
-                         smart_factor_slots_out);
+    const bool normal_ok = impl_->update(new_factors,
+                                        new_values,
+                                        timestamps,
+                                        delete_slots,
+                                        num_smart_factors,
+                                        smart_factor_slots_out,
+                                        false,
+                                        true,
+                                        shadow_acceptance_audit_enable
+                                            ? &normal_audit
+                                            : nullptr);
+    if (!normal_ok || !shadow_acceptance_audit_enable) {
+      return normal_ok;
+    }
   } catch (...) {
     return false;
   }
+
+  Impl::CandidateAudit shadow_audit;
+  if (shadow_impl) {
+    try {
+      const bool shadow_ok = shadow_impl->update(shadow_new_factors,
+                                                new_values,
+                                                timestamps,
+                                                delete_slots,
+                                                num_smart_factors,
+                                                nullptr,
+                                                true,
+                                                false,
+                                                &shadow_audit);
+      shadow_status = shadow_ok ? "ok" : "shadow_update_failed";
+    } catch (const std::exception& e) {
+      shadow_status = std::string("shadow_exception_") + e.what();
+    } catch (...) {
+      shadow_status = "shadow_exception_unknown";
+    }
+  }
+  Impl::logShadowAcceptanceAudit(normal_audit, shadow_audit, shadow_status);
+  return true;
 }
 
 std::optional<gtsam::Matrix> PersistentBpsamLocalCovarianceSidecar::

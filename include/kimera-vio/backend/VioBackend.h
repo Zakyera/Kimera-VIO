@@ -556,6 +556,13 @@ class VioBackend {
       const std::chrono::high_resolution_clock::time_point& total_start_time,
       const std::chrono::high_resolution_clock::time_point& start_time);
 
+  void logFactorGraphAudit(const FrameId& cur_id,
+                           const Timestamp& timestamp_kf_nsec,
+                           size_t new_factor_count,
+                           size_t delete_slot_count,
+                           size_t num_factors_before_external,
+                           size_t inserted_external_factor_count) const;
+
   // Reset state of debug info.
   void resetDebugInfo(DebugVioInfo* debug_info);
 
@@ -629,6 +636,8 @@ class VioBackend {
   double cbs_get_odometry_beliefs_time_sec_per_update_ = 0.0;
   size_t cbs_marginalization_graph_factor_count_ = 0u;
   std::vector<ExternalOdometryBelief> cbs_outgoing_odom_beliefs_;
+  CbsPoseMergeDiagnostic pending_cbs_pose_merge_diagnostic_;
+  CbsPoseMergeDiagnostic cbs_pose_merge_diagnostic_;
   std::string cbs_odom_sender_mode_ = "adjacent_window";
   uint8_t cbs_odom_requesting_agent_id_ = static_cast<uint8_t>('l');
   bool external_odom_duration_gate_enable_ = false;

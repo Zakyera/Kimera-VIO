@@ -32,7 +32,8 @@ class PersistentBpsamLocalCovarianceSidecar {
               const std::map<gtsam::Key, double>& timestamps,
               const gtsam::FactorIndices& delete_slots,
               size_t num_smart_factors,
-              std::vector<size_t>* smart_factor_slots_out);
+              std::vector<size_t>* smart_factor_slots_out,
+              bool shadow_acceptance_audit_enable = false);
 
   std::optional<gtsam::Matrix> computePoseCovariance(gtsam::Key pose_key);
 

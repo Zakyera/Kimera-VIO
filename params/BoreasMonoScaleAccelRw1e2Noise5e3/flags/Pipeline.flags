@@ -1,0 +1,4 @@
+#!/bin/bash
+# Optional pipeline-level overrides for S3E experiments.
+# Keep backend_type aligned with PipelineParams.yaml by default.
+--backend_type=0
