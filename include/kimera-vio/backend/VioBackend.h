@@ -83,6 +83,8 @@ class VioBackend {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   typedef std::function<void(const ImuBias& imu_bias)> ImuBiasCallback;
   typedef std::function<void(const LandmarksMap& map)> MapCallback;
+  typedef std::function<void(const ExternalBeliefMatchDiagnostic&)>
+      ExternalBeliefMatchDiagnosticCallback;
 
   /**
    * @brief VioBackend Constructor. Initialization must be done separately.
@@ -126,6 +128,11 @@ class VioBackend {
    * optimizing.
    */
   void registerMapUpdateCallback(const MapCallback& map_update_callback);
+
+  // Registers a passive observation callback for external-belief timestamp
+  // matching. The callback is never required for estimator operation.
+  void registerExternalBeliefMatchDiagnosticCallback(
+      const ExternalBeliefMatchDiagnosticCallback& callback);
 
   // Thread-safe ingestion of external odometry beliefs (e.g., from LiDAR backend).
   void enqueueExternalOdometryBeliefs(
@@ -705,6 +712,9 @@ class VioBackend {
 
   //! Map update callback for the frontend PnP tracker.
   MapCallback map_update_callback_;
+
+  ExternalBeliefMatchDiagnosticCallback
+      external_belief_match_diagnostic_callback_;
 
   // Debug info.
   DebugVioInfo debug_info_;

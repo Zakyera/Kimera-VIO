@@ -99,6 +99,13 @@ class Pipeline {
     vio_backend_module_->enqueueExternalOdometryBeliefs(beliefs);
   }
 
+  inline void registerExternalBeliefMatchDiagnosticCallback(
+      const VioBackend::ExternalBeliefMatchDiagnosticCallback& callback) {
+    CHECK(vio_backend_module_);
+    vio_backend_module_->registerExternalBeliefMatchDiagnosticCallback(
+        callback);
+  }
+
   inline LcdModule* getLcdModule() const { return lcd_module_.get(); }
 
  public:

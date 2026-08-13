@@ -129,6 +129,59 @@ struct ExternalOdometryBelief {
   std::array<double, 6> relative_mu{};
   std::array<double, 36> covariance{};
   double relax_factor = 0.0;
+
+  // Optional diagnostics-only identity assigned by the ROS bridge. These
+  // fields are ignored by CBS and every estimator-control path.
+  bool shadow_identity_valid = false;
+  uint64_t shadow_receipt_sequence = 0u;
+  uint32_t shadow_belief_ordinal = 0u;
+};
+
+// Immutable diagnostics-only observation of the exact receiver endpoint
+// selection made for an incoming external odometry belief. It is emitted only
+// when an optional observer is registered and never feeds back into CBS.
+struct ExternalBeliefMatchDiagnostic {
+  enum class Status : uint8_t {
+    Unavailable = 0u,
+    Accepted = 1u,
+    AlreadyApplied = 2u,
+    Rejected = 3u,
+    RetryPending = 4u,
+    Superseded = 5u,
+  };
+
+  bool shadow_identity_valid = false;
+  uint64_t shadow_receipt_sequence = 0u;
+  uint32_t shadow_belief_ordinal = 0u;
+  uint8_t source_agent = 0u;
+  uint32_t sender_from_pose_index = 0u;
+  uint32_t sender_to_pose_index = 0u;
+  double sender_from_stamp_sec = 0.0;
+  double sender_to_stamp_sec = 0.0;
+  FrameId receiver_from_frame_id = 0u;
+  FrameId receiver_to_frame_id = 0u;
+  double receiver_from_stamp_sec = std::numeric_limits<double>::quiet_NaN();
+  double receiver_to_stamp_sec = std::numeric_limits<double>::quiet_NaN();
+  double start_abs_timestamp_error_sec =
+      std::numeric_limits<double>::quiet_NaN();
+  double end_abs_timestamp_error_sec =
+      std::numeric_limits<double>::quiet_NaN();
+  double interval_duration_error_sec =
+      std::numeric_limits<double>::quiet_NaN();
+  uint32_t start_ambiguous_match_count = 0u;
+  uint32_t end_ambiguous_match_count = 0u;
+  bool receiver_pose_available = false;
+  Pose3 receiver_from_pose;
+  Pose3 receiver_to_pose;
+  Pose3 sender_relative_pose;
+  bool sender_relative_pose_available = false;
+  gtsam::Matrix6 sender_covariance = gtsam::Matrix6::Zero();
+  bool sender_covariance_available = false;
+  bool sender_frame_conversion_available = true;
+  uint32_t shadow_invalid_reason_mask = 0u;
+  Status status = Status::Unavailable;
+  bool terminal = false;
+  std::string reason;
 };
 
 struct CbsPoseMergeDiagnostic {

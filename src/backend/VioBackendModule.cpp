@@ -49,6 +49,12 @@ void VioBackendModule::registerMapUpdateCallback(
   vio_backend_->registerMapUpdateCallback(map_update_callback);
 }
 
+void VioBackendModule::registerExternalBeliefMatchDiagnosticCallback(
+    const VioBackend::ExternalBeliefMatchDiagnosticCallback& callback) {
+  CHECK(vio_backend_);
+  vio_backend_->registerExternalBeliefMatchDiagnosticCallback(callback);
+}
+
 void VioBackendModule::enqueueExternalOdometryBeliefs(
     const std::vector<ExternalOdometryBelief>& beliefs) {
   CHECK(vio_backend_);

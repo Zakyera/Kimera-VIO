@@ -1639,6 +1639,15 @@ void VioBackend::registerMapUpdateCallback(
   map_update_callback_ = map_update_callback;
 }
 
+void VioBackend::registerExternalBeliefMatchDiagnosticCallback(
+    const ExternalBeliefMatchDiagnosticCallback& callback) {
+  external_belief_match_diagnostic_callback_ = callback;
+  LOG(INFO) << "Passive external-belief match observer "
+            << (external_belief_match_diagnostic_callback_ ? "registered"
+                                                          : "cleared")
+            << ".";
+}
+
 void VioBackend::enqueueExternalOdometryBeliefs(
     const std::vector<ExternalOdometryBelief>& beliefs) {
   if (beliefs.empty()) {
@@ -1991,6 +2000,159 @@ void VioBackend::collectExternalBeliefFactors(
     double score = std::numeric_limits<double>::infinity();
     cbs::BPSAM::CbsOdometryBelief odom_belief;
   };
+  const auto emit_unmatched_shadow =
+      [this](const ExternalOdometryBelief& belief,
+             const FrameId from_best_frame_id,
+             const double from_best_stamp_sec,
+             const double from_best_abs_dt,
+             const FrameId to_best_frame_id,
+             const double to_best_stamp_sec,
+             const double to_best_abs_dt,
+             const ExternalBeliefMatchDiagnostic::Status status,
+             const bool terminal,
+             const std::string& reason) {
+        if (!external_belief_match_diagnostic_callback_) {
+          return;
+        }
+        ExternalBeliefMatchDiagnostic diagnostic;
+        diagnostic.shadow_identity_valid = belief.shadow_identity_valid;
+        diagnostic.shadow_receipt_sequence =
+            belief.shadow_receipt_sequence;
+        diagnostic.shadow_belief_ordinal = belief.shadow_belief_ordinal;
+        diagnostic.source_agent = belief.source_agent;
+        diagnostic.sender_from_pose_index = belief.sender_from_pose_index;
+        diagnostic.sender_to_pose_index = belief.sender_to_pose_index;
+        diagnostic.sender_from_stamp_sec = belief.from_stamp_sec;
+        diagnostic.sender_to_stamp_sec = belief.to_stamp_sec;
+        diagnostic.receiver_from_frame_id = from_best_frame_id;
+        diagnostic.receiver_to_frame_id = to_best_frame_id;
+        diagnostic.receiver_from_stamp_sec = from_best_stamp_sec;
+        diagnostic.receiver_to_stamp_sec = to_best_stamp_sec;
+        diagnostic.start_abs_timestamp_error_sec = from_best_abs_dt;
+        diagnostic.end_abs_timestamp_error_sec = to_best_abs_dt;
+        if (std::isfinite(from_best_stamp_sec) &&
+            std::isfinite(to_best_stamp_sec)) {
+          diagnostic.interval_duration_error_sec = std::abs(
+              (belief.to_stamp_sec - belief.from_stamp_sec) -
+              (to_best_stamp_sec - from_best_stamp_sec));
+        }
+        try {
+          diagnostic.sender_relative_pose =
+              gtsam::Pose3::Expmap(vector6FromArray(belief.relative_mu));
+          diagnostic.sender_relative_pose_available = true;
+          diagnostic.sender_covariance =
+              poseCovarianceFromMatrix(matrix6FromArray(belief.covariance));
+          diagnostic.sender_covariance_available =
+              diagnostic.sender_covariance.allFinite();
+        } catch (...) {
+          diagnostic.sender_covariance_available = false;
+        }
+        diagnostic.status = status;
+        diagnostic.terminal = terminal;
+        diagnostic.reason = reason;
+        try {
+          external_belief_match_diagnostic_callback_(diagnostic);
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "Passive external-belief match observer failed: "
+                       << e.what();
+        } catch (...) {
+          LOG(WARNING) << "Passive external-belief match observer failed.";
+        }
+      };
+  const auto emit_shadow_match =
+      [this, cur_id](const MatchedExternalOdomCandidate& candidate,
+             const ExternalBeliefMatchDiagnostic::Status status,
+             const bool terminal,
+             const std::string& reason) {
+        if (!external_belief_match_diagnostic_callback_) {
+          return;
+        }
+        ExternalBeliefMatchDiagnostic diagnostic;
+        diagnostic.shadow_identity_valid =
+            candidate.belief.shadow_identity_valid;
+        diagnostic.shadow_receipt_sequence =
+            candidate.belief.shadow_receipt_sequence;
+        diagnostic.shadow_belief_ordinal =
+            candidate.belief.shadow_belief_ordinal;
+        diagnostic.source_agent = candidate.belief.source_agent;
+        diagnostic.sender_from_pose_index =
+            candidate.belief.sender_from_pose_index;
+        diagnostic.sender_to_pose_index =
+            candidate.belief.sender_to_pose_index;
+        diagnostic.sender_from_stamp_sec = candidate.belief.from_stamp_sec;
+        diagnostic.sender_to_stamp_sec = candidate.belief.to_stamp_sec;
+        diagnostic.receiver_from_frame_id = candidate.from_frame_id;
+        diagnostic.receiver_to_frame_id = candidate.to_frame_id;
+        diagnostic.receiver_from_stamp_sec = candidate.from_best_stamp_sec;
+        diagnostic.receiver_to_stamp_sec = candidate.to_best_stamp_sec;
+        diagnostic.start_abs_timestamp_error_sec =
+            candidate.from_best_abs_dt;
+        diagnostic.end_abs_timestamp_error_sec = candidate.to_best_abs_dt;
+        diagnostic.interval_duration_error_sec = candidate.duration_error;
+        const auto ambiguous_match_count =
+            [this, cur_id](const double sender_stamp_sec,
+                           const double selected_abs_dt) {
+              if (!std::isfinite(sender_stamp_sec) ||
+                  !std::isfinite(selected_abs_dt)) {
+                return 0u;
+              }
+              uint32_t tied_candidates = 0u;
+              for (const auto& [frame_id, frame_stamp_sec] :
+                   keyframe_timestamp_sec_) {
+                if (frame_id > cur_id || !std::isfinite(frame_stamp_sec)) {
+                  continue;
+                }
+                const double abs_dt =
+                    std::abs(frame_stamp_sec - sender_stamp_sec);
+                if (std::abs(abs_dt - selected_abs_dt) <= 1.0e-12) {
+                  ++tied_candidates;
+                }
+              }
+              return tied_candidates > 0u ? tied_candidates - 1u : 0u;
+            };
+        diagnostic.start_ambiguous_match_count = ambiguous_match_count(
+            candidate.belief.from_stamp_sec, candidate.from_best_abs_dt);
+        diagnostic.end_ambiguous_match_count = ambiguous_match_count(
+            candidate.belief.to_stamp_sec, candidate.to_best_abs_dt);
+        diagnostic.sender_relative_pose =
+            candidate.odom_belief.measured_from_to;
+        diagnostic.sender_relative_pose_available = true;
+        if (candidate.odom_belief.covariance.rows() == 6 &&
+            candidate.odom_belief.covariance.cols() == 6 &&
+            candidate.odom_belief.covariance.allFinite()) {
+          diagnostic.sender_covariance = candidate.odom_belief.covariance;
+          diagnostic.sender_covariance_available = true;
+        }
+        const gtsam::Key from_key = candidate.odom_belief.from_pose_key;
+        const gtsam::Key to_key = candidate.odom_belief.to_pose_key;
+        const auto pose_before = [this](const gtsam::Key key,
+                                        gtsam::Pose3* pose) {
+          CHECK_NOTNULL(pose);
+          if (new_values_.exists(key)) {
+            *pose = new_values_.at<gtsam::Pose3>(key);
+            return true;
+          }
+          if (state_.exists(key)) {
+            *pose = state_.at<gtsam::Pose3>(key);
+            return true;
+          }
+          return false;
+        };
+        diagnostic.receiver_pose_available =
+            pose_before(from_key, &diagnostic.receiver_from_pose) &&
+            pose_before(to_key, &diagnostic.receiver_to_pose);
+        diagnostic.status = status;
+        diagnostic.terminal = terminal;
+        diagnostic.reason = reason;
+        try {
+          external_belief_match_diagnostic_callback_(diagnostic);
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "Passive external-belief match observer failed: "
+                       << e.what();
+        } catch (...) {
+          LOG(WARNING) << "Passive external-belief match observer failed.";
+        }
+      };
   using ReceiverEdgeKey = std::tuple<uint8_t, FrameId, FrameId>;
   std::vector<MatchedExternalOdomCandidate> matched_candidates;
   std::map<ReceiverEdgeKey, size_t> best_candidate_by_receiver_edge;
@@ -2042,6 +2204,17 @@ void VioBackend::collectExternalBeliefFactors(
                            to_best_abs_dt,
                            to_reject_reason,
                            "retry_timestamp_match");
+        emit_unmatched_shadow(
+            belief,
+            from_best_frame_id,
+            from_best_stamp_sec,
+            from_best_abs_dt,
+            to_best_frame_id,
+            to_best_stamp_sec,
+            to_best_abs_dt,
+            ExternalBeliefMatchDiagnostic::Status::RetryPending,
+            false,
+            "retry_timestamp_match");
       } else {
         ++dropped_unmatched;
         if (from_reject_reason == ExternalBeliefRejectReason::kWindow ||
@@ -2060,6 +2233,17 @@ void VioBackend::collectExternalBeliefFactors(
                            to_best_abs_dt,
                            to_reject_reason,
                            "dropped_timestamp_match");
+        emit_unmatched_shadow(
+            belief,
+            from_best_frame_id,
+            from_best_stamp_sec,
+            from_best_abs_dt,
+            to_best_frame_id,
+            to_best_stamp_sec,
+            to_best_abs_dt,
+            ExternalBeliefMatchDiagnostic::Status::Rejected,
+            true,
+            "dropped_timestamp_match");
       }
       continue;
     }
@@ -2089,6 +2273,17 @@ void VioBackend::collectExternalBeliefFactors(
                            to_best_abs_dt,
                            ExternalBeliefRejectReason::kDuration,
                            "retry_same_local_key");
+        emit_unmatched_shadow(
+            belief,
+            from_best_frame_id,
+            from_best_stamp_sec,
+            from_best_abs_dt,
+            to_best_frame_id,
+            to_best_stamp_sec,
+            to_best_abs_dt,
+            ExternalBeliefMatchDiagnostic::Status::RetryPending,
+            false,
+            "retry_same_local_key");
       } else {
         ++dropped_unmatched;
         ++rejected_duration;
@@ -2102,6 +2297,17 @@ void VioBackend::collectExternalBeliefFactors(
                            to_best_abs_dt,
                            ExternalBeliefRejectReason::kDuration,
                            "dropped_same_local_key");
+        emit_unmatched_shadow(
+            belief,
+            from_best_frame_id,
+            from_best_stamp_sec,
+            from_best_abs_dt,
+            to_best_frame_id,
+            to_best_stamp_sec,
+            to_best_abs_dt,
+            ExternalBeliefMatchDiagnostic::Status::Rejected,
+            true,
+            "dropped_same_local_key");
       }
       continue;
     }
@@ -2130,6 +2336,17 @@ void VioBackend::collectExternalBeliefFactors(
                          to_best_abs_dt,
                          ExternalBeliefRejectReason::kDuration,
                          "dropped_duration_mismatch");
+      emit_unmatched_shadow(
+          belief,
+          from_best_frame_id,
+          from_best_stamp_sec,
+          from_best_abs_dt,
+          to_best_frame_id,
+          to_best_stamp_sec,
+          to_best_abs_dt,
+          ExternalBeliefMatchDiagnostic::Status::Rejected,
+          true,
+          "dropped_duration_mismatch");
       continue;
     }
 
@@ -2205,6 +2422,10 @@ void VioBackend::collectExternalBeliefFactors(
                        candidate.to_best_abs_dt,
                        candidate.to_reject_reason,
                        "receiver_edge_superseded_by_better_candidate");
+    emit_shadow_match(candidate,
+                      ExternalBeliefMatchDiagnostic::Status::Superseded,
+                      true,
+                      "receiver_edge_superseded_by_better_candidate");
   }
 
   const auto log_bpsam_add_detail =
@@ -2293,6 +2514,11 @@ void VioBackend::collectExternalBeliefFactors(
                                candidate.to_best_abs_dt,
                                candidate.to_reject_reason,
                                "retry_bpsam_inactive_window");
+            emit_shadow_match(
+                candidate,
+                ExternalBeliefMatchDiagnostic::Status::RetryPending,
+                false,
+                "retry_bpsam_inactive_window");
             continue;
           }
         }
@@ -2357,6 +2583,18 @@ void VioBackend::collectExternalBeliefFactors(
             ++rejected_bpsam_exception;
             break;
         }
+        ExternalBeliefMatchDiagnostic::Status shadow_status =
+            ExternalBeliefMatchDiagnostic::Status::Rejected;
+        if (detail.status ==
+            cbs::BPSAM::AddOdometryBeliefStatus::Accepted) {
+          shadow_status = ExternalBeliefMatchDiagnostic::Status::Accepted;
+        } else if (detail.status ==
+                   cbs::BPSAM::AddOdometryBeliefStatus::
+                       AcceptedButSkippedAlreadyApplied) {
+          shadow_status =
+              ExternalBeliefMatchDiagnostic::Status::AlreadyApplied;
+        }
+        emit_shadow_match(candidate, shadow_status, true, detail.message);
         log_bpsam_add_detail(candidate, detail);
       }
 
@@ -2373,6 +2611,10 @@ void VioBackend::collectExternalBeliefFactors(
                            candidate.to_best_abs_dt,
                            candidate.to_reject_reason,
                            "bpsam_missing_detail");
+        emit_shadow_match(candidate,
+                          ExternalBeliefMatchDiagnostic::Status::Rejected,
+                          true,
+                          "bpsam_missing_detail");
       }
     } catch (const std::exception& e) {
       for (const size_t candidate_index : selected_candidate_indices) {
@@ -2389,6 +2631,10 @@ void VioBackend::collectExternalBeliefFactors(
                            candidate.to_best_abs_dt,
                            candidate.to_reject_reason,
                            "bpsam_exception");
+        emit_shadow_match(candidate,
+                          ExternalBeliefMatchDiagnostic::Status::Rejected,
+                          true,
+                          "bpsam_exception");
         LOG(WARNING) << "BPSAM rejected external CBS odometry "
                      << formatPoseKeyToken(candidate.belief.source_agent,
                                            candidate.belief.sender_from_pose_index)
@@ -2413,6 +2659,10 @@ void VioBackend::collectExternalBeliefFactors(
                            candidate.to_best_abs_dt,
                            candidate.to_reject_reason,
                            "bpsam_unknown_exception");
+        emit_shadow_match(candidate,
+                          ExternalBeliefMatchDiagnostic::Status::Rejected,
+                          true,
+                          "bpsam_unknown_exception");
         LOG(WARNING) << "BPSAM rejected external CBS odometry "
                      << formatPoseKeyToken(candidate.belief.source_agent,
                                            candidate.belief.sender_from_pose_index)
