@@ -160,6 +160,12 @@ DEFINE_int32(cbs_active_factor_detail_max_rows_per_update,
              1000,
              "Maximum per-factor active CBS diagnostic rows to emit per "
              "backend update. Use 0 to disable detail logging.");
+DEFINE_int32(cbs_covariance_exchange_audit_max_samples,
+             0,
+             "Maximum accepted incoming CBS odometry factors for which to "
+             "log the exact covariance provenance, linearized factor, and "
+             "receiver endpoint information. Zero disables the passive "
+             "audit.");
 DEFINE_bool(cbs_temporary_linear_already_applied_gate_enable,
             true,
             "In temporary-linear CBS mode, skip near-identical beliefs from "
@@ -1139,6 +1145,11 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
       FLAGS_cbs_active_factor_detail_max_rows_per_update > 0
           ? static_cast<size_t>(
                 FLAGS_cbs_active_factor_detail_max_rows_per_update)
+          : 0u;
+  bpsam_params.covariance_exchange_audit_max_samples =
+      FLAGS_cbs_covariance_exchange_audit_max_samples > 0
+          ? static_cast<size_t>(
+                FLAGS_cbs_covariance_exchange_audit_max_samples)
           : 0u;
   bpsam_params.temporary_linear_already_applied_gate_enable =
       FLAGS_cbs_temporary_linear_already_applied_gate_enable;
