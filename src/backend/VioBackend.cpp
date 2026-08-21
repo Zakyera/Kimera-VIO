@@ -166,6 +166,10 @@ DEFINE_int32(cbs_covariance_exchange_audit_max_samples,
              "log the exact covariance provenance, linearized factor, and "
              "receiver endpoint information. Zero disables the passive "
              "audit.");
+DEFINE_int32(cbs_covariance_exchange_audit_stride,
+             1,
+             "Audit every Nth distinct accepted incoming CBS odometry edge. "
+             "One preserves the original first-N behavior.");
 DEFINE_bool(cbs_temporary_linear_already_applied_gate_enable,
             true,
             "In temporary-linear CBS mode, skip near-identical beliefs from "
@@ -1151,6 +1155,10 @@ VioBackend::VioBackend(const gtsam::Pose3& B_Pose_leftCamRect,
           ? static_cast<size_t>(
                 FLAGS_cbs_covariance_exchange_audit_max_samples)
           : 0u;
+  bpsam_params.covariance_exchange_audit_stride =
+      FLAGS_cbs_covariance_exchange_audit_stride > 0
+          ? static_cast<size_t>(FLAGS_cbs_covariance_exchange_audit_stride)
+          : 1u;
   bpsam_params.temporary_linear_already_applied_gate_enable =
       FLAGS_cbs_temporary_linear_already_applied_gate_enable;
   bpsam_params.temporary_linear_already_applied_metric_threshold =
