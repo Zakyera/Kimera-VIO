@@ -1,0 +1,20 @@
+%YAML:1.0
+# General sensor definitions.
+camera_id: alphasense_front_right
+
+# Sensor extrinsics wrt. the body-frame.
+T_BS:
+  cols: 4
+  rows: 4
+  data: [0.0158462607821067, -0.243190470056833, 0.969849107486707, 0.0601813190502502,
+         0.999740811114319, 0.0197112057493938, -0.011392056898915, 0.0662152106261773,
+         -0.0163464556313752, 0.969778254881724, 0.243439786696525, 0.0117774698973716,
+         0.0, 0.0, 0.0, 1.0]
+
+# Camera specific definitions.
+rate_hz: 10
+resolution: [1440, 1080]
+camera_model: pinhole
+intrinsics: [701.6656970672693, 700.8504216642683, 675.8628766265481, 534.6583586732144] # fu, fv, cu, cv
+distortion_model: equidistant
+distortion_coefficients: [-0.04459393782932651, 0.01237852934390858, -0.01313451092983728, 0.003895777285135927]

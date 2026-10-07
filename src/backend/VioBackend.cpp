@@ -34,6 +34,16 @@
 #include <cbs/key.h>
 #include <cbs/utils/gtsam_compat.h>
 #include <cbs/utils/health_aware_relative_cbs.h>
+#include <cbs/utils/relative_pose_covariance.h>
+#include <gtsam/base/serialization.h>
+#include <gtsam/base/GenericValue.h>
+#include <gtsam/navigation/CombinedImuFactor.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/nonlinear/LinearContainerFactor.h>
+#include <gtsam/inference/Ordering.h>
+#include <gtsam/linear/VectorValues.h>
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/PriorFactor.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -45,6 +55,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>  // for numeric_limits<>
 #include <map>
@@ -66,10 +78,53 @@
 #include "kimera-vio/utils/Timer.h"
 #include "kimera-vio/utils/UtilsNumerical.h"
 
+#if GTSAM_ENABLE_BOOST_SERIALIZATION
+// Diagnostic graph archives are opt-in and independent of estimator operation.
+// Register the concrete types in the Kimera fixed-lag graph for round-trip
+// validation of the saved problem, rather than saving only pose estimates.
+BOOST_CLASS_EXPORT_GUID(gtsam::noiseModel::Gaussian,
+                        "kimera_audit_noise_gaussian")
+BOOST_CLASS_EXPORT_GUID(gtsam::noiseModel::Diagonal,
+                        "kimera_audit_noise_diagonal")
+BOOST_CLASS_EXPORT_GUID(gtsam::noiseModel::Isotropic,
+                        "kimera_audit_noise_isotropic")
+BOOST_CLASS_EXPORT_GUID(gtsam::noiseModel::Unit,
+                        "kimera_audit_noise_unit")
+BOOST_CLASS_EXPORT_GUID(gtsam::PriorFactor<gtsam::Pose3>,
+                        "kimera_audit_prior_pose3")
+BOOST_CLASS_EXPORT_GUID(gtsam::PriorFactor<gtsam::Vector3>,
+                        "kimera_audit_prior_vector3")
+BOOST_CLASS_EXPORT_GUID(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>,
+                        "kimera_audit_prior_bias")
+BOOST_CLASS_EXPORT_GUID(gtsam::BetweenFactor<gtsam::Pose3>,
+                        "kimera_audit_between_pose3")
+BOOST_CLASS_EXPORT_GUID(gtsam::BetweenFactor<gtsam::Vector3>,
+                        "kimera_audit_between_vector3")
+BOOST_CLASS_EXPORT_GUID(gtsam::CombinedImuFactor,
+                        "kimera_audit_combined_imu")
+BOOST_CLASS_EXPORT_GUID(gtsam::LinearContainerFactor,
+                        "kimera_audit_linear_container")
+BOOST_CLASS_EXPORT_GUID(gtsam::JacobianFactor,
+                        "kimera_audit_jacobian")
+BOOST_CLASS_EXPORT_GUID(gtsam::HessianFactor,
+                        "kimera_audit_hessian")
+BOOST_CLASS_EXPORT_GUID(gtsam::PreintegrationCombinedParams,
+                        "kimera_audit_pim_params")
+BOOST_CLASS_EXPORT_GUID(gtsam::PreintegratedCombinedMeasurements,
+                        "kimera_audit_pim_combined")
+GTSAM_VALUE_EXPORT(gtsam::Pose3)
+GTSAM_VALUE_EXPORT(gtsam::Point3)
+GTSAM_VALUE_EXPORT(gtsam::imuBias::ConstantBias)
+#endif
+
 DEFINE_bool(debug_graph_before_opt,
             false,
             "Store factor graph before optimization for later printing if the "
             "optimization fails.");
+DEFINE_string(kimera_bad_update_audit_dir,
+              "",
+              "Diagnostic-only exact Kimera graph/value snapshots for backend "
+              "updates 1082-1085 and 1091-1094. Empty disables all work.");
 DEFINE_bool(process_cheirality,
             false,
             "Handle cheirality exception by removing problematic landmarks and "
@@ -252,6 +307,10 @@ DEFINE_int32(cbs_odom_max_horizon_pairs_per_update,
              25,
              "Maximum number of CBS time_horizon_window sender edges generated "
              "per backend update.");
+DEFINE_bool(cbs_live_revision_enable,
+            false,
+            "Publish newer complete CBS relative-belief revisions from the "
+            "active smoother window (experimental). ");
 DEFINE_bool(cbs_health_aware_enable,
             false,
             "Enable health-aware relative CBS covariance scaling.");
@@ -970,6 +1029,383 @@ inline double safeDeltaNorm(const gtsam::Vector6& mu_a,
   return (mu_b - mu_a).norm();
 }
 
+bool isBadUpdateAuditTarget(const FrameId update) {
+  return !FLAGS_kimera_bad_update_audit_dir.empty() &&
+         ((1082u <= update && update <= 1085u) ||
+          (1091u <= update && update <= 1094u));
+}
+
+std::string badUpdateFactorFamily(const gtsam::NonlinearFactor& factor) {
+  if (dynamic_cast<const SmartStereoFactor*>(&factor)) return "visual_smart_stereo";
+  if (dynamic_cast<const gtsam::CombinedImuFactor*>(&factor)) return "combined_imu";
+  if (dynamic_cast<const gtsam::LinearContainerFactor*>(&factor)) return "marginal_linear_container";
+  if (dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(&factor)) return "prior_pose";
+  if (dynamic_cast<const gtsam::PriorFactor<gtsam::Vector3>*>(&factor)) return "prior_velocity";
+  if (dynamic_cast<const gtsam::PriorFactor<gtsam::imuBias::ConstantBias>*>(&factor)) return "prior_bias";
+  if (dynamic_cast<const gtsam::BetweenFactor<gtsam::Pose3>*>(&factor)) return "between_pose";
+  if (dynamic_cast<const gtsam::BetweenFactor<gtsam::Vector3>*>(&factor)) return "between_velocity";
+  return "other";
+}
+
+template <class T>
+void saveBadUpdateArchive(const std::filesystem::path& path, const T& object) {
+  const std::string encoded = gtsam::serializeBinary(object);
+  T decoded;
+  gtsam::deserializeBinary(encoded, decoded);
+  if (!object.equals(decoded, 1e-9)) {
+    throw std::runtime_error("archive round-trip mismatch: " + path.string());
+  }
+  std::ofstream stream(path, std::ios::binary);
+  if (!stream) throw std::runtime_error("cannot open " + path.string());
+  stream.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
+  if (!stream) throw std::runtime_error("cannot write " + path.string());
+}
+
+void saveBadUpdateValues(const std::filesystem::path& path,
+                         const gtsam::Values& values) {
+  std::ofstream stream(path);
+  stream << std::setprecision(17)
+         << "key,type,p0,p1,p2,qw,qx,qy,qz,bg0,bg1,bg2\n";
+  for (const auto& item : values) {
+    const gtsam::Symbol key(item.key);
+    stream << gtsam::DefaultKeyFormatter(item.key) << ',';
+    if (key.chr() == kPoseSymbolChar) {
+      const auto& pose = values.at<gtsam::Pose3>(item.key);
+      const auto q = pose.rotation().toQuaternion();
+      stream << "pose," << pose.x() << ',' << pose.y() << ',' << pose.z()
+             << ',' << q.w() << ',' << q.x() << ',' << q.y() << ',' << q.z();
+    } else if (key.chr() == kVelocitySymbolChar) {
+      const auto& v = values.at<gtsam::Vector3>(item.key);
+      stream << "velocity," << v.x() << ',' << v.y() << ',' << v.z()
+             << ",,,,,,";
+    } else if (key.chr() == kImuBiasSymbolChar) {
+      const auto& bias =
+          values.at<gtsam::imuBias::ConstantBias>(item.key);
+      const auto& ba = bias.accelerometer();
+      const auto& bg = bias.gyroscope();
+      stream << "bias," << ba.x() << ',' << ba.y() << ',' << ba.z()
+             << ",,,,," << bg.x() << ',' << bg.y() << ',' << bg.z();
+    } else {
+      stream << "other";
+    }
+    stream << '\n';
+  }
+}
+
+double badUpdateRawCost(const gtsam::NonlinearFactor& factor,
+                        const gtsam::Values& values) {
+  const auto* noise = dynamic_cast<const gtsam::NoiseModelFactor*>(&factor);
+  if (!noise) return std::numeric_limits<double>::quiet_NaN();
+  try {
+    return 0.5 * noise->unwhitenedError(values).squaredNorm();
+  } catch (const std::exception&) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+}
+
+void saveBadUpdateFactors(const std::filesystem::path& path,
+                          const gtsam::NonlinearFactorGraph& graph,
+                          const gtsam::Values* before,
+                          const gtsam::Values* after) {
+  std::ofstream stream(path);
+  stream << std::setprecision(17)
+         << "slot,family,type,keys,observations,dimension,"
+            "cost_before,cost_after,raw_before,raw_after,"
+            "imu_delta_t,prior_anchor_keys\n";
+  for (size_t slot = 0; slot < graph.size(); ++slot) {
+    if (!graph.exists(slot) || !graph.at(slot)) continue;
+    const auto& factor = *graph.at(slot);
+    stream << slot << ',' << badUpdateFactorFamily(factor) << ','
+           << demangledTypeName(typeid(factor)) << ',';
+    for (size_t i = 0; i < factor.keys().size(); ++i) {
+      if (i) stream << '|';
+      stream << gtsam::DefaultKeyFormatter(factor.keys()[i]);
+    }
+    const auto* visual = dynamic_cast<const SmartStereoFactor*>(&factor);
+    stream << ',' << (visual ? visual->measured().size() : 0u)
+           << ',' << factor.dim();
+    auto emit_cost = [&](const gtsam::Values* values, bool raw) {
+      if (!values) { stream << ','; return; }
+      try {
+        stream << ',' << (raw ? badUpdateRawCost(factor, *values)
+                             : factor.error(*values));
+      } catch (const std::exception&) {
+        stream << ",nan";
+      }
+    };
+    emit_cost(before, false);
+    emit_cost(after, false);
+    emit_cost(before, true);
+    emit_cost(after, true);
+    const auto* imu = dynamic_cast<const gtsam::CombinedImuFactor*>(&factor);
+    stream << ',' << (imu ? imu->preintegratedMeasurements().deltaTij() : 0.0)
+           << ',';
+    const auto* prior =
+        dynamic_cast<const gtsam::LinearContainerFactor*>(&factor);
+    if (prior && prior->linearizationPoint()) {
+      bool first = true;
+      for (const auto& item : *prior->linearizationPoint()) {
+        if (!first) stream << '|';
+        stream << gtsam::DefaultKeyFormatter(item.key);
+        first = false;
+      }
+    }
+    stream << '\n';
+  }
+}
+
+void saveBadUpdateVisualObservations(
+    const std::filesystem::path& path,
+    const gtsam::NonlinearFactorGraph& graph) {
+  std::ofstream stream(path);
+  stream << std::setprecision(17) << "slot,observation,key,u_left,u_right,v,disparity\n";
+  for (size_t slot = 0; slot < graph.size(); ++slot) {
+    if (!graph.exists(slot) || !graph.at(slot)) continue;
+    const auto* visual = dynamic_cast<const SmartStereoFactor*>(graph.at(slot).get());
+    if (!visual) continue;
+    for (size_t i = 0; i < visual->measured().size(); ++i) {
+      const auto& z = visual->measured().at(i);
+      stream << slot << ',' << i << ','
+             << gtsam::DefaultKeyFormatter(visual->keys().at(i)) << ','
+             << z.uL() << ',' << z.uR() << ',' << z.v() << ','
+             << z.uL() - z.uR() << '\n';
+    }
+  }
+}
+
+void saveBadUpdateLinearInfluence(
+    const std::filesystem::path& dir,
+    const gtsam::NonlinearFactorGraph& graph,
+    const gtsam::Values& values,
+    const FrameId update) {
+  const auto linear = graph.linearize(values);
+  const gtsam::Ordering ordering = gtsam::Ordering::Natural(*linear);
+  const auto [hessian, eta] = linear->hessian(ordering);
+  std::ofstream keys(dir / "linear_keys.csv");
+  keys << "key,offset,dimension\n";
+  size_t offset = 0;
+  for (const auto key : ordering) {
+    const size_t dim = values.at(key).dim();
+    keys << gtsam::DefaultKeyFormatter(key) << ',' << offset << ',' << dim
+         << '\n';
+    offset += dim;
+  }
+  std::ofstream matrix(dir / "linear_hessian.csv");
+  matrix << std::setprecision(17);
+  for (Eigen::Index i = 0; i < hessian.rows(); ++i) {
+    for (Eigen::Index j = 0; j < hessian.cols(); ++j) {
+      if (j) matrix << ',';
+      matrix << hessian(i, j);
+    }
+    matrix << '\n';
+  }
+  std::ofstream gradients(dir / "linear_family_eta.csv");
+  gradients << std::setprecision(17) << "family,coordinate,eta\n";
+  std::map<std::string, gtsam::NonlinearFactorGraph> families;
+  for (const auto& factor : graph) {
+    if (factor) families[badUpdateFactorFamily(*factor)].push_back(factor);
+  }
+  gtsam::Vector reconstructed = gtsam::Vector::Zero(eta.size());
+  for (const auto& [name, family] : families) {
+    const auto family_linear = family.linearize(values);
+    const auto [unused_hessian, family_eta] = family_linear->hessian(ordering);
+    if (family_eta.size() != eta.size()) {
+      throw std::runtime_error("family eta dimension mismatch: " + name);
+    }
+    reconstructed += family_eta;
+    for (Eigen::Index i = 0; i < family_eta.size(); ++i) {
+      gradients << name << ',' << i << ',' << family_eta(i) << '\n';
+    }
+  }
+  std::ofstream validation(dir / "linear_validation.txt");
+  validation << std::setprecision(17)
+             << "eta_reconstruction_max_abs="
+             << (reconstructed - eta).cwiseAbs().maxCoeff() << '\n';
+  const Eigen::LDLT<gtsam::Matrix> ldlt(hessian);
+  if (ldlt.info() != Eigen::Success ||
+      (ldlt.vectorD().array() <= 0.0).any()) {
+    validation << "solve=not_positive_definite\n";
+    return;
+  }
+  const gtsam::Vector full_step = ldlt.solve(eta);
+  validation << "full_normal_equation_max_abs="
+             << (hessian * full_step - eta).cwiseAbs().maxCoeff() << '\n';
+  std::ofstream effects(dir / "linear_family_effects.csv");
+  effects << std::setprecision(17)
+          << "family,edge,relative_tx,relative_ty,relative_tz,"
+             "relative_rot_norm,step_norm\n";
+  const std::vector<std::pair<size_t, size_t>> edges =
+      update == 1084u
+          ? std::vector<std::pair<size_t, size_t>>{{1079u, 1080u}}
+          : std::vector<std::pair<size_t, size_t>>{{1084u, 1085u},
+                                                   {1085u, 1086u},
+                                                   {1086u, 1087u}};
+  auto emit_effects = [&](const std::string& family,
+                          const gtsam::Vector& step) {
+    gtsam::VectorValues tangent;
+    Eigen::Index cursor = 0;
+    for (const auto key : ordering) {
+      const auto dim = static_cast<Eigen::Index>(values.at(key).dim());
+      tangent.insert(key, step.segment(cursor, dim));
+      cursor += dim;
+    }
+    const gtsam::Values moved = values.retract(tangent);
+    for (const auto& [from, to] : edges) {
+      const auto ki = gtsam::Symbol(kPoseSymbolChar, from);
+      const auto kj = gtsam::Symbol(kPoseSymbolChar, to);
+      if (!values.exists(ki) || !values.exists(kj)) continue;
+      const gtsam::Pose3 before =
+          values.at<gtsam::Pose3>(ki).between(values.at<gtsam::Pose3>(kj));
+      const gtsam::Pose3 after =
+          moved.at<gtsam::Pose3>(ki).between(moved.at<gtsam::Pose3>(kj));
+      const gtsam::Vector6 local = gtsam::Pose3::Logmap(before.between(after));
+      effects << family << ',' << from << "->" << to << ',' << local(3)
+              << ',' << local(4) << ',' << local(5) << ','
+              << local.head<3>().norm() << ',' << step.norm() << '\n';
+    }
+  };
+  emit_effects("all_linearized", full_step);
+  gtsam::Vector summed = gtsam::Vector::Zero(eta.size());
+  for (const auto& [name, family] : families) {
+    const auto family_eta = family.linearize(values)->hessian(ordering).second;
+    const gtsam::Vector part = ldlt.solve(family_eta);
+    summed += part;
+    emit_effects(name, part);
+  }
+  validation << "step_reconstruction_max_abs="
+             << (summed - full_step).cwiseAbs().maxCoeff() << '\n';
+}
+
+void saveBadUpdateAudit(const FrameId update,
+                        const gtsam::NonlinearFactorGraph& graph_before,
+                        const gtsam::Values& values_before,
+                        const gtsam::NonlinearFactorGraph& new_factors,
+                        const gtsam::FactorIndices& removed_slots,
+                        const cbs::IncrementalFixedLagBpsamSmoother::BadUpdateStageAudit* stages,
+                        const gtsam::NonlinearFactorGraph& graph_after,
+                        const gtsam::Values& values_after) {
+  const auto dir = std::filesystem::path(FLAGS_kimera_bad_update_audit_dir) /
+                   ("update_" + std::to_string(update));
+  std::filesystem::create_directories(dir);
+  // Smart factors cache triangulation even through const methods. Work only on
+  // copies so the diagnostic cannot influence a later production update.
+  const auto analysis_new_factors = new_factors.clone();
+  const auto analysis_graph_after = graph_after.clone();
+  saveBadUpdateValues(dir / "values_before.csv", values_before);
+  saveBadUpdateValues(dir / "values_after.csv", values_after);
+  saveBadUpdateFactors(dir / "factors_before.csv", graph_before,
+                       &values_before, nullptr);
+  saveBadUpdateFactors(dir / "new_factors.csv", analysis_new_factors,
+                       &values_before, nullptr);
+  saveBadUpdateFactors(dir / "factors_after.csv", analysis_graph_after,
+                       &values_before, &values_after);
+  if (stages) {
+    saveBadUpdateValues(dir / "values_after_optimization_before_marginalization.csv",
+                        stages->values_after_optimization);
+    saveBadUpdateFactors(dir / "factors_after_optimization_before_marginalization.csv",
+                         stages->graph_after_optimization,
+                         &values_before, &stages->values_after_optimization);
+    std::ofstream lifecycle(dir / "marginalization.txt");
+    lifecycle << "keys_to_marginalize\n";
+    for (const auto key : stages->keys_to_marginalize) {
+      lifecycle << gtsam::DefaultKeyFormatter(key) << '\n';
+    }
+    lifecycle << "created_marginal_factor_slots\n";
+    for (const auto slot : stages->created_marginal_factor_slots) {
+      lifecycle << slot << '\n';
+    }
+    lifecycle << "deleted_marginal_factor_slots\n";
+    for (const auto slot : stages->deleted_marginal_factor_slots) {
+      lifecycle << slot << '\n';
+    }
+  }
+  saveBadUpdateVisualObservations(dir / "visual_observations_after.csv",
+                                  analysis_graph_after);
+  for (size_t slot = 0; slot < analysis_graph_after.size(); ++slot) {
+    if (!analysis_graph_after.exists(slot) || !analysis_graph_after.at(slot))
+      continue;
+    const auto& factor = *analysis_graph_after.at(slot);
+    const std::string base = "factor_slot_" + std::to_string(slot);
+    try {
+      if (const auto* imu =
+              dynamic_cast<const gtsam::CombinedImuFactor*>(&factor)) {
+        saveBadUpdateArchive(dir / (base + "_combined_imu.bin"), *imu);
+      } else if (const auto* prior =
+                     dynamic_cast<const gtsam::LinearContainerFactor*>(&factor)) {
+        saveBadUpdateArchive(dir / (base + "_linear_prior.bin"), *prior);
+        if (prior->linearizationPoint()) {
+          saveBadUpdateValues(dir / (base + "_anchor.csv"),
+                              *prior->linearizationPoint());
+        }
+      }
+    } catch (const std::exception& e) {
+      std::ofstream(dir / (base + ".archive_error.txt")) << e.what() << '\n';
+    }
+  }
+  std::ofstream removed(dir / "removed_slots.txt");
+  for (const auto slot : removed_slots) removed << slot << '\n';
+  std::ofstream objective(dir / "objective.csv");
+  objective << std::setprecision(17) << "state,total_cost\n"
+            << "before," << analysis_graph_after.error(values_before) << '\n'
+            << "production," << analysis_graph_after.error(values_after) << '\n';
+  for (const auto& [name, graph] :
+       std::vector<std::pair<std::string, const gtsam::NonlinearFactorGraph*>>{
+           {"graph_before", &graph_before},
+           {"new_factors", &analysis_new_factors},
+           {"graph_after", &analysis_graph_after},
+           {"graph_after_optimization_before_marginalization",
+            stages ? &stages->graph_after_optimization : nullptr}}) {
+    if (!graph) continue;
+    try {
+      saveBadUpdateArchive(dir / (name + ".bin"), *graph);
+      LOG(INFO) << "KIMERA_BAD_UPDATE_ARCHIVE_OK," << update << ',' << name;
+    } catch (const std::exception& e) {
+      std::ofstream(dir / (name + ".archive_error.txt")) << e.what() << '\n';
+      LOG(ERROR) << "KIMERA_BAD_UPDATE_ARCHIVE_FAILED," << update << ','
+                 << name << ',' << e.what();
+    }
+  }
+  for (const auto& [name, values] :
+       std::vector<std::pair<std::string, const gtsam::Values*>>{
+           {"values_before", &values_before},
+           {"values_after", &values_after},
+           {"values_after_optimization_before_marginalization",
+            stages ? &stages->values_after_optimization : nullptr}}) {
+    if (!values) continue;
+    try {
+      saveBadUpdateArchive(dir / (name + ".bin"), *values);
+    } catch (const std::exception& e) {
+      std::ofstream(dir / (name + ".archive_error.txt")) << e.what() << '\n';
+      LOG(ERROR) << "KIMERA_BAD_UPDATE_ARCHIVE_FAILED," << update << ','
+                 << name << ',' << e.what();
+    }
+  }
+  if (update != 1084u && update != 1093u) return;
+  try {
+    saveBadUpdateLinearInfluence(dir, analysis_graph_after, values_before,
+                                 update);
+  } catch (const std::exception& e) {
+    std::ofstream(dir / "linear_influence_error.txt") << e.what() << '\n';
+  }
+  try {
+    gtsam::LevenbergMarquardtParams params;
+    params.maxIterations = 100;
+    const gtsam::Values reference =
+        gtsam::LevenbergMarquardtOptimizer(analysis_graph_after,
+                                          values_after, params)
+            .optimize();
+    objective << "reference," << analysis_graph_after.error(reference) << '\n';
+    saveBadUpdateValues(dir / "values_reference.csv", reference);
+    saveBadUpdateFactors(dir / "factors_reference.csv", analysis_graph_after,
+                         &values_after, &reference);
+    saveBadUpdateArchive(dir / "values_reference.bin", reference);
+  } catch (const std::exception& e) {
+    std::ofstream(dir / "reference_error.txt") << e.what() << '\n';
+    LOG(ERROR) << "KIMERA_BAD_UPDATE_REFERENCE_FAILED," << update << ','
+               << e.what();
+  }
+}
+
 }  // namespace
 
 class VioBackend::LocalSmootherPoseBeliefCovarianceSidecarAdapter final
@@ -1682,7 +2118,25 @@ void VioBackend::enqueueExternalOdometryBeliefs(
         queued_belief.received_wall_time_sec <= 0.0) {
       queued_belief.received_wall_time_sec = wallTimeNowSec();
     }
-    pending_external_odom_beliefs_.push_back(queued_belief);
+    if (FLAGS_cbs_live_revision_enable) {
+      const auto previous = std::find_if(
+          pending_external_odom_beliefs_.begin(),
+          pending_external_odom_beliefs_.end(),
+          [&queued_belief](const ExternalOdometryBelief& candidate) {
+            return candidate.source_agent == queued_belief.source_agent &&
+                   candidate.sender_from_pose_index ==
+                       queued_belief.sender_from_pose_index &&
+                   candidate.sender_to_pose_index ==
+                       queued_belief.sender_to_pose_index;
+          });
+      if (previous != pending_external_odom_beliefs_.end()) {
+        if (queued_belief.revision > previous->revision) {
+          *previous = std::move(queued_belief);
+        }
+        continue;
+      }
+    }
+    pending_external_odom_beliefs_.push_back(std::move(queued_belief));
   }
   const size_t size_before_cap = pending_external_odom_beliefs_.size();
   capPendingExternalOdometryBeliefsLocked();
@@ -1729,6 +2183,24 @@ void VioBackend::requeuePendingExternalOdometryBeliefs(
                 pending_external_odom_beliefs_.size()
           : 0u;
   for (const auto& belief : beliefs) {
+    if (FLAGS_cbs_live_revision_enable) {
+      const auto previous = std::find_if(
+          pending_external_odom_beliefs_.begin(),
+          pending_external_odom_beliefs_.end(),
+          [&belief](const ExternalOdometryBelief& candidate) {
+            return candidate.source_agent == belief.source_agent &&
+                   candidate.sender_from_pose_index ==
+                       belief.sender_from_pose_index &&
+                   candidate.sender_to_pose_index ==
+                       belief.sender_to_pose_index;
+          });
+      if (previous != pending_external_odom_beliefs_.end()) {
+        if (belief.revision > previous->revision) {
+          *previous = belief;
+        }
+        continue;
+      }
+    }
     if (remaining_retry_slots == 0u) {
       break;
     }
@@ -1749,6 +2221,17 @@ void VioBackend::updateKeyframeTimestampIndex(
   auto it = keyframe_timestamp_sec_.begin();
   while (it != keyframe_timestamp_sec_.end() && it->first < min_keep_frame) {
     it = keyframe_timestamp_sec_.erase(it);
+  }
+
+  auto match_it = accepted_external_odom_match_by_receiver_edge_.begin();
+  while (match_it != accepted_external_odom_match_by_receiver_edge_.end()) {
+    const FrameId from_frame_id = std::get<1>(match_it->first);
+    const FrameId to_frame_id = std::get<2>(match_it->first);
+    if (from_frame_id < min_keep_frame || to_frame_id < min_keep_frame) {
+      match_it = accepted_external_odom_match_by_receiver_edge_.erase(match_it);
+    } else {
+      ++match_it;
+    }
   }
 }
 
@@ -2177,6 +2660,23 @@ void VioBackend::collectExternalBeliefFactors(
   std::map<ReceiverEdgeKey, size_t> best_candidate_by_receiver_edge;
 
   for (const auto& belief : pending_odom_beliefs) {
+    const ExternalOdomSourceBeliefId source_id{
+        belief.source_agent,
+        belief.sender_from_pose_index,
+        belief.sender_to_pose_index};
+    if (FLAGS_cbs_live_revision_enable) {
+      const auto prior = accepted_external_odom_revision_by_source_.find(
+          source_id);
+      if (prior != accepted_external_odom_revision_by_source_.end() &&
+          belief.revision <= prior->second) {
+        LOG(INFO) << "KIMERA_CBS_LIVE_REVISION_ROW,ignored,"
+                  << static_cast<int>(belief.source_agent) << ','
+                  << belief.sender_from_pose_index << ','
+                  << belief.sender_to_pose_index << ','
+                  << belief.revision << ',' << prior->second;
+        continue;
+      }
+    }
     FrameId from_frame_id = 0u;
     FrameId to_frame_id = 0u;
     FrameId from_best_frame_id = 0u;
@@ -2384,6 +2884,15 @@ void VioBackend::collectExternalBeliefFactors(
     odom_belief.covariance =
         poseCovarianceFromMatrix(matrix6FromArray(belief.covariance));
     odom_belief.relax_factor = belief.relax_factor;
+    LOG(INFO) << "KIMERA_CBS_SOURCE_TRANSPORT_ROW,"
+              << static_cast<char>(belief.source_agent) << ","
+              << belief.sender_from_pose_index << ","
+              << belief.sender_to_pose_index << ","
+              << belief.revision << ","
+              << cbs::relative_pose_covariance::matrixToken(
+                     matrix6FromArray(belief.covariance)) << ","
+              << cbs::relative_pose_covariance::matrixToken(
+                     odom_belief.covariance);
 
     MatchedExternalOdomCandidate candidate;
     candidate.belief = belief;
@@ -2407,9 +2916,20 @@ void VioBackend::collectExternalBeliefFactors(
     const size_t candidate_index = matched_candidates.size();
     matched_candidates.push_back(std::move(candidate));
     const auto best_it = best_candidate_by_receiver_edge.find(receiver_edge);
+    const auto& selected_candidate = matched_candidates[candidate_index];
+    const bool newer_same_source =
+        best_it != best_candidate_by_receiver_edge.end() &&
+        selected_candidate.belief.source_agent ==
+            matched_candidates[best_it->second].belief.source_agent &&
+        selected_candidate.belief.sender_from_pose_index ==
+            matched_candidates[best_it->second].belief.sender_from_pose_index &&
+        selected_candidate.belief.sender_to_pose_index ==
+            matched_candidates[best_it->second].belief.sender_to_pose_index &&
+        selected_candidate.belief.revision >
+            matched_candidates[best_it->second].belief.revision;
     if (best_it == best_candidate_by_receiver_edge.end() ||
-        matched_candidates[candidate_index].score <
-            matched_candidates[best_it->second].score) {
+        newer_same_source ||
+        selected_candidate.score < matched_candidates[best_it->second].score) {
       best_candidate_by_receiver_edge[receiver_edge] = candidate_index;
     }
   }
@@ -2446,6 +2966,64 @@ void VioBackend::collectExternalBeliefFactors(
                       true,
                       "receiver_edge_superseded_by_better_candidate");
   }
+
+  // Persistent BPSAM factors are keyed by the receiver edge. Beliefs for a
+  // different sender edge may arrive in later backend updates and target that
+  // same receiver edge. Keep the best timestamp match across updates so a
+  // later, worse alternative cannot replace a better active factor. Revisions
+  // of the same sender edge remain eligible because their mean/covariance may
+  // have improved as the sender optimized its fixed-lag window.
+  std::vector<size_t> persistent_selected_candidate_indices;
+  persistent_selected_candidate_indices.reserve(
+      selected_candidate_indices.size());
+  const bool persistent_odom_factor_mode =
+      parseCbsOdomFactorMode(FLAGS_cbs_odom_factor_mode) ==
+      cbs::BPSAM::CbsOdomFactorMode::Persistent;
+  for (const size_t candidate_index : selected_candidate_indices) {
+    const auto& candidate = matched_candidates[candidate_index];
+    if (!persistent_odom_factor_mode) {
+      persistent_selected_candidate_indices.push_back(candidate_index);
+      continue;
+    }
+    const ExternalOdomReceiverEdgeKey receiver_edge{
+        candidate.belief.source_agent,
+        candidate.from_frame_id,
+        candidate.to_frame_id};
+    const auto accepted_it =
+        accepted_external_odom_match_by_receiver_edge_.find(receiver_edge);
+    const bool same_sender_edge =
+        accepted_it != accepted_external_odom_match_by_receiver_edge_.end() &&
+        accepted_it->second.sender_from_pose_index ==
+            candidate.belief.sender_from_pose_index &&
+        accepted_it->second.sender_to_pose_index ==
+            candidate.belief.sender_to_pose_index;
+    const bool strictly_better_alternative =
+        accepted_it == accepted_external_odom_match_by_receiver_edge_.end() ||
+        candidate.score + 1.0e-12 <
+            accepted_it->second.timestamp_score;
+    if (same_sender_edge || strictly_better_alternative) {
+      persistent_selected_candidate_indices.push_back(candidate_index);
+      continue;
+    }
+
+    log_match_decision(candidate.belief,
+                       candidate.from_best_frame_id,
+                       candidate.from_best_stamp_sec,
+                       candidate.from_best_abs_dt,
+                       candidate.from_reject_reason,
+                       candidate.to_best_frame_id,
+                       candidate.to_best_stamp_sec,
+                       candidate.to_best_abs_dt,
+                       candidate.to_reject_reason,
+                       "receiver_edge_retained_better_persistent_match");
+    emit_shadow_match(
+        candidate,
+        ExternalBeliefMatchDiagnostic::Status::Superseded,
+        true,
+        "receiver_edge_retained_better_persistent_match");
+  }
+  selected_candidate_indices =
+      std::move(persistent_selected_candidate_indices);
 
   const auto log_bpsam_add_detail =
       [&](const MatchedExternalOdomCandidate& candidate,
@@ -2545,6 +3123,30 @@ void VioBackend::collectExternalBeliefFactors(
         switch (detail.status) {
           case cbs::BPSAM::AddOdometryBeliefStatus::Accepted:
             ++external_beliefs_added_per_update_;
+            if (FLAGS_cbs_live_revision_enable) {
+              accepted_external_odom_revision_by_source_.insert_or_assign(
+                  ExternalOdomSourceBeliefId{
+                      candidate.belief.source_agent,
+                      candidate.belief.sender_from_pose_index,
+                      candidate.belief.sender_to_pose_index},
+                  candidate.belief.revision);
+              LOG(INFO) << "KIMERA_CBS_LIVE_REVISION_ROW,accepted,"
+                        << static_cast<int>(candidate.belief.source_agent)
+                        << ',' << candidate.belief.sender_from_pose_index
+                        << ',' << candidate.belief.sender_to_pose_index
+                        << ',' << candidate.belief.revision;
+            }
+            if (persistent_odom_factor_mode) {
+              accepted_external_odom_match_by_receiver_edge_.insert_or_assign(
+                  ExternalOdomReceiverEdgeKey{
+                      candidate.belief.source_agent,
+                      candidate.from_frame_id,
+                      candidate.to_frame_id},
+                  AcceptedExternalOdomMatch{
+                      candidate.belief.sender_from_pose_index,
+                      candidate.belief.sender_to_pose_index,
+                      candidate.score});
+            }
             {
               const gtsam::Key from_key =
                   candidate.odom_belief.from_pose_key;
@@ -2947,6 +3549,134 @@ void VioBackend::refreshCbsOutgoingBeliefs(const FrameId& cur_id) {
       last_cbs_outgoing_odom_pair_valid_ = true;
       last_cbs_outgoing_odom_from_key_ = latest_from_key;
       last_cbs_outgoing_odom_to_key_ = latest_to_key;
+    }
+
+    // This audit is opt-in and read-only with respect to the smoother.  The
+    // normal outgoing beliefs above are constructed before any audit query.
+    // The ROS odometry record with header.seq == cur_id supplies the causal
+    // availability time for every logged same-update revision.
+    const char* audit_env = std::getenv("KIMERA_CBS_REVISION_AUDIT");
+    const bool revision_audit =
+        audit_env != nullptr && std::string(audit_env) == "1";
+    if (revision_audit || FLAGS_cbs_live_revision_enable) {
+      auto append_pose = [](std::ostringstream* row, const gtsam::Pose3& pose) {
+        const auto q = pose.rotation().toQuaternion();
+        *row << ',' << pose.x() << ',' << pose.y() << ',' << pose.z()
+             << ',' << q.w() << ',' << q.x() << ',' << q.y() << ',' << q.z();
+      };
+
+      // Preserve every pose's last active estimate; a disappearance from the
+      // fixed-lag smoother marks retirement, while the final active tail is
+      // explicitly right-censored in the offline analysis.
+      for (auto it = cbs_revision_audit_last_pose_.begin();
+           it != cbs_revision_audit_last_pose_.end();) {
+        const gtsam::Key key = gtsam::Symbol(kPoseSymbolChar, it->first);
+        if (smoother_->valueExists(key)) {
+          ++it;
+          continue;
+        }
+        std::ostringstream row;
+        row << std::setprecision(17) << "KIMERA_CBS_REVISION_POSE_RETIRE_ROW,"
+            << cur_id << ',' << it->first << ',' << it->second.first;
+        append_pose(&row, it->second.second);
+        LOG(INFO) << row.str();
+        it = cbs_revision_audit_last_pose_.erase(it);
+      }
+      for (const auto& frame_and_stamp : keyframe_timestamp_sec_) {
+        const FrameId frame_id = frame_and_stamp.first;
+        const gtsam::Key key = gtsam::Symbol(kPoseSymbolChar, frame_id);
+        if (smoother_->valueExists(key)) {
+          cbs_revision_audit_last_pose_[frame_id] =
+              {frame_and_stamp.second,
+               smoother_->calculateEstimate<gtsam::Pose3>(key)};
+        }
+      }
+
+      std::map<std::pair<FrameId, FrameId>, ExternalOdometryBelief> first;
+      for (const auto& belief : cbs_outgoing_odom_beliefs_) {
+        first.emplace(std::make_pair(belief.from_pose_index,
+                                     belief.to_pose_index), belief);
+      }
+      for (const auto& item : first) {
+        cbs_revision_audit_versions_.emplace(item.first, 0u);
+      }
+
+      for (auto it = cbs_revision_audit_versions_.begin();
+           it != cbs_revision_audit_versions_.end();) {
+        const FrameId from_id = it->first.first;
+        const FrameId to_id = it->first.second;
+        const gtsam::Key from_key = gtsam::Symbol(kPoseSymbolChar, from_id);
+        const gtsam::Key to_key = gtsam::Symbol(kPoseSymbolChar, to_id);
+        if (!smoother_->valueExists(from_key) ||
+            !smoother_->valueExists(to_key)) {
+          LOG(INFO) << "KIMERA_CBS_REVISION_EDGE_RETIRE_ROW,"
+                    << cur_id << ',' << from_id << ',' << to_id << ','
+                    << it->second;
+          it = cbs_revision_audit_versions_.erase(it);
+          continue;
+        }
+
+        ExternalOdometryBelief belief;
+        const auto first_it = first.find(it->first);
+        const bool published_now = first_it != first.end() && it->second == 0u;
+        if (published_now) {
+          belief = first_it->second;
+        } else {
+          gtsam::KeySet pair_keys{from_key, to_key};
+          const auto revisions = smoother_->getOdometryBeliefs(
+              pair_keys,
+              static_cast<cbs::AgentId>(cbs_odom_requesting_agent_id_));
+          if (revisions.size() != 1u) {
+            LOG(ERROR) << "KIMERA_CBS_REVISION_EDGE_ERROR_ROW,"
+                       << cur_id << ',' << from_id << ',' << to_id << ','
+                       << revisions.size();
+            ++it;
+            continue;
+          }
+          const auto& revision = revisions.front();
+          belief.from_pose_index = static_cast<uint32_t>(from_id);
+          belief.to_pose_index = static_cast<uint32_t>(to_id);
+          belief.source_agent = static_cast<uint8_t>('k');
+          belief.sender_from_pose_index = belief.from_pose_index;
+          belief.sender_to_pose_index = belief.to_pose_index;
+          belief.from_stamp_sec = keyframe_timestamp_sec_.at(from_id);
+          belief.to_stamp_sec = keyframe_timestamp_sec_.at(to_id);
+          belief.sender_timestamp_ns = timestamp_lkf_;
+          belief.sender_frame_id = "odom";
+          belief.received_wall_time_sec = wallTimeNowSec();
+          belief.relax_factor = revision.relax_factor;
+          vector6ToArray(gtsam::Pose3::Logmap(revision.measured_from_to),
+                         &belief.relative_mu);
+          matrix6ToArray(poseCovarianceFromMatrix(revision.covariance),
+                         &belief.covariance);
+          ++it->second;
+        }
+        belief.revision = static_cast<uint32_t>(it->second);
+        if (FLAGS_cbs_live_revision_enable && !published_now) {
+          cbs_outgoing_odom_beliefs_.push_back(belief);
+        }
+
+        const auto from_pose =
+            smoother_->calculateEstimate<gtsam::Pose3>(from_key);
+        const auto to_pose = smoother_->calculateEstimate<gtsam::Pose3>(to_key);
+        std::ostringstream row;
+        row << std::setprecision(17) << "KIMERA_CBS_REVISION_EDGE_ROW,"
+            << cur_id << ",k," << from_id << ',' << to_id << ','
+            << belief.from_stamp_sec << ',' << belief.to_stamp_sec << ','
+            << it->second << ',' << (published_now ? "first" : "active");
+        append_pose(&row, from_pose);
+        append_pose(&row, to_pose);
+        for (const double value : belief.relative_mu) {
+          row << ',' << value;
+        }
+        for (const double value : belief.covariance) {
+          row << ',' << value;
+        }
+        if (revision_audit) {
+          LOG(INFO) << row.str();
+        }
+        ++it;
+      }
     }
   } catch (const std::exception& e) {
     LOG(WARNING) << "Kimera CBS getOdometryBeliefs failed: " << e.what();
@@ -4178,6 +4908,20 @@ bool VioBackend::optimize(
   }
   DCHECK_EQ(key_frame_count.size(), new_values_.size());
 
+  const bool bad_update_audit = isBadUpdateAuditTarget(cur_id);
+  gtsam::NonlinearFactorGraph bad_update_graph_before;
+  gtsam::Values bad_update_values_before;
+  if (bad_update_audit) {
+    bad_update_graph_before = getMainBackendFactors().clone();
+    bad_update_values_before = calculateMainBackendEstimate();
+    for (const auto& item : new_values_) {
+      if (!bad_update_values_before.exists(item.key)) {
+        bad_update_values_before.insert(item.key, item.value);
+      }
+    }
+    smoother_->captureBadUpdateStagesOnce();
+  }
+
   // Store time before iSAM update.
   if (VLOG_IS_ON(10) || log_output_) {
     debug_info_.updateTime_ =
@@ -4328,6 +5072,24 @@ bool VioBackend::optimize(
         }
       }
       update_states_time_sec = elapsedSec(update_states_start_time);
+
+      if (bad_update_audit) {
+        try {
+          saveBadUpdateAudit(cur_id,
+                             bad_update_graph_before,
+                             bad_update_values_before,
+                             new_factors_tmp,
+                             delete_slots,
+                             smoother_->badUpdateStageAudit()
+                                 ? &*smoother_->badUpdateStageAudit()
+                                 : nullptr,
+                             getMainBackendFactors(),
+                             state_);
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "KIMERA_BAD_UPDATE_AUDIT_FAILED," << cur_id << ','
+                     << e.what();
+        }
+      }
 
       if (FLAGS_kimera_factor_graph_audit_enable) {
         logFactorGraphAudit(cur_id,
@@ -4652,6 +5414,33 @@ void VioBackend::updateStates(const FrameId& cur_id) {
   // Update output estimate by chaining relative motion estimates
   W_Pose_B_lkf_from_increments_ =
       W_Pose_B_lkf_from_increments_.compose(B_lkf_Pose_kf);
+
+  // Read-only bounded mechanism audit: log every active pose, including poses
+  // that do not occur in any exported CBS edge, at full numeric precision.
+  const char* semantics_audit = std::getenv("KIMERA_FIXED_LAG_SEMANTICS_AUDIT");
+  if (semantics_audit != nullptr && std::string(semantics_audit) == "1") {
+    auto append_pose = [](std::ostringstream* row, const gtsam::Pose3& pose) {
+      const auto q = pose.rotation().toQuaternion();
+      *row << ',' << pose.x() << ',' << pose.y() << ',' << pose.z()
+           << ',' << q.w() << ',' << q.x() << ',' << q.y() << ',' << q.z();
+    };
+    for (const auto& value : state_) {
+      const gtsam::Symbol symbol(value.key);
+      if (symbol.chr() != kPoseSymbolChar) continue;
+      const auto stamp = keyframe_timestamp_sec_.find(symbol.index());
+      if (stamp == keyframe_timestamp_sec_.end()) continue;
+      std::ostringstream row;
+      row << std::setprecision(17) << "KIMERA_SEMANTICS_ACTIVE_ROW,"
+          << cur_id << ',' << symbol.index() << ',' << stamp->second;
+      append_pose(&row, state_.at<gtsam::Pose3>(value.key));
+      LOG(INFO) << row.str();
+    }
+    std::ostringstream row;
+    row << std::setprecision(17) << "KIMERA_SEMANTICS_OUTPUT_ROW,"
+        << cur_id << ',' << keyframe_timestamp_sec_.at(cur_id);
+    append_pose(&row, W_Pose_B_lkf_from_increments_);
+    LOG(INFO) << row.str();
+  }
 
   VLOG(1) << "Backend: Update IMU Bias.";
   CHECK(imu_bias_update_callback_) << "Did you forget to register the IMU bias "

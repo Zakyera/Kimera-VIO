@@ -19,6 +19,8 @@
 #include <glog/logging.h>
 #include <gtsam/geometry/Rot3.h>
 
+#include "kimera-vio/frontend/VisualHealthAudit.h"
+
 #include "kimera-vio/utils/Timer.h"
 #include "kimera-vio/utils/UtilsNumerical.h"
 
@@ -309,11 +311,15 @@ StatusStereoMeasurementsPtr StereoVisionImuFrontend::processStereoFrame(
                             frontend_params_.feature_detector_params_,
                             stereo_camera_->getR1());
 
+  LogVisualHealthFrame(*stereoFrame_k_, "tracked", stereoFrame_lkf_->timestamp_);
+
   // feature tracking failed for all points, move on to the next frame
   if (left_frame_k->keypoints_.size() == 0) {
     VLOG(2)
         << "feature tracking failed for all points, moving to next frame \n";
     feature_detector_->featureDetection(left_frame_k, stereo_camera_->getR1());
+    LogVisualHealthFrame(*stereoFrame_k_, "tracking_empty_replenished",
+                         stereoFrame_lkf_->timestamp_);
     stereoFrame_km1_ = stereoFrame_k_;
     stereoFrame_k_.reset();
     ++frame_count_;
@@ -363,6 +369,8 @@ StatusStereoMeasurementsPtr StereoVisionImuFrontend::processStereoFrame(
       start_time = utils::Timer::tic();
       stereo_matcher_.sparseStereoReconstruction(stereoFrame_k_.get());
       sparse_stereo_time = utils::Timer::toc(start_time).count();
+      LogVisualHealthFrame(*stereoFrame_k_, "pre_stereo",
+                           stereoFrame_lkf_->timestamp_);
 
       TrackingStatusPose status_pose_stereo;
       if (frontend_params_.use_stereo_tracking_) {
@@ -418,7 +426,11 @@ StatusStereoMeasurementsPtr StereoVisionImuFrontend::processStereoFrame(
     // Perform feature detection (note: this must be after RANSAC,
     // since if we discard more features, we need to extract more)
     CHECK(feature_detector_);
+    LogVisualHealthFrame(*stereoFrame_k_, "post_ransac_pre_replenishment",
+                         stereoFrame_lkf_->timestamp_);
     feature_detector_->featureDetection(left_frame_k, stereo_camera_->getR1());
+    LogVisualHealthFrame(*stereoFrame_k_, "replenished",
+                         stereoFrame_lkf_->timestamp_);
 
     // Get 3D points via stereo, including newly extracted
     // (this might be only for the visualization).
@@ -443,6 +455,15 @@ StatusStereoMeasurementsPtr StereoVisionImuFrontend::processStereoFrame(
 
     // Populate statistics.
     stereoFrame_k_->checkStatusRightKeypoints(&tracker_->debug_info_);
+    LogVisualHealthFrame(*stereoFrame_k_, "keyframe_final",
+                         stereoFrame_lkf_->timestamp_);
+    if (VisualHealthAuditEnabled()) {
+      LOG(INFO) << "KIMERA_VISUAL_HEALTH_STATUS_ROW,"
+                << stereoFrame_lkf_->timestamp_ << ',' << stereoFrame_k_->timestamp_
+                << ',' << stereoFrame_k_->id_ << ','
+                << TrackerStatusSummary::asString(tracker_status_summary_.kfTrackingStatus_mono_)
+                << ',' << TrackerStatusSummary::asString(tracker_status_summary_.kfTrackingStatus_stereo_);
+    }
 
     // Move on.
     stereoFrame_lkf_ = stereoFrame_k_;

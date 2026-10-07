@@ -226,6 +226,68 @@ ThreadsafeImuBuffer::getImuDataInterpolatedBorders(
   return query_result;
 }
 
+ThreadsafeImuBuffer::QueryResult ThreadsafeImuBuffer::getImuDataZohBorders(
+    const Timestamp& timestamp_ns_from,
+    const Timestamp& timestamp_ns_to,
+    SampleSupport support,
+    ImuStampS* imu_timestamps,
+    ImuAccGyrS* imu_measurements) {
+  CHECK_NOTNULL(imu_timestamps);
+  CHECK_NOTNULL(imu_measurements);
+  DCHECK_LT(timestamp_ns_from, timestamp_ns_to);
+  const QueryResult query_result =
+      isDataAvailableUpToImpl(timestamp_ns_from, timestamp_ns_to);
+  if (query_result != QueryResult::kDataAvailable) {
+    imu_timestamps->resize(Eigen::NoChange, 0);
+    imu_measurements->resize(Eigen::NoChange, 0);
+    return query_result;
+  }
+
+  ImuStampS interior_timestamps;
+  ImuAccGyrS interior_measurements;
+  const QueryResult interior_result = getImuDataBtwTimestamps(
+      timestamp_ns_from, timestamp_ns_to,
+      &interior_timestamps, &interior_measurements);
+  if (interior_result != QueryResult::kDataAvailable &&
+      interior_result != QueryResult::kTooFewMeasurementsAvailable) {
+    imu_timestamps->resize(Eigen::NoChange, 0);
+    imu_measurements->resize(Eigen::NoChange, 0);
+    return interior_result;
+  }
+
+  const size_t interior_count =
+      interior_result == QueryResult::kDataAvailable
+          ? static_cast<size_t>(interior_timestamps.cols())
+          : 0u;
+  const size_t count = interior_count + 2u;
+  imu_timestamps->resize(Eigen::NoChange, count);
+  imu_measurements->resize(Eigen::NoChange, count);
+  (*imu_timestamps)(0) = timestamp_ns_from;
+  for (size_t index = 0; index < interior_count; ++index) {
+    (*imu_timestamps)(index + 1u) = interior_timestamps(index);
+  }
+  (*imu_timestamps)(count - 1u) = timestamp_ns_to;
+
+  for (size_t index = 0; index + 1u < count; ++index) {
+    const Timestamp support_timestamp =
+        support == SampleSupport::kLeft
+            ? (*imu_timestamps)(index)
+            : (*imu_timestamps)(index + 1u);
+    Timestamp raw_timestamp = 0;
+    ImuMeasurement raw;
+    const bool found = support == SampleSupport::kLeft
+        ? buffer_.getValueAtOrBeforeTime(
+              support_timestamp, &raw_timestamp, &raw)
+        : buffer_.getValueAtOrAfterTime(
+              support_timestamp, &raw_timestamp, &raw);
+    CHECK(found) << "Missing ZOH support sample at " << support_timestamp;
+    imu_measurements->col(index) = raw.acc_gyr_;
+  }
+  imu_measurements->rightCols<1>() =
+      imu_measurements->col(static_cast<Eigen::Index>(count - 2u));
+  return QueryResult::kDataAvailable;
+}
+
 void ThreadsafeImuBuffer::interpolateValueAtTimestamp(
     const Timestamp& timestamp_ns,
     ImuAccGyr* interpolated_imu_measurement) {

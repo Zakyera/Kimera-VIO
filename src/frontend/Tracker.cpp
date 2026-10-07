@@ -21,6 +21,7 @@
 #include <vector>   // for vector<>
 
 #include "kimera-vio/frontend/UndistorterRectifier.h"
+#include "kimera-vio/frontend/VisualHealthAudit.h"
 #include "kimera-vio/frontend/optical-flow/OpticalFlowPredictorFactory.h"
 #include "kimera-vio/utils/Timer.h"
 #include "kimera-vio/utils/UtilsOpenCV.h"
@@ -338,6 +339,8 @@ TrackingStatusPose Tracker::geometricOutlierRejection2d2d(
                << " to frame " << cur_frame->id_ << ".\n"
                << "Mono Tracking Status = INVALID.";
     result = std::make_pair(TrackingStatus::INVALID, gtsam::Pose3());
+    LogVisualHealthMatches("mono", ref_frame->timestamp_, cur_frame->timestamp_,
+                           0, 0, result.first);
   } else {
     std::vector<int> inliers;
     result = geometricOutlierRejection2d2d(ref_frame->versors_,
@@ -345,6 +348,9 @@ TrackingStatusPose Tracker::geometricOutlierRejection2d2d(
                                            matches_ref_cur,
                                            &inliers,
                                            cam_lkf_Pose_cam_kf);
+
+    LogVisualHealthMatches("mono", ref_frame->timestamp_, cur_frame->timestamp_,
+                           matches_ref_cur.size(), inliers.size(), result.first);
 
     // TODO(Toni): should we remove outliers if few matches?
     //! Remove correspondences classified as outliers
@@ -654,6 +660,10 @@ Tracker::geometricOutlierRejection3d3dGivenRotation(
           matches_ref_cur,
           camLrectlkf_R_camLrectkf,
           &inliers);
+
+  LogVisualHealthMatches("stereo", ref_stereo_frame.timestamp_,
+                         cur_stereo_frame.timestamp_, matches_ref_cur.size(),
+                         inliers.size(), result.first.first);
 
   // Remove outliers.
   removeOutliersStereo(

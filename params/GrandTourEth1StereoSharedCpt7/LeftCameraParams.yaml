@@ -1,0 +1,20 @@
+%YAML:1.0
+# General sensor definitions.
+camera_id: alphasense_front_left
+
+# Sensor extrinsics wrt. the shared cpt7_imu body-frame.
+T_BS:
+  cols: 4
+  rows: 4
+  data: [-0.000797703823750, -0.171929415330365, 0.985108948194446, 0.369562185674123,
+         0.999832038249738, -0.018174559004802, -0.002362349329816, -0.101050414835670,
+         0.018310078044200, 0.984941603116215, 0.171915035680058, 0.067766626704890,
+         0.0, 0.0, 0.0, 1.0]
+
+# Camera specific definitions.
+rate_hz: 10
+resolution: [1440, 1080]
+camera_model: pinhole
+intrinsics: [701.4545727023193, 700.1179107526791, 680.2585465191044, 537.6794158094971] # fu, fv, cu, cv
+distortion_model: equidistant
+distortion_coefficients: [-0.03843622792783702, -0.002634177248264113, 0.002422949539367233, -0.001382691294699419]

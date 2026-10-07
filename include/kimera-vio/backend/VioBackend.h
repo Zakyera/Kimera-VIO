@@ -48,10 +48,12 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -643,6 +645,10 @@ class VioBackend {
   double cbs_get_odometry_beliefs_time_sec_per_update_ = 0.0;
   size_t cbs_marginalization_graph_factor_count_ = 0u;
   std::vector<ExternalOdometryBelief> cbs_outgoing_odom_beliefs_;
+  // Diagnostic only: stable published edge IDs and latest active pose snapshots.
+  std::map<std::pair<FrameId, FrameId>, size_t> cbs_revision_audit_versions_;
+  std::map<FrameId, std::pair<double, gtsam::Pose3>>
+      cbs_revision_audit_last_pose_;
   CbsPoseMergeDiagnostic pending_cbs_pose_merge_diagnostic_;
   CbsPoseMergeDiagnostic cbs_pose_merge_diagnostic_;
   std::string cbs_odom_sender_mode_ = "adjacent_window";
@@ -739,6 +745,19 @@ class VioBackend {
   std::deque<ExternalOdometryBelief> pending_external_odom_beliefs_;
   std::vector<ExternalBeliefFactorSlot> active_external_belief_factor_slots_;
   std::map<FrameId, double> keyframe_timestamp_sec_;
+  struct AcceptedExternalOdomMatch {
+    uint32_t sender_from_pose_index = 0u;
+    uint32_t sender_to_pose_index = 0u;
+    double timestamp_score = std::numeric_limits<double>::infinity();
+  };
+  using ExternalOdomReceiverEdgeKey =
+      std::tuple<uint8_t, FrameId, FrameId>;
+  std::map<ExternalOdomReceiverEdgeKey, AcceptedExternalOdomMatch>
+      accepted_external_odom_match_by_receiver_edge_;
+  using ExternalOdomSourceBeliefId =
+      std::tuple<uint8_t, uint32_t, uint32_t>;
+  std::map<ExternalOdomSourceBeliefId, uint32_t>
+      accepted_external_odom_revision_by_source_;
   size_t max_pending_external_odom_beliefs_ = 800u;
   double external_belief_timestamp_tolerance_sec_ = 0.2;
   double external_odom_unmatched_retry_max_age_sec_ = 5.0;

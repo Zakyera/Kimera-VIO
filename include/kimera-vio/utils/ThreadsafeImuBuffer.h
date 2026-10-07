@@ -75,6 +75,11 @@ class ThreadsafeImuBuffer {
     kTooFewMeasurementsAvailable
   };
 
+  enum class SampleSupport {
+    kLeft,
+    kRight,
+  };
+
   explicit ThreadsafeImuBuffer(const Timestamp& buffer_length_ns)
       : buffer_(buffer_length_ns), shutdown_(false) {}
 
@@ -121,6 +126,14 @@ class ThreadsafeImuBuffer {
                                             const Timestamp& timestamp_to,
                                             ImuStampS* imu_timestamps,
                                             ImuAccGyrS* imu_measurements);
+
+  /// Build an exact-boundary zero-order-hold packet. The frontend integrates
+  /// column i over [stamp_i, stamp_(i+1)].
+  QueryResult getImuDataZohBorders(const Timestamp& timestamp_from,
+                                   const Timestamp& timestamp_to,
+                                   SampleSupport support,
+                                   ImuStampS* imu_timestamps,
+                                   ImuAccGyrS* imu_measurements);
 
   /// \brief Return a list of the IMU measurements between the specified
   /// timestamps. ONLY the IMU newest value gets interpolated (if the queried

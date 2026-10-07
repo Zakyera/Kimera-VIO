@@ -304,6 +304,48 @@ TEST(ThreadsafeImuBuffer, getImuDataInterpolatedBorders) {
   EXPECT_EQ(imu_measurements.col(2)(0), 29.0);
 }
 
+TEST(ThreadsafeImuBuffer, getImuDataZohBorders) {
+  utils::ThreadsafeImuBuffer buffer(-1);
+  for (const Timestamp timestamp : {10, 15, 20, 25, 30, 40, 50}) {
+    buffer.addMeasurement(timestamp,
+                          ImuAccGyr::Constant(static_cast<double>(timestamp)));
+  }
+
+  ImuStampS stamps;
+  ImuAccGyrS measurements;
+  using Buffer = utils::ThreadsafeImuBuffer;
+  EXPECT_EQ(buffer.getImuDataZohBorders(
+                19, 31, Buffer::SampleSupport::kLeft,
+                &stamps, &measurements),
+            Buffer::QueryResult::kDataAvailable);
+  ASSERT_EQ(stamps.cols(), 5);
+  EXPECT_TRUE(stamps.isApprox(
+      (ImuStampS(1, 5) << 19, 20, 25, 30, 31).finished()));
+  EXPECT_TRUE(measurements.row(0).isApprox(
+      (Eigen::Matrix<double, 1, 5>() << 15, 20, 25, 30, 30).finished()));
+
+  EXPECT_EQ(buffer.getImuDataZohBorders(
+                19, 31, Buffer::SampleSupport::kRight,
+                &stamps, &measurements),
+            Buffer::QueryResult::kDataAvailable);
+  ASSERT_EQ(stamps.cols(), 5);
+  EXPECT_TRUE(measurements.row(0).isApprox(
+      (Eigen::Matrix<double, 1, 5>() << 20, 25, 30, 40, 40).finished()));
+
+  EXPECT_EQ(buffer.getImuDataZohBorders(
+                21, 24, Buffer::SampleSupport::kLeft,
+                &stamps, &measurements),
+            Buffer::QueryResult::kDataAvailable);
+  ASSERT_EQ(stamps.cols(), 2);
+  EXPECT_EQ(measurements(0, 0), 20.0);
+  EXPECT_EQ(buffer.getImuDataZohBorders(
+                21, 24, Buffer::SampleSupport::kRight,
+                &stamps, &measurements),
+            Buffer::QueryResult::kDataAvailable);
+  ASSERT_EQ(stamps.cols(), 2);
+  EXPECT_EQ(measurements(0, 0), 25.0);
+}
+
 TEST(ThreadsafeImuBuffer, getImuDataInterpolatedUpperBorder) {
   VIO::utils::ThreadsafeImuBuffer buffer(-1);
   buffer.addMeasurement(10, ImuAccGyr::Constant(10.0));

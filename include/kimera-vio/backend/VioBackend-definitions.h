@@ -119,6 +119,7 @@ struct ExternalOdometryBelief {
   uint8_t source_agent = 0u;
   uint32_t from_pose_index = 0u;
   uint32_t to_pose_index = 0u;
+  uint32_t revision = 0u;
   uint32_t sender_from_pose_index = 0u;
   uint32_t sender_to_pose_index = 0u;
   double from_stamp_sec = 0.0;

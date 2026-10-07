@@ -16,6 +16,8 @@
 #include "kimera-vio/dataprovider/DataProviderModule.h"
 #include <gflags/gflags.h>
 
+#include <cstdlib>
+
 namespace VIO {
 
 using utils::ThreadsafeImuBuffer;
@@ -134,12 +136,25 @@ DataProviderModule::getTimeSyncedImuMeasurements(const Timestamp& timestamp,
   // missing some of the motion or overestimating depending on the 
   // last timestamp's relationship to the nearest imu timestamp. 
   // For some datasets this caused an incorrect motion estimate
-  ThreadsafeImuBuffer::QueryResult query_result =
-      imu_data_.imu_buffer_.getImuDataInterpolatedBorders(
-          imu_timestamp_last_frame,
-          imu_timestamp_curr_frame,
-          &imu_meas->timestamps_,
-          &imu_meas->acc_gyr_);
+  ThreadsafeImuBuffer::QueryResult query_result;
+  const char* support_environment =
+      std::getenv("KIMERA_IMU_SAMPLE_SUPPORT");
+  const std::string support =
+      support_environment == nullptr ? "current" : support_environment;
+  if (support == "current") {
+    query_result = imu_data_.imu_buffer_.getImuDataInterpolatedBorders(
+        imu_timestamp_last_frame, imu_timestamp_curr_frame,
+        &imu_meas->timestamps_, &imu_meas->acc_gyr_);
+  } else if (support == "left" || support == "right") {
+    query_result = imu_data_.imu_buffer_.getImuDataZohBorders(
+        imu_timestamp_last_frame, imu_timestamp_curr_frame,
+        support == "left"
+            ? ThreadsafeImuBuffer::SampleSupport::kLeft
+            : ThreadsafeImuBuffer::SampleSupport::kRight,
+        &imu_meas->timestamps_, &imu_meas->acc_gyr_);
+  } else {
+    LOG(FATAL) << "KIMERA_IMU_SAMPLE_SUPPORT must be current, left, or right";
+  }
   logQueryResult(timestamp, query_result);
 
   switch (query_result) {
