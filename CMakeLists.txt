@@ -235,6 +235,7 @@ if(KIMERA_BUILD_TESTS)
     tests/testGeneralParallelPlaneRegularBasicFactor.cpp
     tests/testGeneralParallelPlaneRegularTangentSpaceFactor.cpp
     tests/testImuFrontend.cpp
+    tests/testCbsNativeImuMeanBridge.cpp
     tests/testImuParams.cpp
     # tests/testKittiDataProvider.cpp # TODO
     tests/testLoopClosureDetector.cpp

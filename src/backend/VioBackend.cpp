@@ -281,6 +281,10 @@ DEFINE_string(cbs_odom_requesting_agent_id,
               "l",
               "Peer agent id used to label outgoing CBS odometry belief "
               "diagnostics.");
+DEFINE_bool(cbs_experimental_native_imu_mean_alignment,
+            false,
+            "Experimental endpoint mean alignment using native pre-update "
+            "pose/velocity/bias and frontend IMU packets. Covariance unchanged.");
 DEFINE_bool(cbs_external_odom_duration_gate_enable,
             false,
             "Reject incoming CBS odometry beliefs when the sender edge duration "
@@ -2209,11 +2213,19 @@ void VioBackend::requeuePendingExternalOdometryBeliefs(
   }
 }
 
+void VioBackend::cacheCbsNativeImuPacket(const ImuStampS& stamps,
+                                       const ImuAccGyrS& rates) {
+  if (FLAGS_cbs_experimental_native_imu_mean_alignment)
+    cbs_native_imu_mean_bridge_.append(stamps, rates);
+}
+
 void VioBackend::updateKeyframeTimestampIndex(
     const FrameId& frame_id,
     const Timestamp& timestamp_kf_nsec) {
   const double stamp_sec = static_cast<double>(timestamp_kf_nsec) * 1e-9;
   keyframe_timestamp_sec_[frame_id] = stamp_sec;
+  if (FLAGS_cbs_experimental_native_imu_mean_alignment)
+    cbs_keyframe_timestamp_ns_[frame_id] = timestamp_kf_nsec;
 
   const FrameId keep_span =
       static_cast<FrameId>(backend_params_.nr_states_ * 3.0);
@@ -2221,6 +2233,13 @@ void VioBackend::updateKeyframeTimestampIndex(
   auto it = keyframe_timestamp_sec_.begin();
   while (it != keyframe_timestamp_sec_.end() && it->first < min_keep_frame) {
     it = keyframe_timestamp_sec_.erase(it);
+  }
+  if (FLAGS_cbs_experimental_native_imu_mean_alignment) {
+    while (!cbs_keyframe_timestamp_ns_.empty() &&
+           cbs_keyframe_timestamp_ns_.begin()->first < min_keep_frame)
+      cbs_keyframe_timestamp_ns_.erase(cbs_keyframe_timestamp_ns_.begin());
+    cbs_native_imu_mean_bridge_.pruneBefore(
+        cbs_keyframe_timestamp_ns_.begin()->second);
   }
 
   auto match_it = accepted_external_odom_match_by_receiver_edge_.begin();
@@ -2883,6 +2902,67 @@ void VioBackend::collectExternalBeliefFactors(
         gtsam::Pose3::Expmap(vector6FromArray(belief.relative_mu));
     odom_belief.covariance =
         poseCovarianceFromMatrix(matrix6FromArray(belief.covariance));
+    if (FLAGS_cbs_experimental_native_imu_mean_alignment) {
+      const auto receiver_from = cbs_keyframe_timestamp_ns_.at(from_frame_id);
+      const auto receiver_to = cbs_keyframe_timestamp_ns_.at(to_frame_id);
+      const auto sender_from = static_cast<Timestamp>(
+          std::llround(belief.from_stamp_sec * 1e9));
+      const auto sender_to = static_cast<Timestamp>(
+          std::llround(belief.to_stamp_sec * 1e9));
+      const auto causal_limit = cbs_keyframe_timestamp_ns_.at(cur_id);
+      auto bridge = [&](Timestamp from, Timestamp to) {
+        if (from == to) return gtsam::Pose3();
+        const auto first = std::min(from, to);
+        for (auto anchor = cbs_keyframe_timestamp_ns_.rbegin();
+             anchor != cbs_keyframe_timestamp_ns_.rend(); ++anchor) {
+          if (anchor->second > first) continue;
+          const auto x = gtsam::Symbol('x', anchor->first);
+          const auto v = gtsam::Symbol('v', anchor->first);
+          const auto b = gtsam::Symbol('b', anchor->first);
+          // Use one pre-update snapshot; do not query a final/future estimate.
+          if (!state_.exists(x) || !state_.exists(v) || !state_.exists(b))
+            continue;
+          return cbs_native_imu_mean_bridge_.between(
+              anchor->second,
+              gtsam::NavState(state_.at<gtsam::Pose3>(x),
+                             state_.at<gtsam::Vector3>(v)),
+              state_.at<ImuBias>(b), imu_params_, from, to, causal_limit);
+        }
+        throw std::runtime_error("CBS mean bridge: no active native anchor");
+      };
+      try {
+        const auto left = bridge(receiver_from, sender_from);
+        const auto right = bridge(sender_to, receiver_to);
+        const auto raw = odom_belief.measured_from_to;
+        odom_belief.measured_from_to =
+            CbsNativeImuMeanBridge::align(left, raw, right);
+        LOG(INFO) << std::setprecision(17) << "KIMERA_CBS_MEAN_ALIGNMENT_ROW,"
+                  << cur_id << "," << belief.sender_from_pose_index << ","
+                  << belief.sender_to_pose_index << "," << from_frame_id << ","
+                  << to_frame_id << "," << sender_from << "," << sender_to
+                  << "," << receiver_from << "," << receiver_to << ","
+                  << causal_limit << ","
+                  << cbs::relative_pose_covariance::matrixToken(gtsam::Pose3::Logmap(raw))
+                  << "," << cbs::relative_pose_covariance::matrixToken(
+                         gtsam::Pose3::Logmap(odom_belief.measured_from_to))
+                  << "," << cbs::relative_pose_covariance::matrixToken(
+                         odom_belief.covariance);
+      } catch (const std::runtime_error& error) {
+        // Keep the raw payload for a later native update; never silently insert
+        // an unaligned mean into the experimental aligned case.
+        LOG(WARNING) << "KIMERA_CBS_MEAN_ALIGNMENT_UNAVAILABLE," << cur_id
+                     << "," << belief.sender_from_pose_index << ","
+                     << belief.sender_to_pose_index << "," << error.what();
+        if (shouldRetryExternalOdometryBelief(belief, cur_id, "mean_alignment")) {
+          ++retried_unmatched;
+          retry_beliefs.push_back(belief);
+        } else {
+          ++dropped_unmatched;
+          ++rejected_missing_state;
+        }
+        continue;
+      }
+    }
     odom_belief.relax_factor = belief.relax_factor;
     LOG(INFO) << "KIMERA_CBS_SOURCE_TRANSPORT_ROW,"
               << static_cast<char>(belief.source_agent) << ","

@@ -313,6 +313,10 @@ void Pipeline::resume() {
 void Pipeline::spinOnce(FrontendInputPacketBase::UniquePtr input) {
   CHECK(input);
   if (!shutdown_) {
+    // Capture the actual frontend packet, not a second interpretation of raw
+    // IMU support. The backend method is a no-op unless explicitly opted in.
+    vio_backend_module_->cacheCbsNativeImuPacket(input->imu_stamps_,
+                                                input->imu_accgyrs_);
     // Push to Frontend input queue.
     VLOG(2) << "Push input payload to Frontend.";
     frontend_input_queue_.pushBlockingIfFull(std::move(input), 5u);

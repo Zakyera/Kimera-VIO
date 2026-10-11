@@ -84,6 +84,9 @@ class VioBackendModule
   void enqueueExternalOdometryBeliefs(
       const std::vector<ExternalOdometryBelief>& beliefs);
 
+  void cacheCbsNativeImuPacket(const ImuStampS& stamps,
+                             const ImuAccGyrS& rates);
+
  protected:
   const VioBackend::UniquePtr vio_backend_;
 };

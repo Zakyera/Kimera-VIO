@@ -61,4 +61,10 @@ void VioBackendModule::enqueueExternalOdometryBeliefs(
   vio_backend_->enqueueExternalOdometryBeliefs(beliefs);
 }
 
+void VioBackendModule::cacheCbsNativeImuPacket(const ImuStampS& stamps,
+                                             const ImuAccGyrS& rates) {
+  CHECK(vio_backend_);
+  vio_backend_->cacheCbsNativeImuPacket(stamps, rates);
+}
+
 }  // namespace VIO

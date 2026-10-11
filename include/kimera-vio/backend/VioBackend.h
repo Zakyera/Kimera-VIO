@@ -61,6 +61,7 @@
 
 #include "kimera-vio/backend/VioBackend-definitions.h"
 #include "kimera-vio/backend/VioBackendParams.h"
+#include "kimera-vio/imu-frontend/CbsNativeImuMeanBridge.h"
 #include "kimera-vio/factors/PointPlaneFactor.h"
 #include "kimera-vio/frontend/OdometryParams.h"
 #include "kimera-vio/frontend/StereoVisionImuFrontend-definitions.h"
@@ -139,6 +140,9 @@ class VioBackend {
   // Thread-safe ingestion of external odometry beliefs (e.g., from LiDAR backend).
   void enqueueExternalOdometryBeliefs(
       const std::vector<ExternalOdometryBelief>& beliefs);
+
+  void cacheCbsNativeImuPacket(const ImuStampS& stamps,
+                             const ImuAccGyrS& rates);
 
   // Get valid 3D points - TODO: this copies the graph.
   void get3DPoints(std::vector<gtsam::Point3>* points_3d) const;
@@ -745,6 +749,8 @@ class VioBackend {
   std::deque<ExternalOdometryBelief> pending_external_odom_beliefs_;
   std::vector<ExternalBeliefFactorSlot> active_external_belief_factor_slots_;
   std::map<FrameId, double> keyframe_timestamp_sec_;
+  std::map<FrameId, Timestamp> cbs_keyframe_timestamp_ns_;
+  CbsNativeImuMeanBridge cbs_native_imu_mean_bridge_;
   struct AcceptedExternalOdomMatch {
     uint32_t sender_from_pose_index = 0u;
     uint32_t sender_to_pose_index = 0u;
